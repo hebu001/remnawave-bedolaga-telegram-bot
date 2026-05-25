@@ -355,7 +355,10 @@ async def send_cart_notification_after_topup(
     # В приоритете всегда сохраненная корзина: она отражает явный выбор пользователя
     # (период/тариф/сумма). Автопродление expired — только когда корзины нет.
     if cart_data:
-        cart_total = cart_data.get('total_price', 0)
+        # Fallback to `price_kopeks` for add-on carts (add_traffic / add_devices)
+        # which store the amount under that key and don't set `total_price`.
+        # Without this fallback the cart is detected but auto-purchase is skipped.
+        cart_total = cart_data.get('total_price') or cart_data.get('price_kopeks', 0)
         if not cart_total:
             logger.warning(
                 'Сохраненная корзина найдена, но total_price отсутствует или некорректен',
