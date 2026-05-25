@@ -160,29 +160,12 @@ class PaymentCommonMixin:
         db: AsyncSession | None = None,
         payment_method_title: str | None = None,
     ) -> None:
-        """Отправляет пользователю уведомление об успешном платеже."""
-        # Lazy import to avoid circular dependency
-        from app.cabinet.routes.websocket import notify_user_balance_topup
+        """Отправляет пользователю Telegram-уведомление об успешном платеже.
 
-        # Send WebSocket notification to cabinet frontend (works for both Telegram and email-only users)
-        user_id = getattr(user, 'id', None) if user else None
-        if user_id:
-            try:
-                # Get new balance from user
-                new_balance = getattr(user, 'balance_kopeks', 0)
-                await notify_user_balance_topup(
-                    user_id=user_id,
-                    amount_kopeks=amount_kopeks,
-                    new_balance_kopeks=new_balance,
-                    description=payment_method_title or '',
-                )
-            except Exception as ws_error:
-                logger.warning(
-                    'Не удалось отправить WS уведомление о пополнении баланса для user_id',
-                    user_id=user_id,
-                    ws_error=ws_error,
-                )
-
+        WebSocket-уведомление (`balance.topup`) для кабинета отправляется
+        отдельно из `send_cart_notification_after_topup` — оно работает для
+        всех платёжных провайдеров и для email-only пользователей.
+        """
         if not getattr(self, 'bot', None):
             # Если бот не передан (например, внутри фоновых задач), уведомление пропускаем.
             return
@@ -330,7 +313,30 @@ async def send_cart_notification_after_topup(
     Само сообщение «Баланс пополнен…» больше не шлётся — оно дублировало
     основное «Пополнение успешно!» и ломало MAIN_MENU_MODE=cabinet.
     """
-    del amount_kopeks  # больше не используется после удаления второго сообщения
+
+    # Emit the cabinet WebSocket `balance.topup` event for every provider that
+    # routes through this helper (i.e. all providers except recurrent paths,
+    # which have their own notification flow). The event drives the cabinet's
+    # «Баланс пополнен!» success modal and works for both Telegram and
+    # email-only users — `send_to_user` silently no-ops if there are no
+    # active WS connections.
+    try:
+        from app.cabinet.routes.websocket import notify_user_balance_topup
+
+        user_id = getattr(user, 'id', None)
+        if user_id:
+            await notify_user_balance_topup(
+                user_id=user_id,
+                amount_kopeks=amount_kopeks,
+                new_balance_kopeks=getattr(user, 'balance_kopeks', 0),
+                description='',
+            )
+    except Exception as ws_error:
+        logger.warning(
+            'WS balance.topup notification failed',
+            user_id=getattr(user, 'id', None),
+            error=ws_error,
+        )
 
     from app.services.subscription_auto_purchase_service import (
         auto_purchase_saved_cart_after_topup,

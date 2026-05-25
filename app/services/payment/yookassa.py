@@ -911,21 +911,22 @@ class YooKassaPaymentMixin:
 
                     # Для рекуррентных автоплатежей уведомления отправляет recurrent_payment_service
                     if not is_recurrent_topup:
-                        # Уведомление пользователю — вызываем всегда. _send_payment_success_notification
-                        # внутри: отправляет WebSocket-событие в кабинет (работает и для email-only
-                        # пользователей), затем — Telegram-сообщение, если есть `bot` + `telegram_id`.
-                        # Передаём `user=user` чтобы WS получил `user.id` для роутинга сообщения.
-                        try:
-                            await self._send_payment_success_notification(
-                                user.telegram_id,
-                                payment.amount_kopeks,
-                                user=user,
-                                db=db,
-                                payment_method_title='Банковская карта (YooKassa)',
-                            )
-                            logger.info('Уведомление пользователю о платеже отправлено успешно')
-                        except Exception as error:
-                            logger.error('Ошибка отправки уведомления о платеже', error=error, exc_info=True)
+                        # Telegram-уведомление пользователю (только для Telegram-пользователей).
+                        # WebSocket-уведомление кабинету отправляется отдельно из
+                        # send_cart_notification_after_topup ниже — оно покрывает всех.
+                        if getattr(self, 'bot', None) and user.telegram_id:
+                            try:
+                                # Передаем только простые данные, чтобы избежать проблем с ленивой загрузкой
+                                await self._send_payment_success_notification(
+                                    user.telegram_id,
+                                    payment.amount_kopeks,
+                                    user=None,
+                                    db=db,
+                                    payment_method_title='Банковская карта (YooKassa)',
+                                )
+                                logger.info('Уведомление пользователю о платеже отправлено успешно')
+                            except Exception as error:
+                                logger.error('Ошибка отправки уведомления о платеже', error=error, exc_info=True)
 
                         # Проверяем наличие сохраненной корзины для возврата к оформлению подписки
                         # ВАЖНО: этот код должен выполняться даже при ошибках в уведомлениях
