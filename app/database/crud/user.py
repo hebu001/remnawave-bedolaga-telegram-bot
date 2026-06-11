@@ -1,3 +1,4 @@
+import hmac
 import secrets
 import string
 from datetime import UTC, datetime, timedelta
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.database.constants import POSTGRES_INT4_MAX, POSTGRES_INT4_MIN
 from app.database.crud.discount_offer import get_latest_claimed_offer_for_user
 from app.database.crud.promo_group import get_default_promo_group
 from app.database.crud.promo_offer_log import log_promo_offer_action
@@ -86,6 +88,10 @@ def generate_referral_code() -> str:
 
 
 async def get_user_by_id(db: AsyncSession, user_id: int) -> User | None:
+    # users.id is INTEGER (int4) in PostgreSQL; guard large telegram IDs passed by mistake.
+    if user_id < POSTGRES_INT4_MIN or user_id > POSTGRES_INT4_MAX:
+        return None
+
     result = await db.execute(
         select(User)
         .options(
@@ -760,7 +766,7 @@ async def subtract_user_balance(
                         log_error=log_error,
                     )
 
-        logger.info('✅ Средства списаны: →', old_balance=old_balance, balance_kopeks=user.balance_kopeks)
+        logger.info('✅ Средства списаны', old_balance=old_balance, balance_kopeks=user.balance_kopeks)
         return True
 
     except Exception as e:
@@ -1477,7 +1483,7 @@ async def verify_and_apply_email_change(db: AsyncSession, user: User, code: str)
         await db.commit()
         return False, 'Verification code has expired'
 
-    if user.email_change_code != code:
+    if not hmac.compare_digest(str(user.email_change_code), str(code)):
         return False, 'Invalid verification code'
 
     # Check if new email is still available
@@ -1627,9 +1633,7 @@ async def create_user_by_oauth(
     await db.refresh(user)
 
     user.promo_group = default_group
-    logger.info(
-        'Created OAuth user via (provider_id=) with id', provider=provider, provider_id=provider_id, user_id=user.id
-    )
+    logger.info('Created OAuth user', provider=provider, provider_id=provider_id, user_id=user.id)
 
     try:
         from app.services.event_emitter import event_emitter

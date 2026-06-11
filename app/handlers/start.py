@@ -69,6 +69,57 @@ from app.utils.user_utils import generate_unique_referral_code
 logger = structlog.get_logger(__name__)
 
 
+_SUBID_DELIMITER = '_subid_'
+
+
+def _split_start_param_subid(param: str | None) -> tuple[str | None, str | None]:
+    """Extract subid from ``{campaign}_subid_{subid}`` Telegram deeplink format.
+
+    Used to carry Keitaro/affiliate click IDs through /start where space is tight
+    (64 chars, no `?query=`). The campaign portion is returned to let normal
+    AdvertisingCampaign lookup proceed; the subid is stashed in FSM state to be
+    persisted post-registration via :data:`yandex_client_id.upsert_subid`.
+
+    Returns ``(param, None)`` when no delimiter, when either side is empty, or
+    when the subid would overflow the YandexClientIdMap.subid column (255).
+    """
+    if not param or _SUBID_DELIMITER not in param:
+        return param, None
+    head, _, tail = param.partition(_SUBID_DELIMITER)
+    if not head or not tail or len(tail) > 255:
+        return param, None
+    return head, tail
+
+
+async def _persist_pending_subid_after_registration(
+    db: AsyncSession,
+    state: FSMContext,
+    user,
+) -> None:
+    """Drain ``pending_subid`` from FSM state into ``yandex_client_id_map``.
+
+    Mirrors the lifecycle of ``pending_gift_token`` / ``pending_campaign``: the
+    subid is captured at /start (when no user row exists yet), held in state,
+    and committed once the user record is created.
+    """
+    data = await state.get_data() or {}
+    pending_subid = data.get('pending_subid')
+    if not pending_subid:
+        return
+    try:
+        from app.database.crud.yandex_client_id import upsert_subid
+
+        await upsert_subid(db, user.id, pending_subid, source='telegram')
+    except Exception as e:
+        logger.error(
+            'Failed to persist pending subid after registration',
+            user_id=getattr(user, 'id', None),
+            subid=pending_subid,
+            error=str(e),
+            exc_info=True,
+        )
+
+
 async def _activate_pending_gift_after_registration(
     db: AsyncSession,
     state: FSMContext,
@@ -694,7 +745,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
             data['pending_start_payload'] = redis_payload
             state_needs_update = True
             logger.info(
-                "📦 START: Payload '' восстановлен из Redis (fallback)", pending_start_payload=pending_start_payload
+                '📦 START: Payload восстановлен из Redis (fallback)', pending_start_payload=pending_start_payload
             )
             # НЕ удаляем Redis payload здесь - удаление только после успешной регистрации
 
@@ -707,14 +758,18 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         start_parameter = start_args[1]
     elif pending_start_payload:
         start_parameter = pending_start_payload
-        logger.info("📦 START: Используем сохраненный payload ''", pending_start_payload=pending_start_payload)
+        logger.info('📦 START: Используем сохраненный payload', pending_start_payload=pending_start_payload)
 
     if state_needs_update:
         await state.set_data(data)
 
-    # Handle gift code deep links: /start GIFT_{token}
-    if start_parameter and start_parameter.startswith('GIFT_'):
-        gift_token = start_parameter[5:]  # Strip "GIFT_" prefix
+    # Handle gift code deep links: /start GIFT_{token} (or giftclaim_{token} alias)
+    if start_parameter and (start_parameter.startswith('GIFT_') or start_parameter.startswith('giftclaim_')):
+        gift_token = (
+            start_parameter.removeprefix('giftclaim_')
+            if start_parameter.startswith('giftclaim_')
+            else start_parameter[5:]  # Strip "GIFT_" prefix
+        )
         if len(gift_token) >= 8:
             logger.info(
                 'Gift code deep link detected',
@@ -760,6 +815,33 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
             return
         start_parameter = None  # Invalid token, ignore
 
+    # Handle contests deep link: /start contests — the channel announcement's
+    # "🎲 Играть" button opens the bot here (a callback button can't open a
+    # private chat / show a personal menu from a channel post).
+    if start_parameter == 'contests':
+        user = db_user or await get_user_by_telegram_id(db, message.from_user.id)
+        if user and user.status != UserStatus.DELETED.value:
+            from app.handlers.contests import open_contests_menu_message
+
+            await open_contests_menu_message(message, user, db)
+            return
+        # Unregistered → fall through to normal /start (contests need a subscription anyway).
+        start_parameter = None
+
+    # Keitaro/affiliate click ID rides on /start as `{campaign}_subid_{click_id}`
+    # (64 chars total). Pull the click_id into FSM state and continue campaign
+    # lookup with the bare campaign portion.
+    if start_parameter:
+        campaign_part, subid_from_link = _split_start_param_subid(start_parameter)
+        if subid_from_link:
+            start_parameter = campaign_part
+            await state.update_data(pending_subid=subid_from_link)
+            logger.info(
+                'Captured subid from /start deeplink',
+                telegram_id=message.from_user.id,
+                campaign=campaign_part,
+            )
+
     if start_parameter:
         campaign = await get_campaign_by_start_parameter(
             db,
@@ -769,7 +851,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
 
         if campaign:
             logger.info(
-                '📣 Найдена рекламная кампания (start=)',
+                '📣 Найдена рекламная кампания',
                 campaign_id=campaign.id,
                 start_parameter=campaign.start_parameter,
             )
@@ -953,6 +1035,8 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         if user:
             await _activate_pending_gift_after_registration(db, state, user, message.answer)
             await state.update_data(pending_gift_token=None)
+            await _persist_pending_subid_after_registration(db, state, user)
+            await state.update_data(pending_subid=None)
             # Refresh user to pick up newly created subscriptions
             await db.refresh(user, attribute_names=['subscriptions'])
 
@@ -1120,7 +1204,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         data['language'] = normalized_default
         await state.set_data(data)
         logger.info(
-            "🌐 LANGUAGE: выбор языка отключен, устанавливаем язык по умолчанию ''",
+            '🌐 LANGUAGE: выбор языка отключен, устанавливаем язык по умолчанию',
             normalized_default=normalized_default,
         )
 
@@ -1814,6 +1898,7 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
 
     # Auto-activate pending gift for newly registered user (before state.clear() wipes the token)
     await _activate_pending_gift_after_registration(db, state, user, callback.message.answer)
+    await _persist_pending_subid_after_registration(db, state, user)
 
     await state.clear()
 
@@ -2161,6 +2246,7 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
 
     # Auto-activate pending gift for newly registered user (before state.clear() wipes the token)
     await _activate_pending_gift_after_registration(db, state, user, message.answer)
+    await _persist_pending_subid_after_registration(db, state, user)
 
     await state.clear()
 
@@ -2459,12 +2545,12 @@ async def required_sub_channel_check(
                 pending_start_payload = redis_payload
                 state_data['pending_start_payload'] = redis_payload
                 logger.info(
-                    "📦 CHANNEL CHECK: Payload '' восстановлен из Redis (fallback)",
+                    '📦 CHANNEL CHECK: Payload восстановлен из Redis (fallback)',
                     pending_start_payload=pending_start_payload,
                 )
 
         if pending_start_payload:
-            logger.info("📦 CHANNEL CHECK: Найден сохраненный payload ''", pending_start_payload=pending_start_payload)
+            logger.info('📦 CHANNEL CHECK: Найден сохраненный payload', pending_start_payload=pending_start_payload)
 
         user = db_user
         if not user:

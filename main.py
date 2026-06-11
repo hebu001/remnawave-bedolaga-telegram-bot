@@ -16,7 +16,7 @@ from app.database.database import sync_postgres_sequences
 from app.database.migrations import run_alembic_upgrade
 from app.database.models import PaymentMethod
 from app.localization.loader import ensure_locale_templates
-from app.logging_config import setup_logging
+from app.logging_config import _resolve_log_level, setup_logging
 from app.services.backup_service import backup_service
 from app.services.ban_notification_service import ban_notification_service
 from app.services.broadcast_service import broadcast_service
@@ -118,7 +118,7 @@ async def main():
         log_handlers.append(stream_handler)
 
         logging.basicConfig(
-            level=getattr(logging, settings.LOG_LEVEL),
+            level=_resolve_log_level(settings.LOG_LEVEL),
             handlers=log_handlers,
             force=True,
         )
@@ -137,7 +137,7 @@ async def main():
         log_handlers.append(stream_handler)
 
         logging.basicConfig(
-            level=getattr(logging, settings.LOG_LEVEL),
+            level=_resolve_log_level(settings.LOG_LEVEL),
             handlers=log_handlers,
             force=True,
         )
@@ -440,6 +440,16 @@ async def main():
                 stage.warning(f'Ошибка запуска автосинхронизации: {e}')
                 logger.error('❌ Ошибка запуска автосинхронизации RemnaWave', error=e)
 
+        # Разовая фоновая чистка накопившихся дублей тарифных подписок (multi-tariff):
+        # лишние истёкшие дубли удаляются из БД и панели вместе, как штатное удаление.
+        # Идемпотентно — после первой чистки no-op; панель легла — повторит на след. старте.
+        try:
+            from app.services.subscription_dedup_service import dedupe_expired_tariff_subscriptions
+
+            asyncio.create_task(dedupe_expired_tariff_subscriptions())
+        except Exception as e:
+            logger.warning('Не удалось запустить чистку дублей подписок', error=e)
+
         payment_service = PaymentService(bot)
         auto_payment_verification_service.set_payment_service(payment_service)
 
@@ -645,8 +655,13 @@ async def main():
                 interval_minutes = daily_subscription_service.get_check_interval_minutes()
                 stage.log(f'Интервал проверки: {interval_minutes} мин')
             else:
-                daily_subscription_task = None
-                stage.skip('Суточные подписки отключены настройками')
+                # Суточные тарифы выключены, но сброс истёкших докупок трафика нужен
+                # любой установке, продающей пакеты ГБ: без него истёкший пакет роняет
+                # лимит мимо защиты от ухода в минус (#630055). Запускаем только его.
+                daily_subscription_task = asyncio.create_task(
+                    daily_subscription_service.start_traffic_reset_monitoring()
+                )
+                stage.log('Суточные тарифы выключены — запущен только сброс докупок трафика')
 
         async with timeline.stage(
             'Сервис проверки версий',
@@ -779,10 +794,17 @@ async def main():
                 if daily_subscription_task and daily_subscription_task.done():
                     exception = daily_subscription_task.exception()
                     if exception:
-                        logger.error('Сервис суточных подписок завершился с ошибкой', error=exception)
                         if daily_subscription_service.is_enabled():
+                            logger.error('Сервис суточных подписок завершился с ошибкой', error=exception)
                             logger.info('🔄 Перезапуск сервиса суточных подписок...')
                             daily_subscription_task = asyncio.create_task(daily_subscription_service.start_monitoring())
+                        else:
+                            # Суточные выключены — крутился только сброс докупок трафика (#630055).
+                            logger.error('Цикл сброса докупок трафика завершился с ошибкой', error=exception)
+                            logger.info('🔄 Перезапуск сброса докупок трафика...')
+                            daily_subscription_task = asyncio.create_task(
+                                daily_subscription_service.start_traffic_reset_monitoring()
+                            )
 
                 if auto_verification_active and not auto_payment_verification_service.is_running():
                     logger.warning('Сервис автопроверки пополнений остановился, пробуем перезапустить...')
