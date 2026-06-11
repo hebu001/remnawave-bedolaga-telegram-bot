@@ -2412,21 +2412,21 @@ def _get_subscription_status(user, texts):
     if days_left > 7 and end_date_display:
         return texts.t(
             'SUB_STATUS_ACTIVE_LONG',
-            '💎 Активна\n📅 до {end_date} ({days} дн.)',
+            '✅ Активна\n📅 до {end_date} ({days} дн.)',
         ).format(end_date=end_date_display, days=days_left)
     if days_left > 1:
         return texts.t(
             'SUB_STATUS_ACTIVE_FEW_DAYS',
-            '💎 Активна\n⚠️ истекает через {days} дн.',
+            '✅ Активна\n⚠️ истекает через {days} дн.',
         ).format(days=days_left)
     if days_left == 1:
         return texts.t(
             'SUB_STATUS_ACTIVE_TOMORROW',
-            '💎 Активна\n⚠️ истекает завтра!',
+            '✅ Активна\n⚠️ истекает завтра!',
         )
     return texts.t(
         'SUB_STATUS_ACTIVE_TODAY',
-        '💎 Активна\n⚠️ истекает сегодня!',
+        '✅ Активна\n⚠️ истекает сегодня!',
     )
 
 
@@ -2459,9 +2459,30 @@ def get_referral_code_keyboard(language: str):
     )
 
 
+def _build_subscription_link_block(subscription) -> str:
+    """Ссылка на подписку под статусом (blockquote, авто-кликабельная).
+
+    Пустая строка, если подписки/ссылки нет или ссылка скрыта настройкой.
+    """
+    if not subscription:
+        return ''
+    try:
+        url = getattr(subscription, 'subscription_url', None)
+    except Exception:
+        return ''
+    if not url or settings.should_hide_subscription_link():
+        return ''
+    return f'\n<blockquote>{url}</blockquote>'
+
+
 async def get_main_menu_text(user, texts, db: AsyncSession):
     base_text = texts.MAIN_MENU.format(
-        user_name=html.escape(user.full_name or ''), subscription_status=_get_subscription_status(user, texts)
+        user_name=html.escape(user.full_name or ''),
+        telegram_id=getattr(user, 'telegram_id', '') or '',
+        subscription_status=_get_subscription_status(user, texts),
+        subscription_link=_build_subscription_link_block(getattr(user, 'subscription', None)),
+        cabinet_url=settings.CABINET_URL,
+        cabinet_domain=settings.CABINET_URL.split('://')[-1].rstrip('/'),
     )
 
     action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
@@ -2508,7 +2529,12 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
 
 async def get_main_menu_text_simple(user_name, texts, db: AsyncSession):
     base_text = texts.MAIN_MENU.format(
-        user_name=html.escape(user_name or ''), subscription_status=_get_subscription_status_simple(texts)
+        user_name=html.escape(user_name or ''),
+        telegram_id='',
+        subscription_status=_get_subscription_status_simple(texts),
+        subscription_link='',
+        cabinet_url=settings.CABINET_URL,
+        cabinet_domain=settings.CABINET_URL.split('://')[-1].rstrip('/'),
     )
 
     action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')

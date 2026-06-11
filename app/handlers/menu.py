@@ -1124,12 +1124,12 @@ def _get_subscription_status(user: User, texts, is_daily_tariff: bool = False) -
     if actual_status == 'active':
         # Для суточных тарифов не показываем предупреждение об истечении
         if is_daily_tariff:
-            return texts.t('SUB_STATUS_DAILY_ACTIVE', '💎 Активна')
+            return texts.t('SUB_STATUS_DAILY_ACTIVE', '✅ Активна')
 
         if days_left > 7 and end_date_text:
             return texts.t(
                 'SUB_STATUS_ACTIVE_LONG',
-                '💎 Активна\n📅 до {end_date} ({days} дн.)',
+                '✅ Активна\n📅 до {end_date} ({days} дн.)',
             ).format(
                 end_date=end_date_text,
                 days=days_left,
@@ -1137,16 +1137,16 @@ def _get_subscription_status(user: User, texts, is_daily_tariff: bool = False) -
         if days_left > 1:
             return texts.t(
                 'SUB_STATUS_ACTIVE_FEW_DAYS',
-                '💎 Активна\n⚠️ истекает через {days} дн.',
+                '✅ Активна\n⚠️ истекает через {days} дн.',
             ).format(days=days_left)
         if days_left == 1:
             return texts.t(
                 'SUB_STATUS_ACTIVE_TOMORROW',
-                '💎 Активна\n⚠️ истекает завтра!',
+                '✅ Активна\n⚠️ истекает завтра!',
             )
         return texts.t(
             'SUB_STATUS_ACTIVE_TODAY',
-            '💎 Активна\n⚠️ истекает сегодня!',
+            '✅ Активна\n⚠️ истекает сегодня!',
         )
 
     return texts.t('SUB_STATUS_UNKNOWN', '❓ Неизвестно')
@@ -1210,6 +1210,23 @@ async def _get_multi_tariff_status(user, texts, db: AsyncSession) -> tuple[str, 
     return status_text, ''
 
 
+def _build_subscription_link_block(subscription) -> str:
+    """Ссылка на подписку под статусом (blockquote, авто-кликабельная).
+
+    Возвращает пустую строку, если подписки/ссылки нет или ссылка скрыта
+    настройкой — тогда в шаблоне не появится пустой blockquote.
+    """
+    if not subscription:
+        return ''
+    try:
+        url = getattr(subscription, 'subscription_url', None)
+    except Exception:
+        return ''
+    if not url or settings.should_hide_subscription_link():
+        return ''
+    return f'\n<blockquote>{url}</blockquote>'
+
+
 async def get_main_menu_text(user, texts, db: AsyncSession):
     from app.config import settings
 
@@ -1219,7 +1236,11 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
 
         base_text = texts.MAIN_MENU.format(
             user_name=html.escape(user.full_name or ''),
+            telegram_id=getattr(user, 'telegram_id', '') or '',
             subscription_status=subscriptions_status,
+            subscription_link=_build_subscription_link_block(getattr(user, 'subscription', None)),
+            cabinet_url=settings.CABINET_URL,
+            cabinet_domain=settings.CABINET_URL.split('://')[-1].rstrip('/'),
         )
 
         if tariff_info_block:
@@ -1246,7 +1267,11 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
 
         base_text = texts.MAIN_MENU.format(
             user_name=html.escape(user.full_name or ''),
+            telegram_id=getattr(user, 'telegram_id', '') or '',
             subscription_status=_get_subscription_status(user, texts, is_daily_tariff),
+            subscription_link=_build_subscription_link_block(subscription),
+            cabinet_url=settings.CABINET_URL,
+            cabinet_domain=settings.CABINET_URL.split('://')[-1].rstrip('/'),
         )
 
         if tariff_info_block:
