@@ -181,6 +181,9 @@ async def purchase_devices_legacy(
                 'base_price_kopeks': base_total_price,
                 'discount_percent': devices_discount_percent,
                 'source': 'cabinet',
+                # Явное намерение пополнить ради корзины: без этой метки
+                # has_topup_intent gate (v3.60.0) блокирует авто-покупку add-on.
+                'return_to_cart': True,
             }
             await user_cart_service.save_user_cart(user.id, cart_data)
             logger.info(
@@ -455,6 +458,8 @@ async def purchase_devices(
                     'base_price_kopeks': base_price_prorated,
                     'discount_percent': devices_discount_percent,
                     'source': 'cabinet',
+                    # Явное намерение пополнить ради корзины (см. has_topup_intent gate).
+                    'return_to_cart': True,
                 }
                 await user_cart_service.save_user_cart(user.id, cart_data)
                 logger.info(
@@ -735,6 +740,8 @@ async def save_devices_cart(
         'base_price_kopeks': base_total_price,
         'discount_percent': devices_discount_percent,
         'source': 'cabinet',
+        # Явное намерение пополнить ради корзины (см. has_topup_intent gate).
+        'return_to_cart': True,
     }
     await user_cart_service.save_user_cart(user.id, cart_data)
     logger.info(
