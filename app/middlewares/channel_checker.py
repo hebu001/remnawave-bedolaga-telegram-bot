@@ -187,8 +187,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
             channel_sub_kb = get_channel_sub_keyboard(normalized, language=user_lang)
             text = texts.t(
                 'CHANNEL_REQUIRED_TEXT',
-                '🔒 Для использования бота подпишитесь на новостной канал, '
-                'чтобы получать уведомления о новых возможностях и обновлениях бота. Спасибо!',
+                '📢 Подпишитесь на наш канал, чтобы первыми узнавать все новости о нашем VPN-сервисе!',
             )
 
             try:
@@ -238,8 +237,7 @@ class ChannelCheckerMiddleware(BaseMiddleware):
         channel_sub_kb = get_channel_sub_keyboard(normalized, language=language)
         text = texts.t(
             'CHANNEL_REQUIRED_TEXT',
-            '🔒 Для использования бота подпишитесь на новостной канал, '
-            'чтобы получать уведомления о новых возможностях и обновлениях бота. Спасибо!',
+            '📢 Подпишитесь на наш канал, чтобы первыми узнавать все новости о нашем VPN-сервисе!',
         )
 
         try:
