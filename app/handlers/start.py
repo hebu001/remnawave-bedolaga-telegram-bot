@@ -1135,7 +1135,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
             await db.execute(delete(ReferralEarning).where(ReferralEarning.user_id == user.id))
             await db.execute(delete(ReferralEarning).where(ReferralEarning.referral_id == user.id))
 
-            # Обнуляем transaction_id во всех таблицах платежей перед удалением транзакций
+            # Обнуляем transaction_id во всех таблицах платежей перед удалением расходных транзакций
             payment_models = [
                 YooKassaPayment,
                 CryptoBotPayment,
@@ -1153,7 +1153,17 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
                     sa_update(payment_model).where(payment_model.user_id == user.id).values(transaction_id=None)
                 )
 
-            await db.execute(delete(Transaction).where(Transaction.user_id == user.id))
+            # Удаляем только расходные транзакции, сохраняя deposit-транзакции и баланс
+            await db.execute(
+                delete(Transaction).where(
+                    Transaction.user_id == user.id,
+                    Transaction.type != 'deposit',
+                )
+            )
+            logger.info(
+                '💰 Deposit-транзакции и баланс сохранены при повторной регистрации',
+                balance_kopeks=user.balance_kopeks,
+            )
 
             if user.balance_kopeks > 0:
                 logger.warning(
@@ -1164,9 +1174,9 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
 
             # Keep status=DELETED so complete_registration properly handles
             # referral assignment and status change (not the "already active" branch)
-            user.balance_kopeks = 0
+            # balance_kopeks сохраняется — не обнуляем оплаченный баланс
             user.remnawave_uuid = None
-            user.has_had_paid_subscription = False
+            user.has_had_paid_subscription = user.balance_kopeks > 0
             user.referred_by_id = None
 
             user.username = message.from_user.username
