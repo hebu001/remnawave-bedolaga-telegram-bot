@@ -26,6 +26,11 @@ ARG VCS_REF
 COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
+# pg_dump for fast, out-of-process DB backups (avoids the in-process ORM dump
+# that blocks the event loop and balloons memory). Client 17 dumps server 15+.
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd -g 1000 app && \
     useradd -u 1000 -g 1000 -m -s /bin/bash app
 
