@@ -23,6 +23,7 @@ from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import ServerSquad, User
 from app.services.remnawave_service import RemnaWaveService
 from app.services.system_settings_service import bot_configuration_service
+from app.utils.incy_crypto import encrypt_incy_link
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import (
@@ -226,13 +227,12 @@ def _get_remnawave_config_uuid() -> str | None:
         return settings.CABINET_REMNA_SUB_CONFIG
 
 
-def _extract_scheme_from_buttons(buttons: list[dict[str, Any]]) -> tuple[str, bool]:
+def _extract_scheme_from_buttons(buttons: list[dict[str, Any]]) -> tuple[str, str]:
     """Extract URL scheme from buttons list.
 
     Returns:
-        Tuple of (scheme, uses_crypto_link).
-        uses_crypto_link=True when the template is {{HAPP_CRYPT4_LINK}},
-        meaning subscription_crypto_link should be used as payload.
+        Tuple of (scheme, payload_kind) where payload_kind is one of
+        'plain', 'happ_crypto', 'incy_crypto'.
     """
     for btn in buttons:
         if not isinstance(btn, dict):
@@ -242,40 +242,50 @@ def _extract_scheme_from_buttons(buttons: list[dict[str, Any]]) -> tuple[str, bo
             continue
         link_upper = link.upper()
 
-        # Check for {{HAPP_CRYPT4_LINK}} -- uses crypto link as payload
+        # Check for {{INCY_CRYPT1_LINK}} -- uses subscription_incy_crypto_link as payload
+        if '{{INCY_CRYPT1_LINK}}' in link_upper or 'INCY_CRYPT1_LINK' in link_upper:
+            scheme = re.sub(r'\{\{INCY_CRYPT1_LINK\}\}', '', link, flags=re.IGNORECASE)
+            if scheme and '://' in scheme:
+                return scheme, 'incy_crypto'
+
+        # Check for {{HAPP_CRYPT4_LINK}} -- uses subscription_crypto_link as payload
         if '{{HAPP_CRYPT4_LINK}}' in link_upper or 'HAPP_CRYPT4_LINK' in link_upper:
             scheme = re.sub(r'\{\{HAPP_CRYPT4_LINK\}\}', '', link, flags=re.IGNORECASE)
             if scheme and '://' in scheme:
-                return scheme, True
+                return scheme, 'happ_crypto'
 
         # Check for {{SUBSCRIPTION_LINK}} -- uses plain subscription_url as payload
         if '{{SUBSCRIPTION_LINK}}' in link_upper or 'SUBSCRIPTION_LINK' in link_upper:
             scheme = re.sub(r'\{\{SUBSCRIPTION_LINK\}\}', '', link, flags=re.IGNORECASE)
             if scheme and '://' in scheme:
-                return scheme, False
+                return scheme, 'plain'
 
         # Also check for type="subscriptionLink" buttons with custom schemes
         btn_type = btn.get('type', '')
         if btn_type == 'subscriptionLink' and '://' in link and not link.startswith('http'):
             scheme = link.split('{{')[0] if '{{' in link else link
             if scheme and '://' in scheme:
-                return scheme, False
-    return '', False
+                return scheme, 'plain'
+    return '', 'plain'
 
 
-def _get_url_scheme_for_app(app: dict[str, Any]) -> tuple[str, bool]:
+def _get_url_scheme_for_app(app: dict[str, Any]) -> tuple[str, str]:
     """Get URL scheme for app - from config, buttons, or fallback by name.
 
     Returns:
-        Tuple of (scheme, uses_crypto_link).
-        uses_crypto_link=True means the app template uses {{HAPP_CRYPT4_LINK}},
-        so subscription_crypto_link should be used as the deep link payload.
+        Tuple of (scheme, payload_kind) where payload_kind is one of
+        'plain', 'happ_crypto', 'incy_crypto'.
     """
-    # 1. Check urlScheme field (cabinet format stores usesCryptoLink alongside)
+    # 1. Check urlScheme field (cabinet format)
     scheme = str(app.get('urlScheme', '')).strip()
     if scheme:
-        uses_crypto = bool(app.get('usesCryptoLink', False))
-        return scheme, uses_crypto
+        # Explicit cryptoLinkKind takes precedence; legacy usesCryptoLink maps to HAPP.
+        kind = app.get('cryptoLinkKind')
+        if kind in ('plain', 'happ_crypto', 'incy_crypto'):
+            return scheme, kind
+        if app.get('usesCryptoLink'):
+            return scheme, 'happ_crypto'
+        return scheme, 'plain'
 
     # 2. Extract from buttons in blocks (RemnaWave format)
     blocks = app.get('blocks', [])
@@ -283,16 +293,16 @@ def _get_url_scheme_for_app(app: dict[str, Any]) -> tuple[str, bool]:
         if not isinstance(block, dict):
             continue
         buttons = block.get('buttons', [])
-        scheme, uses_crypto = _extract_scheme_from_buttons(buttons)
+        scheme, kind = _extract_scheme_from_buttons(buttons)
         if scheme:
-            return scheme, uses_crypto
+            return scheme, kind
 
     # 3. Check buttons directly in app (alternative structure)
     direct_buttons = app.get('buttons', [])
     if direct_buttons:
-        scheme, uses_crypto = _extract_scheme_from_buttons(direct_buttons)
+        scheme, kind = _extract_scheme_from_buttons(direct_buttons)
         if scheme:
-            return scheme, uses_crypto
+            return scheme, kind
 
     # No scheme found
     logger.debug(
@@ -302,7 +312,7 @@ def _get_url_scheme_for_app(app: dict[str, Any]) -> tuple[str, bool]:
         get_3=bool(app.get('buttons')),
         get_4=bool(app.get('urlScheme')),
     )
-    return '', False
+    return '', 'plain'
 
 
 async def _load_app_config_async() -> dict[str, Any] | None:
@@ -329,30 +339,42 @@ async def _load_app_config_async() -> dict[str, Any] | None:
 
 
 def _create_deep_link(
-    app: dict[str, Any], subscription_url: str, subscription_crypto_link: str | None = None
+    app: dict[str, Any],
+    subscription_url: str | None,
+    subscription_crypto_link: str | None = None,
+    subscription_incy_crypto_link: str | None = None,
 ) -> str | None:
     """Create deep link for app with subscription URL.
 
     Uses urlScheme from RemnaWave config (e.g. "happ://add/", "v2rayng://install-config?url=")
     combined with the appropriate payload URL.
 
-    Two Happ schemes exist in RemnaWave:
+    Scheme/payload pairings:
       - happ://add/{{SUBSCRIPTION_LINK}}       -> uses plain subscription_url
-      - happ://crypt4/{{HAPP_CRYPT4_LINK}}     -> uses subscription_crypto_link
+      - happ://crypt4/{{HAPP_CRYPT4_LINK}}     -> uses subscription_crypto_link (HAPP AES-RSA)
+      - incy://crypt1/{{INCY_CRYPT1_LINK}}     -> uses subscription_incy_crypto_link (INCY AES-GCM)
     """
     if not isinstance(app, dict):
         return None
 
-    if not subscription_url and not subscription_crypto_link:
+    if not subscription_url and not subscription_crypto_link and not subscription_incy_crypto_link:
         return None
 
-    scheme, uses_crypto = _get_url_scheme_for_app(app)
+    scheme, kind = _get_url_scheme_for_app(app)
     if not scheme:
         logger.debug('_create_deep_link: no urlScheme for app', get=app.get('name', 'unknown'))
         return None
 
     # Pick the correct payload based on which template the app uses
-    if uses_crypto:
+    if kind == 'incy_crypto':
+        if not subscription_incy_crypto_link:
+            logger.debug(
+                '_create_deep_link: app requires incy crypto link but none available',
+                get=app.get('name', 'unknown'),
+            )
+            return None
+        payload = subscription_incy_crypto_link
+    elif kind == 'happ_crypto':
         if not subscription_crypto_link:
             logger.debug(
                 '_create_deep_link: app requires crypto link but none available', get=app.get('name', 'unknown')
@@ -380,13 +402,15 @@ def _resolve_button_url(
     url: str,
     subscription_url: str | None,
     subscription_crypto_link: str | None,
+    subscription_incy_crypto_link: str | None = None,
 ) -> str:
     """Resolve template variables in button URLs.
 
     Matches remnawave/subscription-page frontend TemplateEngine:
     - {{SUBSCRIPTION_LINK}} -> plain subscription URL
-    - {{HAPP_CRYPT3_LINK}} -> crypto link
-    - {{HAPP_CRYPT4_LINK}} -> crypto link
+    - {{HAPP_CRYPT3_LINK}} -> HAPP crypto link
+    - {{HAPP_CRYPT4_LINK}} -> HAPP crypto link
+    - {{INCY_CRYPT1_LINK}} -> INCY crypto link (AES-256-GCM, generated by bot)
     """
     if not url:
         return url
@@ -396,6 +420,8 @@ def _resolve_button_url(
     if subscription_crypto_link:
         result = result.replace('{{HAPP_CRYPT3_LINK}}', subscription_crypto_link)
         result = result.replace('{{HAPP_CRYPT4_LINK}}', subscription_crypto_link)
+    if subscription_incy_crypto_link:
+        result = result.replace('{{INCY_CRYPT1_LINK}}', subscription_incy_crypto_link)
     return result
 
 
@@ -434,6 +460,27 @@ async def get_app_config(
             logger.debug('Could not generate crypto link', error=e)
 
     config = await _load_app_config_async()
+
+    # Generate INCY crypto link on every request — AES-GCM uses a fresh IV so the
+    # ciphertext differs each call, but every payload decrypts to subscription_url.
+    # Branding name (if available) is embedded in the encrypted payload and shown
+    # on the INCY client's "Confirm import?" sheet.
+    subscription_incy_crypto_link: str | None = None
+    if subscription_url:
+        branding_name: str | None = None
+        if config:
+            branding = config.get('brandingSettings') or {}
+            if isinstance(branding, dict):
+                # Remnawave uses 'title'; some configs use 'name'.
+                for candidate_key in ('name', 'title'):
+                    raw_name = branding.get(candidate_key)
+                    if isinstance(raw_name, str) and raw_name.strip():
+                        branding_name = raw_name.strip()
+                        break
+        try:
+            subscription_incy_crypto_link = encrypt_incy_link(subscription_url, name=branding_name)
+        except Exception as e:
+            logger.warning('Failed to generate INCY crypto link', error=e)
 
     if not config:
         raise HTTPException(
@@ -478,8 +525,13 @@ async def get_app_config(
 
             # Generate deep link
             deep_link = None
-            if subscription_url or subscription_crypto_link:
-                deep_link = _create_deep_link(app, subscription_url, subscription_crypto_link)
+            if subscription_url or subscription_crypto_link or subscription_incy_crypto_link:
+                deep_link = _create_deep_link(
+                    app,
+                    subscription_url,
+                    subscription_crypto_link,
+                    subscription_incy_crypto_link,
+                )
             app['deepLink'] = deep_link
 
             # Resolve templates only for subscriptionLink and copyButton (not external)
@@ -497,6 +549,7 @@ async def get_app_config(
                                 url,
                                 subscription_url,
                                 subscription_crypto_link,
+                                subscription_incy_crypto_link,
                             )
                             # Only set resolvedUrl if ALL templates were resolved;
                             # otherwise let the frontend fall through to deepLink/subscriptionUrl
@@ -518,9 +571,12 @@ async def get_app_config(
         'baseSettings': config.get('baseSettings'),
         'uiConfig': config.get('uiConfig', {}),
         'platformNames': platform_names,
-        'hasSubscription': bool(subscription_url or subscription_crypto_link),
+        'hasSubscription': bool(
+            subscription_url or subscription_crypto_link or subscription_incy_crypto_link
+        ),
         'subscriptionUrl': subscription_url,
         'subscriptionCryptoLink': subscription_crypto_link,
+        'subscriptionIncyCryptoLink': subscription_incy_crypto_link,
         'hideLink': hide_link,
         'branding': config.get('brandingSettings', {}),
     }
