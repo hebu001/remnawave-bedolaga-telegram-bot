@@ -263,6 +263,16 @@ def _get_method_defaults() -> dict:
                 {'id': 'sbp', 'name': 'СБП'},
             ],
         },
+        'cispay': {
+            'default_display_name': settings.get_cispay_display_name(),
+            'is_configured': settings.is_cispay_enabled(),
+            'default_min': settings.CISPAY_MIN_AMOUNT_KOPEKS,
+            'default_max': settings.CISPAY_MAX_AMOUNT_KOPEKS,
+            'available_sub_options': [
+                {'id': 'card', 'name': 'Карта'},
+                {'id': 'sbp', 'name': 'СБП'},
+            ],
+        },
     }
 
 
@@ -324,6 +334,7 @@ DEFAULT_METHOD_ORDER = [
     'jupiter',
     'donut',
     'lava',
+    'cispay',
 ]
 
 
@@ -487,6 +498,7 @@ async def update_config(
     updatable_fields = (
         'is_enabled',
         'display_name',
+        'description',
         'sub_options',
         'quick_amounts',
         'min_amount_kopeks',
@@ -634,6 +646,7 @@ async def get_enabled_methods_for_user(
             {
                 'id': method_id,
                 'name': display_name,
+                'description': config.description,
                 'min_amount_kopeks': min_amount,
                 'max_amount_kopeks': max_amount,
                 'options': options,
