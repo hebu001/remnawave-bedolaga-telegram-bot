@@ -370,8 +370,10 @@ async def _build_single_subscription_block(user: User, texts, db: AsyncSession) 
             tariff_template = texts.t('MAIN_MENU_RICH_TARIFF', '📦 Тариф: {tariff}')
             tariff_line = html.escape(tariff_template).replace('{tariff}', f'<b>{html.escape(tariff.name)}</b>')
 
+    # Статус + дата — одной строкой (единый источник: _get_subscription_status)
     status_text = _get_subscription_status(user, texts, is_daily_tariff)
-    lines = [html.escape(line) for line in status_text.split('\n') if line.strip()]
+    status_inline = ' · '.join(html.escape(part.strip()) for part in status_text.split('\n') if part.strip())
+    lines = [status_inline]
     if tariff_line:
         lines.append(tariff_line)
 
@@ -382,22 +384,19 @@ async def _build_single_subscription_block(user: User, texts, db: AsyncSession) 
     if not is_daily_tariff and end_date and end_date > current_time and actual_status in {'active', 'trial'}:
         seconds_left = (end_date - current_time).total_seconds()
         total_seconds = (end_date - start_date).total_seconds() if start_date else 0
-        relative_template = texts.t('MAIN_MENU_RICH_EXPIRES_RELATIVE', '⏳ истекает {when}')
         days_left_text = texts.t('MAIN_MENU_RICH_DAYS_LEFT', 'осталось {days} дн.').replace(
             '{days}', str(max((end_date - current_time).days, 0))
         )
-        relative_line = html.escape(relative_template).replace('{when}', _tg_time(end_date, 'r', days_left_text))
-        lines.append(f'<code>{_progress_bar(seconds_left, total_seconds)}</code> {relative_line}')
+        relative = _tg_time(end_date, 'r', days_left_text)
+        lines.append(f'<code>{_progress_bar(seconds_left, total_seconds)}</code> {relative}')
 
+    # Трафик + устройства — одной строкой
     if actual_status in {'active', 'trial', 'limited'}:
-        traffic_template = texts.t('MAIN_MENU_RICH_TRAFFIC', '📊 Трафик: {traffic}')
-        lines.append(
-            html.escape(traffic_template).replace('{traffic}', html.escape(_traffic_usage_text(subscription, texts)))
-        )
+        info_parts = [f'📊 {html.escape(_traffic_usage_text(subscription, texts))}']
         device_limit = getattr(subscription, 'device_limit', None)
         if device_limit:
-            devices_template = texts.t('MAIN_MENU_RICH_DEVICES', '📱 Устройства: {devices}')
-            lines.append(html.escape(devices_template).replace('{devices}', str(device_limit)))
+            info_parts.append(f'📱 {device_limit}')
+        lines.append('   '.join(info_parts))
         connect_link = _connect_link(subscription, texts)
         if connect_link:
             lines.append(connect_link)
@@ -418,37 +417,29 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     if logo_url:
         blocks.append(f'<img src="{html.escape(logo_url, quote=True)}"/>')
 
-    user_name = html.escape(user.full_name or '')
-    blocks.append(f'<h4>👤 {user_name}</h4>')
+    # Профиль: имя + ID одной строкой
+    header = f'👤 <b>{html.escape(user.full_name or "")}</b>'
     telegram_id = getattr(user, 'telegram_id', '') or ''
     if telegram_id:
-        blocks.append(f'<p>🆔 <code>{html.escape(str(telegram_id))}</code></p>')
-    blocks.append('<hr/>')
+        header += f'  ·  🆔 <code>{html.escape(str(telegram_id))}</code>'
+    blocks.append(f'<h4>{header}</h4>')
 
+    # Подписка — компактная карточка (без заголовка-секции, blockquote самодостаточен)
     if settings.is_multi_tariff_enabled():
-        heading = texts.t('MAIN_MENU_RICH_SUBSCRIPTIONS_HEADING', '📱 Подписки')
         subscriptions = await get_all_subscriptions_by_user_id(db, user.id)
         subscription_block = _build_subscriptions_table(subscriptions, texts)
         if len(subscriptions) > 1 and settings.MAIN_MENU_RICH_SUBSCRIPTIONS_COLLAPSIBLE:
-            # Несколько подписок раздувают меню — сворачиваем таблицу в details;
-            # summary служит заголовком (h6 не дублируем), счётчик — вместо содержимого.
+            heading = texts.t('MAIN_MENU_RICH_SUBSCRIPTIONS_HEADING', '📱 Подписки')
             summary = f'<b>{html.escape(heading)} ({len(subscriptions)})</b>'
             blocks.append(f'<details><summary>{summary}</summary>{subscription_block}</details>')
         else:
-            blocks.append(f'<h6>{html.escape(heading)}</h6>')
             blocks.append(subscription_block)
     else:
-        heading = texts.t('MAIN_MENU_RICH_SUBSCRIPTION_HEADING', '📱 Подписка')
-        blocks.append(f'<h6>{html.escape(heading)}</h6>')
         blocks.append(await _build_single_subscription_block(user, texts, db))
 
     trial_link = _trial_offer_link(user, texts)
     if trial_link:
         blocks.append(f'<p>{trial_link}</p>')
-
-    balance_template = texts.t('MAIN_MENU_RICH_BALANCE', '💰 Баланс: {balance}')
-    balance_value = f'<b>{html.escape(settings.format_price(user.balance_kopeks))}</b>'
-    blocks.append(f'<p>{html.escape(balance_template).replace("{balance}", balance_value)}</p>')
 
     hint_sections: list[str] = []
     try:
@@ -481,15 +472,14 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
         random_message_html = _sanitize_rich_inline(random_message).replace('\n', '<br>')
         blocks.append(f'<blockquote>{random_message_html}</blockquote>')
 
-    # Профиль-футер: домен кабинета (без https, авто-ссылка) и канал —
-    # перенос содержимого текстовой шапки в rich-меню (гибрид).
+    # Хвост одной строкой: баланс · кабинет (без https, авто-ссылка) · канал
+    tail = [f'💰 <b>{html.escape(settings.format_price(user.balance_kopeks))}</b>']
     cabinet_domain = (settings.CABINET_URL or '').split('://')[-1].rstrip('/')
     if cabinet_domain and cabinet_domain != 'example.com/cabinet':
-        cabinet_label = texts.t('MAIN_MENU_RICH_CABINET', '🔗 Кабинет: {cabinet}')
-        blocks.append(f'<p>{html.escape(cabinet_label).replace("{cabinet}", html.escape(cabinet_domain))}</p>')
-    blocks.append(f'<p>{texts.t("MAIN_MENU_RICH_CHANNEL", "📢 Канал: @evovpn")}</p>')
+        tail.append(f'🔗 {html.escape(cabinet_domain)}')
+    tail.append(texts.t('MAIN_MENU_RICH_CHANNEL', '📢 @evovpn'))
+    blocks.append(f'<p>{"  ·  ".join(tail)}</p>')
 
-    blocks.append('<hr/>')
     action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
     blocks.append(f'<footer>{html.escape(action_prompt)}</footer>')
 
