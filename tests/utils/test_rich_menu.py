@@ -57,6 +57,7 @@ def _make_subscription(now, *, status='active', days_left=12, is_trial=False, ta
 def _make_user(subscription, *, trial_used=True):
     return SimpleNamespace(
         id=1,
+        telegram_id=765468039,
         full_name='Егор <script>',
         language='ru',
         auth_type='telegram',
@@ -97,18 +98,16 @@ async def test_builder_single_subscription_structure(monkeypatch):
 
     html_out = await rich_menu.build_main_menu_rich_html(user, DummyTexts(), AsyncMock())
 
-    # Имя экранировано, сырых тегов пользователя нет
-    assert 'Егор &lt;script&gt;' in html_out
+    # Никаких сырых тегов пользователя
     assert '<script>' not in html_out
-    # Структура: заголовок, блок подписки, баланс, футер
+    # Структура: заголовок с ID, подписка в таблице, футер
     assert html_out.startswith('<h4>')
-    assert '<blockquote>' in html_out
+    assert '<code>765468039</code>' in html_out
+    assert '<table bordered striped>' in html_out
     assert '<footer>' in html_out
     # Дата окончания — через tg-time с relative-форматом и unix конца подписки
     assert f'unix="{int(subscription.end_date.timestamp())}"' in html_out
     assert 'format="r"' in html_out
-    # Прогресс-бар остатка дней
-    assert '<code>[' in html_out
     # Баланс из format_price
     assert '1250' in html_out
 

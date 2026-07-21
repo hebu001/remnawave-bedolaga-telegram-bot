@@ -54,7 +54,6 @@ from app.utils.timezone import format_local_datetime
 logger = structlog.get_logger(__name__)
 
 _RTL_LANGUAGES = frozenset({'ar', 'fa', 'he'})
-_PROGRESS_BAR_LENGTH = 10
 
 # Сервер не поддерживает rich-сообщения (устаревший self-hosted bot-api).
 # Взводится один раз до рестарта — по образцу _happ_encrypt_unavailable.
@@ -177,18 +176,6 @@ def _tg_time(moment: datetime, time_format: str, fallback: str) -> str:
     if not 0 < unix_time <= _TG_TIME_MAX_UNIX:
         return html.escape(fallback)
     return f'<tg-time unix="{unix_time}" format="{time_format}">{html.escape(fallback)}</tg-time>'
-
-
-def _progress_bar(seconds_left: float, total_seconds: float) -> str:
-    # Тот же вид [████░░░░░░], что у таймеров промо-предложений (app/utils/promo_offer.py).
-    if total_seconds <= 0:
-        total_seconds = seconds_left or 1
-    ratio = max(0.0, min(1.0, seconds_left / total_seconds))
-    filled = int(round(ratio * _PROGRESS_BAR_LENGTH))
-    filled = max(0, min(_PROGRESS_BAR_LENGTH, filled))
-    if filled == 0 and seconds_left > 0:
-        filled = 1
-    return f'[{"█" * filled}{"░" * (_PROGRESS_BAR_LENGTH - filled)}]'
 
 
 def _rich_status_label(texts, actual_status: str, is_trial: bool) -> str:
@@ -349,8 +336,11 @@ def _build_subscriptions_table(subscriptions, texts) -> str:
 
 
 async def _build_single_subscription_block(user: User, texts, db: AsyncSession) -> str:
-    # Статусные строки берём из того же builder-а, что и классическое меню, —
-    # единый источник правды для формулировок (см. tests/test_start_menu_text_consistency.py).
+    """Подписка в аккуратной таблице (Bot API 10.1): статус, дата (tg-time), тариф.
+
+    Статус-лейбл берём из того же builder-а, что и классическое меню, —
+    единый источник формулировок (см. tests/test_start_menu_text_consistency.py).
+    """
     from app.handlers.menu import _get_subscription_status
 
     subscription = getattr(user, 'subscription', None)
@@ -358,7 +348,7 @@ async def _build_single_subscription_block(user: User, texts, db: AsyncSession) 
         return f'<p>{html.escape(texts.t("SUB_STATUS_NONE", "❌ Отсутствует"))}</p>'
 
     is_daily_tariff = False
-    tariff_line = ''
+    tariff_name = ''
     if settings.is_tariffs_mode() and subscription.tariff_id:
         try:
             tariff = await get_tariff_by_id(db, subscription.tariff_id)
@@ -367,46 +357,46 @@ async def _build_single_subscription_block(user: User, texts, db: AsyncSession) 
             logger.debug('Не удалось загрузить тариф для rich-меню', error=str(error))
         if tariff:
             is_daily_tariff = bool(getattr(tariff, 'is_daily', False))
-            tariff_template = texts.t('MAIN_MENU_RICH_TARIFF', '📦 Тариф: {tariff}')
-            tariff_line = html.escape(tariff_template).replace('{tariff}', f'<b>{html.escape(tariff.name)}</b>')
+            tariff_name = tariff.name or ''
 
-    # Статус + дата — одной строкой (единый источник: _get_subscription_status)
+    # Статус-лейбл — первая строка _get_subscription_status
     status_text = _get_subscription_status(user, texts, is_daily_tariff)
-    status_inline = ' · '.join(html.escape(part.strip()) for part in status_text.split('\n') if part.strip())
-    lines = [status_inline]
-    if tariff_line:
-        lines.append(tariff_line)
+    status_label = html.escape(status_text.split('\n')[0].strip()) if status_text else ''
 
     current_time = datetime.now(UTC)
     end_date = getattr(subscription, 'end_date', None)
-    start_date = getattr(subscription, 'start_date', None)
     actual_status = (subscription.actual_status or '').lower()
-    if not is_daily_tariff and end_date and end_date > current_time and actual_status in {'active', 'trial'}:
-        seconds_left = (end_date - current_time).total_seconds()
-        total_seconds = (end_date - start_date).total_seconds() if start_date else 0
-        days_left_text = texts.t('MAIN_MENU_RICH_DAYS_LEFT', 'осталось {days} дн.').replace(
-            '{days}', str(max((end_date - current_time).days, 0))
-        )
-        relative = _tg_time(end_date, 'r', days_left_text)
-        lines.append(f'<code>{_progress_bar(seconds_left, total_seconds)}</code> {relative}')
 
-    # Трафик + устройства — одной строкой
+    rows: list[tuple[str, str]] = [(texts.t('MAIN_MENU_RICH_ROW_STATUS', 'Статус'), status_label)]
+
+    if end_date:
+        date_str = format_local_datetime(end_date, '%d.%m.%Y')
+        if actual_status == 'expired' or end_date <= current_time:
+            rows.append((texts.t('MAIN_MENU_RICH_ROW_EXPIRED', 'Истекла'), html.escape(date_str)))
+        else:
+            # Живая относительная дата — фича Bot API tg-time
+            rows.append((texts.t('MAIN_MENU_RICH_ROW_UNTIL', 'Действует'), _tg_time(end_date, 'r', f'до {date_str}')))
+
+    if tariff_name:
+        rows.append((texts.t('MAIN_MENU_RICH_ROW_TARIFF', 'Тариф'), f'<b>{html.escape(tariff_name)}</b>'))
+
+    table = (
+        '<table bordered striped>'
+        + ''.join(f'<tr><td>{html.escape(k)}</td><td>{v}</td></tr>' for k, v in rows)
+        + '</table>'
+    )
+
+    parts = [table]
     if actual_status in {'active', 'trial', 'limited'}:
-        info_parts = [f'📊 {html.escape(_traffic_usage_text(subscription, texts))}']
-        device_limit = getattr(subscription, 'device_limit', None)
-        if device_limit:
-            info_parts.append(f'📱 {device_limit}')
-        lines.append('   '.join(info_parts))
         connect_link = _connect_link(subscription, texts)
         if connect_link:
-            lines.append(connect_link)
-
-    if actual_status == 'expired':
+            parts.append(f'<p>{connect_link}</p>')
+    elif actual_status == 'expired':
         renew_link = _renew_link(getattr(subscription, 'id', None), texts)
         if renew_link:
-            lines.append(renew_link)
+            parts.append(f'<p>{renew_link}</p>')
 
-    return '<blockquote>' + '<br>'.join(lines) + '</blockquote>'
+    return ''.join(parts)
 
 
 async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
@@ -417,14 +407,12 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     if logo_url:
         blocks.append(f'<img src="{html.escape(logo_url, quote=True)}"/>')
 
-    # Профиль: имя + ID одной строкой
-    header = f'👤 <b>{html.escape(user.full_name or "")}</b>'
+    # Профиль: только ID (Bot API <code> — копируется по тапу)
     telegram_id = getattr(user, 'telegram_id', '') or ''
     if telegram_id:
-        header += f'  ·  🆔 <code>{html.escape(str(telegram_id))}</code>'
-    blocks.append(f'<h4>{header}</h4>')
+        blocks.append(f'<h4>🆔 <code>{html.escape(str(telegram_id))}</code></h4>')
 
-    # Подписка — компактная карточка (без заголовка-секции, blockquote самодостаточен)
+    # Подписка — таблица (Bot API 10.1)
     if settings.is_multi_tariff_enabled():
         subscriptions = await get_all_subscriptions_by_user_id(db, user.id)
         subscription_block = _build_subscriptions_table(subscriptions, texts)
@@ -472,13 +460,16 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
         random_message_html = _sanitize_rich_inline(random_message).replace('\n', '<br>')
         blocks.append(f'<blockquote>{random_message_html}</blockquote>')
 
-    # Хвост одной строкой: баланс · кабинет (без https, авто-ссылка) · канал
-    tail = [f'💰 <b>{html.escape(settings.format_price(user.balance_kopeks))}</b>']
+    # Баланс — отдельной строкой
+    balance_template = texts.t('MAIN_MENU_RICH_BALANCE', '💰 Баланс: {balance}')
+    balance_value = f'<b>{html.escape(settings.format_price(user.balance_kopeks))}</b>'
+    blocks.append(f'<p>{html.escape(balance_template).replace("{balance}", balance_value)}</p>')
+
+    # Ссылки — отдельными строками: кабинет (без https, авто-ссылка) и канал
     cabinet_domain = (settings.CABINET_URL or '').split('://')[-1].rstrip('/')
     if cabinet_domain and cabinet_domain != 'example.com/cabinet':
-        tail.append(f'🔗 {html.escape(cabinet_domain)}')
-    tail.append(texts.t('MAIN_MENU_RICH_CHANNEL', '📢 @evovpn'))
-    blocks.append(f'<p>{"  ·  ".join(tail)}</p>')
+        blocks.append(f'<p>🔗 {html.escape(cabinet_domain)}</p>')
+    blocks.append(f'<p>{texts.t("MAIN_MENU_RICH_CHANNEL", "📢 @evovpn")}</p>')
 
     action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
     blocks.append(f'<footer>{html.escape(action_prompt)}</footer>')
