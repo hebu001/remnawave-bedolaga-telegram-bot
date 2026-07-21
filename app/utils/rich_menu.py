@@ -420,6 +420,9 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
 
     user_name = html.escape(user.full_name or '')
     blocks.append(f'<h4>👤 {user_name}</h4>')
+    telegram_id = getattr(user, 'telegram_id', '') or ''
+    if telegram_id:
+        blocks.append(f'<p>🆔 <code>{html.escape(str(telegram_id))}</code></p>')
     blocks.append('<hr/>')
 
     if settings.is_multi_tariff_enabled():
@@ -477,6 +480,14 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
         # Rich-HTML живёт по правилам HTML: перенос строки — только через <br>.
         random_message_html = _sanitize_rich_inline(random_message).replace('\n', '<br>')
         blocks.append(f'<blockquote>{random_message_html}</blockquote>')
+
+    # Профиль-футер: домен кабинета (без https, авто-ссылка) и канал —
+    # перенос содержимого текстовой шапки в rich-меню (гибрид).
+    cabinet_domain = (settings.CABINET_URL or '').split('://')[-1].rstrip('/')
+    if cabinet_domain and cabinet_domain != 'example.com/cabinet':
+        cabinet_label = texts.t('MAIN_MENU_RICH_CABINET', '🔗 Кабинет: {cabinet}')
+        blocks.append(f'<p>{html.escape(cabinet_label).replace("{cabinet}", html.escape(cabinet_domain))}</p>')
+    blocks.append(f'<p>{texts.t("MAIN_MENU_RICH_CHANNEL", "📢 Канал: @evovpn")}</p>')
 
     blocks.append('<hr/>')
     action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
