@@ -399,9 +399,26 @@ async def _build_single_subscription_block(user: User, texts, db: AsyncSession) 
     return ''.join(parts)
 
 
+# Заголовок-вордмарк из кастом-эмодзи (Bot API tg-emoji). Каждый tg-emoji
+# оборачивает обычный эмодзи-фолбэк на случай, если кастомный не отрисуется.
+_MENU_TITLE_EMOJI_IDS = (
+    '5375321518504973992',
+    '5375272250935126654',
+    '5375492784620872543',
+    '5375272250935126654',
+    '5375223876718466233',
+    '5375075640217213286',
+)
+_MENU_TITLE_HTML = ''.join(f'<tg-emoji emoji-id="{eid}">🔤</tg-emoji>' for eid in _MENU_TITLE_EMOJI_IDS)
+
+
 async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     """Собирает rich-HTML главного меню (контент, без клавиатуры)."""
     blocks: list[str] = []
+
+    # Заголовок-вордмарк из кастом-эмодзи — самый верх
+    if _MENU_TITLE_HTML:
+        blocks.append(f'<h3>{_MENU_TITLE_HTML}</h3>')
 
     logo_url = _resolve_rich_logo_url()
     if logo_url:

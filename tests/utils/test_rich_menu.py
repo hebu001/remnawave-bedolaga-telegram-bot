@@ -100,8 +100,9 @@ async def test_builder_single_subscription_structure(monkeypatch):
 
     # Никаких сырых тегов пользователя
     assert '<script>' not in html_out
-    # Структура: заголовок с ID, подписка в таблице, футер
-    assert html_out.startswith('<h4>')
+    # Структура: вордмарк-заголовок из кастом-эмодзи, ID, подписка в таблице, футер
+    assert html_out.startswith('<h3>')
+    assert 'tg-emoji' in html_out
     assert '<code>765468039</code>' in html_out
     assert '<table bordered striped>' in html_out
     assert '<footer>' in html_out
