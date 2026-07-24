@@ -413,80 +413,52 @@ _MENU_TITLE_HTML = ''.join(f'<tg-emoji emoji-id="{eid}">🔤</tg-emoji>' for eid
 
 
 async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
-    """Собирает rich-HTML главного меню (контент, без клавиатуры)."""
-    blocks: list[str] = []
+    """Rich-HTML главного меню: классический профиль-layout.
 
-    # Заголовок-вордмарк из кастом-эмодзи — самый верх
-    if _MENU_TITLE_HTML:
-        blocks.append(f'<h3>{_MENU_TITLE_HTML}</h3>')
+    Секции «Ваш профиль» и «Подписка», ссылка на подписку в blockquote,
+    кабинет и канал. skip_entity_detection=True, поэтому ссылки — явными
+    <a href>, иначе в rich-сообщении они не кликабельны.
+    """
+    from app.handlers.menu import _get_subscription_status
+
+    blocks: list[str] = []
 
     logo_url = _resolve_rich_logo_url()
     if logo_url:
         blocks.append(f'<img src="{html.escape(logo_url, quote=True)}"/>')
 
-    # Профиль: только ID (Bot API <code> — копируется по тапу)
+    # Профиль
+    profile = [
+        texts.t('MAIN_MENU_RICH_PROFILE_HEADER', '<b>━ 🪪 Ваш профиль ━</b>'),
+        f'👤 <b>{html.escape(user.full_name or "")}</b>',
+    ]
     telegram_id = getattr(user, 'telegram_id', '') or ''
     if telegram_id:
-        blocks.append(f'<h4>🆔 <code>{html.escape(str(telegram_id))}</code></h4>')
+        profile.append(f'🆔 <code>{html.escape(str(telegram_id))}</code>')
 
-    # Подписка — таблица (Bot API 10.1)
-    if settings.is_multi_tariff_enabled():
-        subscriptions = await get_all_subscriptions_by_user_id(db, user.id)
-        subscription_block = _build_subscriptions_table(subscriptions, texts)
-        if len(subscriptions) > 1 and settings.MAIN_MENU_RICH_SUBSCRIPTIONS_COLLAPSIBLE:
-            heading = texts.t('MAIN_MENU_RICH_SUBSCRIPTIONS_HEADING', '📱 Подписки')
-            summary = f'<b>{html.escape(heading)} ({len(subscriptions)})</b>'
-            blocks.append(f'<details><summary>{summary}</summary>{subscription_block}</details>')
-        else:
-            blocks.append(subscription_block)
-    else:
-        blocks.append(await _build_single_subscription_block(user, texts, db))
+    # Подписка (статус-строки из того же builder-а, что и классическое меню)
+    sub_lines = [texts.t('MAIN_MENU_RICH_SUB_HEADER', '<b>━ 📱 Подписка ━</b>')]
+    status_text = _get_subscription_status(user, texts)
+    sub_lines.extend(html.escape(part) for part in status_text.split('\n') if part.strip())
 
-    trial_link = _trial_offer_link(user, texts)
-    if trial_link:
-        blocks.append(f'<p>{trial_link}</p>')
+    blocks.append('<br>'.join(profile) + '<br><br>' + '<br>'.join(sub_lines))
 
-    hint_sections: list[str] = []
-    try:
-        promo_hint = await build_promo_offer_hint(db, user, texts)
-        if promo_hint:
-            hint_sections.append(promo_hint.strip())
-    except Exception as hint_error:
-        logger.debug('Не удалось построить подсказку промо-предложения для rich-меню', hint_error=hint_error)
-    try:
-        test_access_hint = await build_test_access_hint(db, user, texts)
-        if test_access_hint:
-            hint_sections.append(test_access_hint.strip())
-    except Exception as test_error:
-        logger.debug('Не удалось построить подсказку тестового доступа для rich-меню', test_error=test_error)
+    # Ссылка на подписку — blockquote, кликабельная
+    subscription = getattr(user, 'subscription', None)
+    sub_url = getattr(subscription, 'subscription_url', None) if subscription else None
+    if sub_url and not settings.should_hide_subscription_link():
+        blocks.append(f'<blockquote><a href="{html.escape(sub_url, quote=True)}">{html.escape(sub_url)}</a></blockquote>')
 
-    if hint_sections:
-        summary = texts.t('MAIN_MENU_RICH_HINTS_SUMMARY', '💡 Акции и подсказки')
-        # Строки подсказок содержат только inline-теги (<code>{bar}</code>) — переносы
-        # превращаем в отдельные параграфы внутри details-блока.
-        inner = ''.join(f'<p>{line}</p>' for section in hint_sections for line in section.split('\n') if line.strip())
-        blocks.append(f'<details open><summary>{html.escape(summary)}</summary>{inner}</details>')
-
-    try:
-        random_message = await get_random_active_message(db)
-    except Exception as error:
-        random_message = None
-        logger.error('Ошибка получения случайного сообщения для rich-меню', error=error)
-    if random_message:
-        # Rich-HTML живёт по правилам HTML: перенос строки — только через <br>.
-        random_message_html = _sanitize_rich_inline(random_message).replace('\n', '<br>')
-        blocks.append(f'<blockquote>{random_message_html}</blockquote>')
-
-    # Баланс — отдельной строкой
-    balance_template = texts.t('MAIN_MENU_RICH_BALANCE', '💰 Баланс: {balance}')
-    balance_value = f'<b>{html.escape(settings.format_price(user.balance_kopeks))}</b>'
-    blocks.append(f'<p>{html.escape(balance_template).replace("{balance}", balance_value)}</p>')
-
-    # Ссылки — отдельными строками: кабинет (без https, авто-ссылка) и канал
+    # Кабинет + канал
+    tail: list[str] = []
     cabinet_domain = (settings.CABINET_URL or '').split('://')[-1].rstrip('/')
     if cabinet_domain and cabinet_domain != 'example.com/cabinet':
-        blocks.append(f'<p>🔗 {html.escape(cabinet_domain)}</p>')
-    blocks.append(f'<p>{texts.t("MAIN_MENU_RICH_CHANNEL", "📢 @evovpn")}</p>')
+        tail.append(
+            f'🔗 Кабинет: <a href="{html.escape(settings.CABINET_URL, quote=True)}">{html.escape(cabinet_domain)}</a>'
+        )
+    tail.append(texts.t('MAIN_MENU_RICH_CHANNEL', '📢 Канал: <a href="https://t.me/evovpn">@evovpn</a>'))
+    # пустая строка перед блоком ссылок (как в классическом меню)
+    blocks.append('<br>' + '<br>'.join(tail))
 
     action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
     blocks.append(f'<footer>{html.escape(action_prompt)}</footer>')

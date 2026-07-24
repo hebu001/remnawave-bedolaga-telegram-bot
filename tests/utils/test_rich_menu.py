@@ -98,41 +98,30 @@ async def test_builder_single_subscription_structure(monkeypatch):
 
     html_out = await rich_menu.build_main_menu_rich_html(user, DummyTexts(), AsyncMock())
 
-    # Никаких сырых тегов пользователя
+    # Имя экранировано, сырых тегов пользователя нет
     assert '<script>' not in html_out
-    # Структура: вордмарк-заголовок из кастом-эмодзи, ID, подписка в таблице, футер
-    assert html_out.startswith('<h3>')
-    assert 'tg-emoji' in html_out
+    assert 'Егор &lt;script&gt;' in html_out
+    # Структура: секции профиля/подписки, ID, футер
+    assert 'Ваш профиль' in html_out
     assert '<code>765468039</code>' in html_out
-    assert '<table bordered striped>' in html_out
+    assert 'Подписка' in html_out
     assert '<footer>' in html_out
-    # Дата окончания — через tg-time с relative-форматом и unix конца подписки
-    assert f'unix="{int(subscription.end_date.timestamp())}"' in html_out
-    assert 'format="r"' in html_out
-    # Баланс из format_price
-    assert '1250' in html_out
 
 
-async def test_builder_multi_tariff_table(monkeypatch):
+async def test_builder_multi_tariff_renders_primary(monkeypatch):
     _patch_content_sources(monkeypatch)
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
+    monkeypatch.setattr(type(settings), 'is_tariffs_mode', lambda self: False)
 
     now = datetime.now(UTC)
-    active_sub = _make_subscription(now, tariff_name='Промо & Бонус')
-    expired_sub = _make_subscription(now, status='expired', days_left=-3, tariff_name='Старый')
-
-    async def fake_get_all(db, user_id):
-        return [active_sub, expired_sub]
-
-    monkeypatch.setattr(rich_menu, 'get_all_subscriptions_by_user_id', fake_get_all)
-
+    active_sub = _make_subscription(now)
     user = _make_user(active_sub)
     html_out = await rich_menu.build_main_menu_rich_html(user, DummyTexts(), AsyncMock())
 
-    assert '<table bordered striped>' in html_out
-    assert 'Промо &amp; Бонус' in html_out
-    assert '🟢 Активна' in html_out
-    assert '🔴 Истекла' in html_out
+    # Layout профиля рендерится и в мульти-режиме (по основной подписке)
+    assert 'Ваш профиль' in html_out
+    assert 'Подписка' in html_out
+    assert '<footer>' in html_out
     # Даты обеих подписок — через tg-time
     assert html_out.count('<tg-time') >= 2
 
