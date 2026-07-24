@@ -76,8 +76,7 @@ services:
       - ./uploads:/app/uploads:rw
       # Логотип для сообщений
       - ./vpn_logo.png:/app/vpn_logo.png:ro
-    ports:
-      - '${WEB_API_PORT:-8080}:8080'
+    # Порт 8080 доступен только внутри Docker-сети (Caddy проксирует)
     networks:
       - bot_network
     healthcheck:
@@ -91,10 +90,30 @@ services:
       retries: 3
       start_period: 30s
 
+  caddy:
+    image: caddy:2-alpine
+    container_name: remnawave_caddy
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - bot_network
+
+
 volumes:
   postgres_data:
     driver: local
   redis_data:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
     driver: local
 
 networks:
