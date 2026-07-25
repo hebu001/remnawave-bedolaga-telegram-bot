@@ -457,30 +457,34 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     # Профиль (заголовок — операторский шаблон с анимированным эмодзи; имя — данные)
     profile = [
         _rich_text(texts.t('MAIN_MENU_RICH_PROFILE_HEADER', f'<b>━ {_ANIM_PROFILE} Ваш профиль ━</b>')),
-        f'👤 <b>{html.escape(user.full_name or "")}</b>',
+        f'<b>{html.escape(user.full_name or "")}</b>',
     ]
     telegram_id = getattr(user, 'telegram_id', '') or ''
     if telegram_id:
-        profile.append(f'🆔 <code>{html.escape(str(telegram_id))}</code>')
+        profile.append(f'ID: <code>{html.escape(str(telegram_id))}</code>')
 
-    # Подписка: заголовок + статус·дата ОДНОЙ строкой, ✅ активного — анимированный
-    sub_lines = [_rich_text(texts.t('MAIN_MENU_RICH_SUB_HEADER', f'<b>━ {_ANIM_SUB} Подписка ━</b>'))]
+    # Подписка: заголовок + ВЫДЕЛЕННЫЙ blockquote (статус·дата одной строкой + ссылка)
+    sub_header = _rich_text(texts.t('MAIN_MENU_RICH_SUB_HEADER', f'<b>━ {_ANIM_SUB} Подписка ━</b>'))
     status_text = _get_subscription_status(user, texts)
     status_parts = [p.strip() for p in status_text.split('\n') if p.strip()]
+    sub_body: list[str] = []
     if status_parts:
         # объединяем статус и дату в одну строку, убирая ведущий 📅 у даты
         date_bits = ' '.join(re.sub(r'^📅\s*', '', p) for p in status_parts[1:])
         merged = f'{status_parts[0]} {date_bits}'.strip()
         merged = merged.replace('✅', _ANIM_ACTIVE, 1)  # анимируем ✅ активной подписки
-        sub_lines.append(_rich_text(merged))
+        sub_body.append(_rich_text(merged))
 
-    blocks.append('<br>'.join(profile) + '<br><br>' + '<br>'.join(sub_lines))
-
-    # Ссылка на подписку — blockquote, кликабельная
     subscription = getattr(user, 'subscription', None)
     sub_url = getattr(subscription, 'subscription_url', None) if subscription else None
     if sub_url and not settings.should_hide_subscription_link():
-        blocks.append(f'<blockquote><a href="{html.escape(sub_url, quote=True)}">{html.escape(sub_url)}</a></blockquote>')
+        sub_body.append(f'<a href="{html.escape(sub_url, quote=True)}">{html.escape(sub_url)}</a>')
+
+    subscription_block = sub_header
+    if sub_body:
+        subscription_block += '<blockquote>' + '<br>'.join(sub_body) + '</blockquote>'
+
+    blocks.append('<br>'.join(profile) + '<br><br>' + subscription_block)
 
     # Кабинет + канал
     tail: list[str] = []
