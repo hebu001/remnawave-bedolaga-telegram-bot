@@ -49,6 +49,7 @@ from app.utils.miniapp_buttons import build_miniapp_startapp_url
 from app.utils.promo_offer import build_promo_offer_hint, build_test_access_hint
 from app.utils.subscription_utils import get_happ_cryptolink_redirect_link
 from app.utils.timezone import format_local_datetime
+from app.utils.validators import sanitize_html
 
 
 logger = structlog.get_logger(__name__)
@@ -199,6 +200,24 @@ def _sanitize_rich_inline(value: str) -> str:
     value = _SPOILER_SPAN_RE.sub(r'<tg-spoiler>\2</tg-spoiler>', value)
     value = _SPAN_TAG_RE.sub('', value)
     return _IMG_TAG_RE.sub('', value)
+
+
+def _rich_text(value: str) -> str:
+    """Готовит редактируемый оператором ТЕКСТ ШАБЛОНА к вставке в rich-HTML.
+
+    Тексты меню правятся из админки и могут нести разметку из ALLOWED_HTML_TAGS —
+    прежде всего <tg-emoji emoji-id=...> с премиум-эмодзи. Глухой html.escape()
+    выводил такие теги сырыми (клиент видел «<tg-emoji …>» текстом), хотя
+    rich-сообщения их поддерживают. Поэтому: escape → sanitize_html (пропускает
+    разрешённое подмножество тегов, срезает чужие теги/атрибуты и javascript:) →
+    приведение к rich-HTML.
+
+    ТОЛЬКО для шаблонов. Значения в {плейсхолдерах} — имя, тариф, суммы, URL —
+    экранируются как раньше: это данные, а не разметка.
+    """
+    if not value:
+        return value
+    return _sanitize_rich_inline(sanitize_html(html.escape(value)))
 
 
 def _renew_link(subscription_id: int | None, texts) -> str:
@@ -427,9 +446,9 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     if logo_url:
         blocks.append(f'<img src="{html.escape(logo_url, quote=True)}"/>')
 
-    # Профиль
+    # Профиль (заголовок — операторский шаблон, имя — данные пользователя)
     profile = [
-        texts.t('MAIN_MENU_RICH_PROFILE_HEADER', '<b>━ 🪪 Ваш профиль ━</b>'),
+        _rich_text(texts.t('MAIN_MENU_RICH_PROFILE_HEADER', '<b>━ 🪪 Ваш профиль ━</b>')),
         f'👤 <b>{html.escape(user.full_name or "")}</b>',
     ]
     telegram_id = getattr(user, 'telegram_id', '') or ''
@@ -437,9 +456,9 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
         profile.append(f'🆔 <code>{html.escape(str(telegram_id))}</code>')
 
     # Подписка (статус-строки из того же builder-а, что и классическое меню)
-    sub_lines = [texts.t('MAIN_MENU_RICH_SUB_HEADER', '<b>━ 📱 Подписка ━</b>')]
+    sub_lines = [_rich_text(texts.t('MAIN_MENU_RICH_SUB_HEADER', '<b>━ 📱 Подписка ━</b>'))]
     status_text = _get_subscription_status(user, texts)
-    sub_lines.extend(html.escape(part) for part in status_text.split('\n') if part.strip())
+    sub_lines.extend(_rich_text(part) for part in status_text.split('\n') if part.strip())
 
     blocks.append('<br>'.join(profile) + '<br><br>' + '<br>'.join(sub_lines))
 
@@ -456,12 +475,12 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
         tail.append(
             f'🔗 Кабинет: <a href="{html.escape(settings.CABINET_URL, quote=True)}">{html.escape(cabinet_domain)}</a>'
         )
-    tail.append(texts.t('MAIN_MENU_RICH_CHANNEL', '📢 Канал: <a href="https://t.me/evovpn">@evovpn</a>'))
+    tail.append(_rich_text(texts.t('MAIN_MENU_RICH_CHANNEL', '📢 Канал: <a href="https://t.me/evovpn">@evovpn</a>')))
     # пустая строка перед блоком ссылок (как в классическом меню)
     blocks.append('<br>' + '<br>'.join(tail))
 
-    action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
-    blocks.append(f'<footer>{html.escape(action_prompt)}</footer>')
+    action_prompt = _rich_text(texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:'))
+    blocks.append(f'<footer>{action_prompt}</footer>')
 
     return ''.join(blocks)
 
