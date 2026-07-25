@@ -63,6 +63,10 @@ class WebAPIServer:
             lifespan='on',
             access_log=False,
             log_config=log_config,
+            # Защитный клапан (инцидент 08.07.2026): без лимита сотни одновременных
+            # запросов кабинета держат сессии БД и душат единственное ядро event loop.
+            # Лишние запросы получают быстрый 503 вместо коллапса всего процесса.
+            limit_concurrency=64,
         )
         self._server = uvicorn.Server(self._config)
         self._task: asyncio.Task[None] | None = None

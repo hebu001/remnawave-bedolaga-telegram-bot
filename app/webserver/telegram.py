@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import defaultdict, deque
 from typing import Any
 
 import structlog
@@ -13,6 +15,43 @@ from app.config import settings
 
 
 logger = structlog.get_logger(__name__)
+
+# Экстренный rate-limit на входе вебхука (инцидент 07.07.2026): аккаунты,
+# шлющие больше _INGRESS_RATE_LIMIT апдейтов за _INGRESS_RATE_WINDOW секунд,
+# молча отбрасываются до валидации и очереди. Живой пользователь в лимит не упирается.
+_INGRESS_RATE_LIMIT = 25
+_INGRESS_RATE_WINDOW = 60.0
+_ingress_hits: dict[int, deque[float]] = defaultdict(deque)
+
+
+def _ingress_rate_limited(payload: dict) -> bool:
+    obj = (
+        payload.get('message')
+        or payload.get('callback_query')
+        or payload.get('pre_checkout_query')
+        or payload.get('chat_member')
+    )
+    if not isinstance(obj, dict):
+        return False
+    sender = obj.get('from')
+    if not isinstance(sender, dict):
+        return False
+    uid = sender.get('id')
+    if not isinstance(uid, int):
+        return False
+
+    now = time.monotonic()
+    if len(_ingress_hits) > 100_000:  # защита памяти: редкая мгновенная «амнистия»
+        _ingress_hits.clear()
+    hits = _ingress_hits[uid]
+    while hits and now - hits[0] > _INGRESS_RATE_WINDOW:
+        hits.popleft()
+    hits.append(now)
+    if len(hits) > _INGRESS_RATE_LIMIT:
+        if len(hits) == _INGRESS_RATE_LIMIT + 1:  # логируем один раз на окно
+            logger.warning('Ingress rate-limit: отбрасываю флуд', telegram_id=uid)
+        return True
+    return False
 
 
 class TelegramWebhookProcessorError(RuntimeError):
@@ -220,6 +259,15 @@ def create_telegram_router(
         except Exception as error:  # pragma: no cover - defensive logging
             logger.error('Ошибка чтения Telegram webhook', error=error)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='invalid_payload') from error
+
+        # Экстренная защита от флуда (инцидент 07.07.2026): мусор отбрасывается
+        # до pydantic-валидации и очереди, иначе он вытесняет реальные команды.
+        if isinstance(payload, dict):
+            callback = payload.get('callback_query')
+            if isinstance(callback, dict) and callback.get('data') == 'sub_channel_check':
+                return JSONResponse({'status': 'ok'})
+            if _ingress_rate_limited(payload):
+                return JSONResponse({'status': 'ok'})
 
         try:
             update = Update.model_validate(payload)

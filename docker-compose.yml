@@ -42,6 +42,15 @@ services:
     build: .
     container_name: remnawave_bot
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: '3'
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,7 +59,12 @@ services:
     env_file:
       - .env
     environment:
-      FORCE_COLOR: '1'
+      # FORCE_COLOR выключен 08.07.2026: rich-рендеринг трейсбеков (ast.parse на каждую
+      # ошибку) выжигал CPU при шторме ошибок и валил бота — см. инцидент-историю
+      FORCE_COLOR: '0'
+      # Без column-позиций в code objects трейсбеки Python 3.13 не делают ast.parse
+      # исходников (каретки ^^^) — при шторме ошибок это экономит целое ядро
+      PYTHONNODEBUGRANGES: '1'
       DOCKER_ENV: 'true'
       DATABASE_MODE: 'auto'
       POSTGRES_HOST: 'postgres'
@@ -76,7 +90,8 @@ services:
       - ./uploads:/app/uploads:rw
       # Логотип для сообщений
       - ./vpn_logo.png:/app/vpn_logo.png:ro
-    # Порт 8080 доступен только внутри Docker-сети (Caddy проксирует)
+    # Порт 8080 доступен только внутри Docker-сети — Caddy из /opt/caddy проксирует
+    # через shared external network remnawave-bedolaga-telegram-bot_bot_network.
     networks:
       - bot_network
     healthcheck:
@@ -90,30 +105,10 @@ services:
       retries: 3
       start_period: 30s
 
-  caddy:
-    image: caddy:2-alpine
-    container_name: remnawave_caddy
-    restart: unless-stopped
-    ports:
-      - '80:80'
-      - '443:443'
-      - '443:443/udp'
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - bot_network
-
-
 volumes:
   postgres_data:
     driver: local
   redis_data:
-    driver: local
-  caddy_data:
-    driver: local
-  caddy_config:
     driver: local
 
 networks:
