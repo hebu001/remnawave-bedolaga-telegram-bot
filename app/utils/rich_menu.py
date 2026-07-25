@@ -463,26 +463,24 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     if telegram_id:
         profile.append(f'ID: <code>{html.escape(str(telegram_id))}</code>')
 
-    # Подписка: заголовок + ВЫДЕЛЕННЫЙ blockquote (статус·дата одной строкой + ссылка)
+    # Подписка: заголовок + статус·дата ОДНОЙ строкой (вне цитаты), ссылка — в цитате
     sub_header = _rich_text(texts.t('MAIN_MENU_RICH_SUB_HEADER', f'<b>━ {_ANIM_SUB} Подписка ━</b>'))
     status_text = _get_subscription_status(user, texts)
     status_parts = [p.strip() for p in status_text.split('\n') if p.strip()]
-    sub_body: list[str] = []
+    subscription_block = sub_header
     if status_parts:
         # объединяем статус и дату в одну строку, убирая ведущий 📅 у даты
         date_bits = ' '.join(re.sub(r'^📅\s*', '', p) for p in status_parts[1:])
         merged = f'{status_parts[0]} {date_bits}'.strip()
         merged = merged.replace('✅', _ANIM_ACTIVE, 1)  # анимируем ✅ активной подписки
-        sub_body.append(_rich_text(merged))
+        subscription_block += '<br>' + _rich_text(merged)
 
     subscription = getattr(user, 'subscription', None)
     sub_url = getattr(subscription, 'subscription_url', None) if subscription else None
     if sub_url and not settings.should_hide_subscription_link():
-        sub_body.append(f'<a href="{html.escape(sub_url, quote=True)}">{html.escape(sub_url)}</a>')
-
-    subscription_block = sub_header
-    if sub_body:
-        subscription_block += '<blockquote expandable>' + '<br>'.join(sub_body) + '</blockquote>'
+        # только ссылка — в выделенной раскрываемой цитате
+        link = f'<a href="{html.escape(sub_url, quote=True)}">{html.escape(sub_url)}</a>'
+        subscription_block += f'<blockquote expandable>{link}</blockquote>'
 
     blocks.append('<br>'.join(profile) + '<br><br>' + subscription_block)
 
