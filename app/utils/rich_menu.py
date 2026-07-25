@@ -482,7 +482,7 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
 
     subscription_block = sub_header
     if sub_body:
-        subscription_block += '<blockquote>' + '<br>'.join(sub_body) + '</blockquote>'
+        subscription_block += '<pre>' + '<br>'.join(sub_body) + '</pre>'
 
     blocks.append('<br>'.join(profile) + '<br><br>' + subscription_block)
 
