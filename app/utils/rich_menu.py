@@ -430,6 +430,14 @@ _MENU_TITLE_EMOJI_IDS = (
 )
 _MENU_TITLE_HTML = ''.join(f'<tg-emoji emoji-id="{eid}">🔤</tg-emoji>' for eid in _MENU_TITLE_EMOJI_IDS)
 
+# Анимированные премиум-эмодзи (Bot API tg-emoji) для секций меню. Каждый
+# оборачивает обычный эмодзи-фолбэк на случай, если кастомный не отрисуется.
+_ANIM_PROFILE = '<tg-emoji emoji-id="5375456792794932918">🪪</tg-emoji>'
+_ANIM_SUB = '<tg-emoji emoji-id="5375589030543007016">📱</tg-emoji>'
+_ANIM_ACTIVE = '<tg-emoji emoji-id="5375488025797109671">✅</tg-emoji>'
+_ANIM_CABINET = '<tg-emoji emoji-id="5375448847105433363">🔗</tg-emoji>'
+_ANIM_CHANNEL = '<tg-emoji emoji-id="5375457050492968577">📢</tg-emoji>'
+
 
 async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     """Rich-HTML главного меню: классический профиль-layout.
@@ -446,19 +454,25 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     if logo_url:
         blocks.append(f'<img src="{html.escape(logo_url, quote=True)}"/>')
 
-    # Профиль (заголовок — операторский шаблон, имя — данные пользователя)
+    # Профиль (заголовок — операторский шаблон с анимированным эмодзи; имя — данные)
     profile = [
-        _rich_text(texts.t('MAIN_MENU_RICH_PROFILE_HEADER', '<b>━ 🪪 Ваш профиль ━</b>')),
+        _rich_text(texts.t('MAIN_MENU_RICH_PROFILE_HEADER', f'<b>━ {_ANIM_PROFILE} Ваш профиль ━</b>')),
         f'👤 <b>{html.escape(user.full_name or "")}</b>',
     ]
     telegram_id = getattr(user, 'telegram_id', '') or ''
     if telegram_id:
         profile.append(f'🆔 <code>{html.escape(str(telegram_id))}</code>')
 
-    # Подписка (статус-строки из того же builder-а, что и классическое меню)
-    sub_lines = [_rich_text(texts.t('MAIN_MENU_RICH_SUB_HEADER', '<b>━ 📱 Подписка ━</b>'))]
+    # Подписка: заголовок + статус·дата ОДНОЙ строкой, ✅ активного — анимированный
+    sub_lines = [_rich_text(texts.t('MAIN_MENU_RICH_SUB_HEADER', f'<b>━ {_ANIM_SUB} Подписка ━</b>'))]
     status_text = _get_subscription_status(user, texts)
-    sub_lines.extend(_rich_text(part) for part in status_text.split('\n') if part.strip())
+    status_parts = [p.strip() for p in status_text.split('\n') if p.strip()]
+    if status_parts:
+        # объединяем статус и дату в одну строку, убирая ведущий 📅 у даты
+        date_bits = ' '.join(re.sub(r'^📅\s*', '', p) for p in status_parts[1:])
+        merged = f'{status_parts[0]} {date_bits}'.strip()
+        merged = merged.replace('✅', _ANIM_ACTIVE, 1)  # анимируем ✅ активной подписки
+        sub_lines.append(_rich_text(merged))
 
     blocks.append('<br>'.join(profile) + '<br><br>' + '<br>'.join(sub_lines))
 
@@ -473,9 +487,13 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     cabinet_domain = (settings.CABINET_URL or '').split('://')[-1].rstrip('/')
     if cabinet_domain and cabinet_domain != 'example.com/cabinet':
         tail.append(
-            f'🔗 Кабинет: <a href="{html.escape(settings.CABINET_URL, quote=True)}">{html.escape(cabinet_domain)}</a>'
+            f'{_ANIM_CABINET} Кабинет: <a href="{html.escape(settings.CABINET_URL, quote=True)}">{html.escape(cabinet_domain)}</a>'
         )
-    tail.append(_rich_text(texts.t('MAIN_MENU_RICH_CHANNEL', '📢 Канал: <a href="https://t.me/evovpn">@evovpn</a>')))
+    tail.append(
+        _rich_text(
+            texts.t('MAIN_MENU_RICH_CHANNEL', f'{_ANIM_CHANNEL} Канал: <a href="https://t.me/evovpn">@evovpn</a>')
+        )
+    )
     # пустая строка перед блоком ссылок (как в классическом меню)
     blocks.append('<br>' + '<br>'.join(tail))
 
