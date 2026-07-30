@@ -64,6 +64,7 @@ from .promo import router as promo_router
 from .promocode import router as promocode_router
 from .referral import router as referral_router
 from .site_verification import router as site_verification_router
+from .subpage import router as subpage_router
 from .subscription import router as subscription_router
 from .subscription_modules.multi_tariff import router as multi_tariff_subscription_router
 from .support_ws import router as support_ws_router
@@ -84,6 +85,9 @@ router = APIRouter(prefix='/cabinet', tags=['Cabinet'], redirect_slashes=False)
 # Final path becomes `/cabinet/public/site-verification`. Has its own
 # `/public` prefix so it's clearly separated from authenticated routes.
 router.include_router(site_verification_router)
+
+# Public (unauthenticated) payments from the Remnawave subscription page.
+router.include_router(subpage_router)
 
 # Include all sub-routers
 router.include_router(auth_router)

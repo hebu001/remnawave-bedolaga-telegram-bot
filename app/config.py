@@ -1273,6 +1273,12 @@ class Settings(BaseSettings):
         ''  # Comma-separated IPs/CIDRs of trusted reverse proxies (e.g. '127.0.0.1,10.0.0.0/8')
     )
 
+    # Payments initiated from the Remnawave subscription page (sub page).
+    # SUBPAGE_URL is the public base URL of the subscription page, used to
+    # build payment return URLs (e.g. https://sub.example.com).
+    SUBPAGE_PAYMENT_ENABLED: bool = False
+    SUBPAGE_URL: str | None = None
+
     # OAuth 2.0 provider settings for cabinet
     OAUTH_GOOGLE_CLIENT_ID: str = ''
     OAUTH_GOOGLE_CLIENT_SECRET: str = ''
@@ -3646,6 +3652,9 @@ class Settings(BaseSettings):
     # Cabinet methods
     def is_cabinet_enabled(self) -> bool:
         return bool(self.CABINET_ENABLED)
+
+    def is_subpage_payment_enabled(self) -> bool:
+        return bool(self.SUBPAGE_PAYMENT_ENABLED and self.SUBPAGE_URL and self.CABINET_ENABLED)
 
     def get_cabinet_jwt_secret(self) -> str:
         if self.CABINET_JWT_SECRET:

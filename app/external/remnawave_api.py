@@ -631,6 +631,16 @@ class RemnaWaveAPI:
                 return None
             raise
 
+    async def get_user_by_short_uuid(self, short_uuid: str) -> RemnaWaveUser | None:
+        try:
+            response = await self._make_request('GET', f'/api/users/by-short-uuid/{short_uuid}')
+            user = self._parse_user(response['response'])
+            return await self.enrich_user_with_happ_link(user)
+        except RemnaWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
     async def get_user_by_email(self, email: str) -> list[RemnaWaveUser]:
         """Get users by email address."""
         try:

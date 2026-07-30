@@ -595,6 +595,19 @@ class YooKassaPaymentMixin:
             if guest_result is not None:
                 return True
 
+            # --- Subscription-page renewal flow -------------------------------
+            from app.services.subpage_payment_service import try_fulfill_subpage_renewal
+
+            subpage_result = await try_fulfill_subpage_renewal(
+                db,
+                metadata=payment_metadata,
+                payment_amount_kopeks=webhook_amount_kopeks,
+                provider_payment_id=payment.yookassa_payment_id,
+                provider_name='yookassa',
+            )
+            if subpage_result is not None:
+                return True
+
             # --- Standard user payment flow ------------------------------------
             payment_description = getattr(payment, 'description', 'YooKassa платеж')
 
