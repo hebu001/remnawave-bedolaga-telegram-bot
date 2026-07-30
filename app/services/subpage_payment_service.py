@@ -22,11 +22,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.models import PaymentMethod, Subscription, SubscriptionStatus, TransactionType, User
+from app.database.models import (
+    PaymentMethod,
+    Subscription,
+    SubscriptionStatus,
+    TransactionType,
+    User,
+    UserPromoGroup,
+)
 from app.utils.cache import cache, cache_key
 
 
 logger = structlog.get_logger(__name__)
+
+
+def _subscription_load_options():
+    # pricing_engine resolves the user's promo group lazily; without these
+    # eager loads any relationship access raises MissingGreenlet in async.
+    return (
+        selectinload(Subscription.user).selectinload(User.user_promo_groups).selectinload(UserPromoGroup.promo_group),
+        selectinload(Subscription.user).selectinload(User.promo_group),
+        selectinload(Subscription.tariff),
+    )
 
 SUBPAGE_INVOICE_PREFIX = 'subpage_invoice'
 SUBPAGE_INVOICE_TTL = 3600  # pending invoice lifetime
@@ -54,7 +71,7 @@ async def resolve_subscription_by_short_uuid(
 
     result = await db.execute(
         select(Subscription)
-        .options(selectinload(Subscription.user), selectinload(Subscription.tariff))
+        .options(*_subscription_load_options())
         .where(Subscription.remnawave_short_uuid == short_uuid)
         .limit(1)
     )
@@ -90,7 +107,7 @@ async def resolve_subscription_by_short_uuid(
     if settings.is_multi_tariff_enabled():
         result = await db.execute(
             select(Subscription)
-            .options(selectinload(Subscription.user), selectinload(Subscription.tariff))
+            .options(*_subscription_load_options())
             .where(Subscription.remnawave_uuid == panel_user.uuid)
             .limit(1)
         )
@@ -249,7 +266,7 @@ async def try_fulfill_subpage_renewal(
 
     result = await db.execute(
         select(Subscription)
-        .options(selectinload(Subscription.user), selectinload(Subscription.tariff))
+        .options(*_subscription_load_options())
         .where(Subscription.id == subscription_id)
         .limit(1)
     )
