@@ -43,6 +43,9 @@ class SubpageMethod(BaseModel):
 class SubpageRenewalOption(BaseModel):
     periodDays: int
     priceKopeks: int
+    basePriceKopeks: int = 0
+    devicesPriceKopeks: int = 0
+    extraDevices: int = 0
     label: str | None = None
 
 
@@ -50,6 +53,10 @@ class SubpageRenewalOptionsResponse(BaseModel):
     enabled: bool
     currency: str = 'RUB'
     expiresAt: str | None = None
+    tariffName: str | None = None
+    trafficLimitGb: int | None = None
+    deviceLimit: int | None = None
+    cabinetUrl: str | None = None
     options: list[SubpageRenewalOption] = []
     methods: list[SubpageMethod] = []
 
@@ -117,10 +124,14 @@ async def get_subpage_renewal_options(
         pricing = await pricing_engine.calculate_renewal_price(db, subscription, period, user=user)
         if pricing.final_total <= 0:
             continue
+        breakdown = pricing.breakdown or {}
         options.append(
             SubpageRenewalOption(
                 periodDays=period,
                 priceKopeks=pricing.final_total,
+                basePriceKopeks=pricing.base_price,
+                devicesPriceKopeks=pricing.devices_price,
+                extraDevices=int(breakdown.get('extra_devices', 0) or 0),
                 label=format_period_label(period),
             )
         )
@@ -128,10 +139,16 @@ async def get_subpage_renewal_options(
     if not options:
         return SubpageRenewalOptionsResponse(enabled=False)
 
+    tariff = subscription.tariff if subscription.tariff_id else None
+
     end_date = subscription.end_date
     return SubpageRenewalOptionsResponse(
         enabled=True,
         expiresAt=end_date.isoformat() if end_date else None,
+        tariffName=tariff.name if tariff else None,
+        trafficLimitGb=subscription.traffic_limit_gb,
+        deviceLimit=subscription.device_limit,
+        cabinetUrl=settings.CABINET_URL or None,
         options=options,
         methods=methods,
     )
