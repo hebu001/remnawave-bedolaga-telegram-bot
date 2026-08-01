@@ -41,12 +41,9 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database.crud.subscription import get_all_subscriptions_by_user_id
 from app.database.crud.tariff import get_tariff_by_id
-from app.database.crud.user_message import get_random_active_message
 from app.database.models import User
 from app.utils.miniapp_buttons import build_miniapp_startapp_url
-from app.utils.promo_offer import build_promo_offer_hint, build_test_access_hint
 from app.utils.subscription_utils import get_happ_cryptolink_redirect_link
 from app.utils.timezone import format_local_datetime
 from app.utils.validators import sanitize_html

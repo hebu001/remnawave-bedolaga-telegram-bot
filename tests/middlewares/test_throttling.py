@@ -19,7 +19,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from app.middlewares import throttling as thr  # noqa: E402
+from app.middlewares import throttling as thr
 
 
 def make_message(text: str | None, user_id: int = 1000) -> MagicMock:
@@ -45,12 +45,12 @@ class TestNormalizeCommand:
         [
             ('/start', 'start'),
             ('/start 3838', 'start'),
-            ('/start@EvoVPN_bot', 'start'),       # @mention bypass closed
+            ('/start@EvoVPN_bot', 'start'),  # @mention bypass closed
             ('/start@EvoVPN_bot ref1', 'start'),
-            ('/start ㅤ', 'start'),           # the 2026-04-05 attack form
-            ('/startㅤ', 'start'),            # filler attached directly
-            ('/​start', 'start'),            # zero-width inside
-            ('/START', 'start'),                  # case-insensitive
+            ('/start ㅤ', 'start'),  # the 2026-04-05 attack form
+            ('/startㅤ', 'start'),  # filler attached directly
+            ('/\u200bstart', 'start'),  # zero-width inside
+            ('/START', 'start'),  # case-insensitive
             ('/help', 'help'),
             ('hello', ''),
             ('', ''),
@@ -74,8 +74,8 @@ class TestStartBurst:
 
         blocked = make_message('/start@SomeBot')
         assert await mw(handler, blocked, {}) is None
-        assert handler.await_count == 3          # 4th did not reach the handler
-        blocked.answer.assert_awaited_once()     # and the user got a notice
+        assert handler.await_count == 3  # 4th did not reach the handler
+        blocked.answer.assert_awaited_once()  # and the user got a notice
 
     @pytest.mark.asyncio
     async def test_reply_at_most_once_per_window(self):
@@ -97,9 +97,7 @@ class TestStartBurst:
 class TestAutoTempBan:
     @pytest.mark.asyncio
     async def test_repeat_flooder_is_silenced(self):
-        mw = thr.ThrottlingMiddleware(
-            rate_limit=0, start_max_calls=3, penalty_after_blocks=5, penalty_cooldown=300
-        )
+        mw = thr.ThrottlingMiddleware(rate_limit=0, start_max_calls=3, penalty_after_blocks=5, penalty_cooldown=300)
         handler = AsyncMock()
         uid = 7777
 

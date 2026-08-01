@@ -586,9 +586,7 @@ async def get_app_config(
         'baseSettings': config.get('baseSettings'),
         'uiConfig': config.get('uiConfig', {}),
         'platformNames': platform_names,
-        'hasSubscription': bool(
-            subscription_url or subscription_crypto_link or subscription_incy_crypto_link
-        ),
+        'hasSubscription': bool(subscription_url or subscription_crypto_link or subscription_incy_crypto_link),
         'subscriptionUrl': subscription_url,
         'subscriptionCryptoLink': subscription_crypto_link,
         'subscriptionIncyCryptoLink': subscription_incy_crypto_link,

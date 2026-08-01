@@ -45,6 +45,7 @@ def _subscription_load_options():
         selectinload(Subscription.tariff),
     )
 
+
 SUBPAGE_INVOICE_PREFIX = 'subpage_invoice'
 SUBPAGE_INVOICE_TTL = 3600  # pending invoice lifetime
 SUBPAGE_INVOICE_DONE_TTL = 86400  # keep terminal statuses around for the result page
@@ -265,10 +266,7 @@ async def try_fulfill_subpage_renewal(
         return True
 
     result = await db.execute(
-        select(Subscription)
-        .options(*_subscription_load_options())
-        .where(Subscription.id == subscription_id)
-        .limit(1)
+        select(Subscription).options(*_subscription_load_options()).where(Subscription.id == subscription_id).limit(1)
     )
     subscription = result.scalars().first()
     if subscription is None or subscription.user is None:

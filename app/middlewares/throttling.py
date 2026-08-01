@@ -18,7 +18,7 @@ logger = structlog.get_logger(__name__)
 # so a naive `text == '/start'` check fails while Telegram still routes it as /start.
 # U+3164 (Hangul Filler) was used in the 2026-04-05 multi-account /start flood.
 _INVISIBLE_CHARS = (
-    '​'  # zero-width space
+    '\u200b'  # zero-width space
     '‌'  # zero-width non-joiner
     '‍'  # zero-width joiner
     '⁠'  # word joiner

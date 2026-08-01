@@ -196,12 +196,12 @@ async def create_subpage_invoice(
     if amount_kopeks < settings.YOOKASSA_MIN_AMOUNT_KOPEKS or amount_kopeks > settings.YOOKASSA_MAX_AMOUNT_KOPEKS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Amount out of provider limits')
 
-    from app.services.payment_service import PaymentService
-
     # Token is minted before the provider call so it can ride along in the
     # payment metadata; the Redis record is written only after the provider
     # accepts the payment.
     import secrets as _secrets
+
+    from app.services.payment_service import PaymentService
 
     invoice_token = _secrets.token_urlsafe(24)
 
