@@ -166,10 +166,12 @@ async def create_invoice_record(
     amount_kopeks: int,
     local_payment_id: int | None,
     provider_payment_id: str,
+    method: str = 'yookassa',
 ) -> str:
     token = token or secrets.token_urlsafe(24)
     record = {
         'status': 'pending',
+        'method': method,
         'short_uuid': short_uuid,
         'subscription_id': subscription_id,
         'user_id': user_id,
@@ -283,7 +285,10 @@ async def try_fulfill_subpage_renewal(
     from app.database.crud.transaction import create_transaction, get_transaction_by_external_id
     from app.database.crud.user import add_user_balance
 
-    payment_method = PaymentMethod.YOOKASSA if provider_name == 'yookassa' else None
+    payment_method = {
+        'yookassa': PaymentMethod.YOOKASSA,
+        'wata': PaymentMethod.WATA,
+    }.get(provider_name)
 
     if payment_method is not None:
         existing = await get_transaction_by_external_id(db, provider_payment_id, payment_method)

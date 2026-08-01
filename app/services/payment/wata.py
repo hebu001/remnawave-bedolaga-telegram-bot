@@ -481,6 +481,19 @@ class WataPaymentMixin:
         if guest_result is not None:
             return payment
 
+        # --- Subscription-page renewal flow -------------------------------
+        from app.services.subpage_payment_service import try_fulfill_subpage_renewal
+
+        subpage_result = await try_fulfill_subpage_renewal(
+            db,
+            metadata=wata_metadata,
+            payment_amount_kopeks=payment.amount_kopeks,
+            provider_payment_id=payment.payment_link_id,
+            provider_name='wata',
+        )
+        if subpage_result is not None:
+            return payment
+
         user = await payment_module.get_user_by_id(db, payment.user_id)
         if not user:
             logger.error('Пользователь не найден при обработке WATA', user_id=payment.user_id)

@@ -91,11 +91,31 @@ async def _rate_limit(request: Request, action: str, limit: int, window: int) ->
         )
 
 
-def _available_methods() -> list[SubpageMethod]:
-    methods: list[SubpageMethod] = []
-    if settings.is_yookassa_enabled():
-        methods.append(SubpageMethod(id='yookassa', name='Карта / СБП (ЮKassa)'))
-    return methods
+# Providers wired into the subpage flow (invoice creation + webhook hook)
+SUBPAGE_SUPPORTED_METHODS = ('yookassa', 'wata')
+
+
+async def _available_methods(db: AsyncSession, user) -> list[SubpageMethod]:
+    """Enabled methods in the bot's admin ranking order (PaymentMethodConfig),
+    filtered to providers the subpage flow supports. The widget offers the
+    first-ranked one."""
+    try:
+        from app.services.payment_method_config_service import get_enabled_methods_for_user
+
+        ranked = await get_enabled_methods_for_user(db, user=user, is_first_topup=False)
+        return [
+            SubpageMethod(id=m['id'], name=str(m.get('name') or m['id']))
+            for m in ranked
+            if m.get('id') in SUBPAGE_SUPPORTED_METHODS
+        ]
+    except Exception as error:
+        logger.warning('Subpage: method ranking failed, using env fallback', error=str(error))
+        methods: list[SubpageMethod] = []
+        if settings.is_yookassa_enabled():
+            methods.append(SubpageMethod(id='yookassa', name='Карта / СБП (ЮKassa)'))
+        if settings.is_wata_enabled():
+            methods.append(SubpageMethod(id='wata', name='Карта (WATA)'))
+        return methods
 
 
 @router.get('/{short_uuid}/renewal-options', response_model=SubpageRenewalOptionsResponse)
@@ -113,7 +133,7 @@ async def get_subpage_renewal_options(
 
     user, subscription = resolved
 
-    methods = _available_methods()
+    methods = await _available_methods(db, user)
     if not methods or not is_subscription_renewable(subscription):
         return SubpageRenewalOptionsResponse(enabled=False)
 
@@ -180,7 +200,8 @@ async def create_subpage_invoice(
     if not is_subscription_renewable(subscription):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Subscription is not renewable')
 
-    if body.method != 'yookassa' or not settings.is_yookassa_enabled():
+    available = await _available_methods(db, user)
+    if body.method not in {m.id for m in available}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported payment method')
 
     if body.periodDays not in get_renewal_periods(subscription):
@@ -193,7 +214,11 @@ async def create_subpage_invoice(
     if amount_kopeks <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported period')
 
-    if amount_kopeks < settings.YOOKASSA_MIN_AMOUNT_KOPEKS or amount_kopeks > settings.YOOKASSA_MAX_AMOUNT_KOPEKS:
+    if body.method == 'yookassa':
+        min_amount, max_amount = settings.YOOKASSA_MIN_AMOUNT_KOPEKS, settings.YOOKASSA_MAX_AMOUNT_KOPEKS
+    else:
+        min_amount, max_amount = settings.WATA_MIN_AMOUNT_KOPEKS, settings.WATA_MAX_AMOUNT_KOPEKS
+    if amount_kopeks < min_amount or amount_kopeks > max_amount:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Amount out of provider limits')
 
     # Token is minted before the provider call so it can ride along in the
@@ -219,17 +244,45 @@ async def create_subpage_invoice(
     }
 
     payment_service = PaymentService()
-    result = await payment_service.create_yookassa_payment(
-        db=db,
-        user_id=user.id,
-        amount_kopeks=amount_kopeks,
-        description=f'Продление подписки на {body.periodDays} дней',
-        metadata=metadata,
-        return_url=return_url,
-    )
+    description = f'Продление подписки на {body.periodDays} дней'
 
-    if not result or not result.get('confirmation_url'):
-        logger.error('Subpage: YooKassa payment creation failed', short_uuid=short_uuid)
+    if body.method == 'yookassa':
+        result = await payment_service.create_yookassa_payment(
+            db=db,
+            user_id=user.id,
+            amount_kopeks=amount_kopeks,
+            description=description,
+            metadata=metadata,
+            return_url=return_url,
+        )
+        payment_url = result.get('confirmation_url') if result else None
+        provider_payment_id = str(result.get('yookassa_payment_id')) if result else ''
+    else:
+        result = await payment_service.create_wata_payment(
+            db=db,
+            user_id=user.id,
+            amount_kopeks=amount_kopeks,
+            description=description,
+            language=getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE,
+            return_url=return_url,
+            failed_url=return_url,
+        )
+        payment_url = result.get('payment_url') if result else None
+        provider_payment_id = str(result.get('payment_link_id')) if result else ''
+        # WATA creation has no metadata param — patch the local record afterwards
+        # (same pattern as the guest-purchase flow).
+        if result:
+            from app.database.crud.wata import get_wata_payment_by_id
+
+            wata_record = await get_wata_payment_by_id(db, result['local_payment_id'])
+            if wata_record is not None:
+                merged = dict(getattr(wata_record, 'metadata_json', None) or {})
+                merged.update(metadata)
+                wata_record.metadata_json = merged
+                await db.commit()
+
+    if not result or not payment_url:
+        logger.error('Subpage: payment creation failed', short_uuid=short_uuid, method=body.method)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Payment provider error')
 
     await create_invoice_record(
@@ -239,7 +292,8 @@ async def create_subpage_invoice(
         period_days=body.periodDays,
         amount_kopeks=amount_kopeks,
         local_payment_id=result.get('local_payment_id'),
-        provider_payment_id=str(result.get('yookassa_payment_id')),
+        provider_payment_id=provider_payment_id,
+        method=body.method,
         token=invoice_token,
     )
 
@@ -252,7 +306,7 @@ async def create_subpage_invoice(
 
     return SubpageInvoiceResponse(
         invoiceToken=invoice_token,
-        paymentUrl=result['confirmation_url'],
+        paymentUrl=payment_url,
         amountKopeks=amount_kopeks,
     )
 
@@ -272,7 +326,11 @@ async def get_subpage_invoice_status(
 
     invoice_status = record.get('status', 'pending')
 
-    if invoice_status == 'pending' and record.get('local_payment_id'):
+    if (
+        invoice_status == 'pending'
+        and record.get('local_payment_id')
+        and record.get('method', 'yookassa') == 'yookassa'
+    ):
         payment = await db.get(YooKassaPayment, record['local_payment_id'])
         if payment is not None and payment.status in ('canceled', 'cancelled'):
             invoice_status = 'failed'
