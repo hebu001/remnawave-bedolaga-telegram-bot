@@ -49,7 +49,10 @@ from app.services.coupon_service import (
     is_coupon_token,
     redeem_coupon,
 )
-from app.services.guest_purchase_service import GIFT_TOKEN_MIN_PREFIX_LENGTH
+from app.services.gift_claim_service import (
+    get_gift_by_claim_identifier,
+    is_supported_gift_claim_identifier,
+)
 from app.services.main_menu_button_service import MainMenuButtonService
 from app.services.phantom_service import claim_phantom, merge_phantom_into_user
 from app.services.pinned_message_service import (
@@ -75,6 +78,17 @@ logger = structlog.get_logger(__name__)
 
 
 _SUBID_DELIMITER = '_subid_'
+
+
+def _parse_gift_start_parameter(param: str | None) -> tuple[bool, str | None]:
+    """Return ``(is_gift_namespace, claim_identifier)`` for gift deep links."""
+    if not param:
+        return False, None
+    if param.startswith('GIFT_'):
+        return True, param.removeprefix('GIFT_')
+    if param.startswith('giftclaim_'):
+        return True, param.removeprefix('giftclaim_')
+    return False, None
 
 
 def _split_start_param_subid(param: str | None) -> tuple[str | None, str | None]:
@@ -142,32 +156,9 @@ async def _activate_pending_gift_after_registration(
         if not gift_token:
             return
 
-        from sqlalchemy import select
-        from sqlalchemy.orm import selectinload
+        from app.services.guest_purchase_service import activate_purchase as svc_activate
 
-        from app.services.guest_purchase_service import (
-            GIFT_TOKEN_MIN_PREFIX_LENGTH,
-            activate_purchase as svc_activate,
-        )
-
-        # Support both full token and prefix-based lookup (Telegram truncates the token by
-        # the GIFT_/giftclaim_ prefix length). Require a long minimum prefix so a short,
-        # guessable value can't claim an arbitrary gift via startswith().
-        if len(gift_token) >= 64:
-            token_filter = GuestPurchase.token == gift_token
-        elif len(gift_token) >= GIFT_TOKEN_MIN_PREFIX_LENGTH:
-            token_filter = GuestPurchase.token.startswith(gift_token)
-        else:
-            logger.warning('Gift deep link token too short for prefix lookup', token_length=len(gift_token))
-            return
-
-        gift_result = await db.execute(
-            select(GuestPurchase)
-            .options(selectinload(GuestPurchase.tariff))
-            .where(token_filter, GuestPurchase.is_gift.is_(True))
-            .with_for_update()
-        )
-        gift_purchase = gift_result.scalars().first()
+        gift_purchase = await get_gift_by_claim_identifier(db, gift_token, for_update=True)
 
         if not gift_purchase or not gift_purchase.is_gift:
             logger.warning('Gift not found for deep link token', token_prefix=gift_token[:5])
@@ -955,6 +946,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
     start_parameter = None
 
     msg_start_arg = start_args[1] if len(start_args) > 1 else None
+    msg_is_gift_link, _ = _parse_gift_start_parameter(msg_start_arg)
 
     if pending_start_payload and msg_start_arg and pending_start_payload != msg_start_arg:
         # Одновременно есть аргумент из сообщения и pending payload.
@@ -965,23 +957,32 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         # Оптимизация: middleware уже проверил payload через БД и выставил
         # FSM-флаг 'pending_payload_is_campaign'. Используем его, чтобы
         # не делать повторный запрос в БД на каждом /start.
-        payload_is_campaign = data.get('pending_payload_is_campaign', False)
-        if not payload_is_campaign:
-            pending_first_touch_campaign = await get_campaign_by_start_parameter(
-                db, pending_start_payload, only_active=True
-            )
-            payload_is_campaign = bool(pending_first_touch_campaign)
-            if payload_is_campaign:
-                await state.update_data(pending_payload_is_campaign=True)
-        if payload_is_campaign:
-            start_parameter = pending_start_payload
+        if msg_is_gift_link:
+            # Claiming a bearer gift is an explicit action and must not be hidden
+            # behind stale first-touch campaign attribution in FSM/Redis.
+            start_parameter = msg_start_arg
             logger.info(
-                '📦 START: pending_start_payload — кампания первого касания, приоритет над новым аргументом',
-                pending_start_payload=pending_start_payload,
-                message_arg=msg_start_arg,
+                '🎁 START: свежая ссылка подарка имеет приоритет над pending payload',
+                telegram_id=message.from_user.id,
             )
         else:
-            start_parameter = msg_start_arg
+            payload_is_campaign = data.get('pending_payload_is_campaign', False)
+            if not payload_is_campaign:
+                pending_first_touch_campaign = await get_campaign_by_start_parameter(
+                    db, pending_start_payload, only_active=True
+                )
+                payload_is_campaign = bool(pending_first_touch_campaign)
+                if payload_is_campaign:
+                    await state.update_data(pending_payload_is_campaign=True)
+            if payload_is_campaign:
+                start_parameter = pending_start_payload
+                logger.info(
+                    '📦 START: pending_start_payload — кампания первого касания, приоритет над новым аргументом',
+                    pending_start_payload=pending_start_payload,
+                    message_arg=msg_start_arg,
+                )
+            else:
+                start_parameter = msg_start_arg
     elif msg_start_arg:
         start_parameter = msg_start_arg
     elif pending_start_payload:
@@ -992,15 +993,13 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         await state.set_data(data)
 
     # Handle gift code deep links: /start GIFT_{token} (or giftclaim_{token} alias)
-    if start_parameter and (start_parameter.startswith('GIFT_') or start_parameter.startswith('giftclaim_')):
-        gift_token = (
-            start_parameter.removeprefix('giftclaim_')
-            if start_parameter.startswith('giftclaim_')
-            else start_parameter[5:]  # Strip "GIFT_" prefix
-        )
-        # Reject tokens too short to be a legitimately-truncated gift token — a short prefix
-        # would match (and claim) an arbitrary gift via the startswith lookup downstream.
-        if len(gift_token) >= GIFT_TOKEN_MIN_PREFIX_LENGTH:
+    is_gift_namespace, gift_token = _parse_gift_start_parameter(start_parameter)
+    if is_gift_namespace:
+        gift_token = gift_token or ''
+        # GIFT_/giftclaim_ is a reserved namespace. Consume it immediately so a
+        # malformed or obsolete gift link can never fall through as a referral.
+        start_parameter = None
+        if is_supported_gift_claim_identifier(gift_token):
             logger.info(
                 'Gift code deep link detected',
                 token_prefix=gift_token[:5],
@@ -1009,7 +1008,11 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
             # For new users, gift is auto-activated via
             # _activate_pending_gift_after_registration() before state.clear().
             await state.update_data(pending_gift_token=gift_token)
-            start_parameter = None  # Don't treat as campaign or referral
+        else:
+            logger.warning('Unsupported gift deep link identifier', token_length=len(gift_token))
+            await message.answer(
+                '❌ Ссылка на подарок устарела или повреждена. Попросите отправителя поделиться заново.'
+            )
 
     # Handle coupon deep links: /start coupon_{token} — one-time wholesale coupons
     if start_parameter and start_parameter.startswith(COUPON_DEEP_LINK_PREFIX):

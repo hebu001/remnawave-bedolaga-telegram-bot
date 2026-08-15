@@ -5,6 +5,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import GuestPurchase, GuestPurchaseStatus, LandingPage
+from app.services.gift_claim_service import generate_gift_claim_code
 
 
 logger = structlog.get_logger(__name__)
@@ -139,6 +140,8 @@ async def create_guest_purchase(db: AsyncSession, *, commit: bool = True, **kwar
     """Create a new guest purchase with an auto-generated token."""
     if 'token' not in kwargs:
         kwargs['token'] = generate_purchase_token()
+    if kwargs.get('is_gift') and not kwargs.get('claim_code'):
+        kwargs['claim_code'] = generate_gift_claim_code()
 
     purchase = GuestPurchase(**kwargs)
     db.add(purchase)

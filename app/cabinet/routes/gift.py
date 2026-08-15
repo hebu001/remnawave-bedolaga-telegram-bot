@@ -23,6 +23,11 @@ from app.database.models import (
     TransactionType,
     User,
 )
+from app.services.gift_claim_service import (
+    ensure_gift_claim_code,
+    get_gift_by_claim_identifier,
+    gift_public_code,
+)
 from app.services.guest_purchase_service import (
     GuestPurchaseError,
     create_purchase,
@@ -376,7 +381,7 @@ async def create_gift_purchase(
 
         # Build return URL for after payment
         cabinet_base = (settings.CABINET_URL or '').rstrip('/')
-        return_url = f'{cabinet_base}/gift/result?token={purchase.token[:12]}'
+        return_url = f'{cabinet_base}/gift/result?token={gift_public_code(purchase)}'
 
         from app.services.payment_service import PaymentService
 
@@ -432,7 +437,7 @@ async def create_gift_purchase(
 
         return GiftPurchaseResponse(
             status='created',
-            purchase_token=purchase.token[:12],
+            purchase_token=gift_public_code(purchase),
             payment_url=payment_url,
             warning=recipient_warning,
         )
@@ -529,8 +534,6 @@ async def create_gift_purchase(
         description=tx_description,
     )
 
-    purchase_token = purchase.token
-
     # Unified claimable model: ALL gifts (code-only AND directed) stay in PAID
     # until claimed via the gift link — the buyer shares it, whoever activates it
     # gets the subscription. For a directed gift, best-effort notify the recipient
@@ -543,7 +546,7 @@ async def create_gift_purchase(
 
     return GiftPurchaseResponse(
         status='ok',
-        purchase_token=purchase_token[:12],
+        purchase_token=gift_public_code(purchase),
         warning=recipient_warning,
     )
 
@@ -576,7 +579,7 @@ async def get_pending_gifts(
 
         pending.append(
             PendingGiftResponse(
-                token=p.token[:12],
+                token=gift_public_code(p),
                 tariff_name=p.tariff.name if p.tariff else None,
                 period_days=p.period_days,
                 gift_message=p.gift_message,
@@ -595,13 +598,7 @@ async def get_gift_purchase_status(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get the status of a cabinet gift purchase."""
-    if len(token) >= 64:
-        token_filter = GuestPurchase.token == token
-    else:
-        token_filter = GuestPurchase.token.startswith(token)
-
-    result = await db.execute(select(GuestPurchase).options(selectinload(GuestPurchase.tariff)).where(token_filter))
-    purchase = result.scalars().first()
+    purchase = await get_gift_by_claim_identifier(db, token)
     if purchase is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -629,13 +626,16 @@ async def get_gift_purchase_status(
         GuestPurchaseStatus.PAID.value,
         GuestPurchaseStatus.PENDING_ACTIVATION.value,
     )
+    if is_claimable:
+        await ensure_gift_claim_code(db, purchase)
+        await db.commit()
 
     return GiftPurchaseStatusResponse(
         status=purchase.status,
         is_gift=True,
         is_code_only=is_code_only,
         is_claimable=is_claimable,
-        purchase_token=purchase.token[:12] if is_claimable else None,
+        purchase_token=gift_public_code(purchase) if is_claimable else None,
         recipient_contact_value=recipient_contact_value,
         gift_message=purchase.gift_message,
         tariff_name=tariff_name,
@@ -670,7 +670,7 @@ async def get_sent_gifts(
 
         sent.append(
             SentGiftResponse(
-                token=p.token[:12],
+                token=gift_public_code(p),
                 tariff_name=p.tariff.name if p.tariff else None,
                 period_days=p.period_days,
                 device_limit=p.tariff.device_limit if p.tariff else 1,
@@ -713,7 +713,7 @@ async def get_received_gifts(
 
         received.append(
             ReceivedGiftResponse(
-                token=p.token[:12],
+                token=gift_public_code(p),
                 tariff_name=p.tariff.name if p.tariff else None,
                 period_days=p.period_days,
                 device_limit=p.tariff.device_limit if p.tariff else 1,
@@ -748,21 +748,7 @@ async def activate_gift_by_code(
     if len(code) < 8:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Code too short')
 
-    # Support both full token and prefix-based lookup (displayed codes are truncated)
-    if len(code) >= 64:
-        # Full token — exact match
-        token_filter = GuestPurchase.token == code
-    else:
-        # Prefix match — for short display codes like GIFT-XXXXXXXXXXXX
-        token_filter = GuestPurchase.token.startswith(code)
-
-    result = await db.execute(
-        select(GuestPurchase)
-        .options(selectinload(GuestPurchase.tariff))
-        .where(token_filter, GuestPurchase.is_gift.is_(True))
-        .with_for_update()
-    )
-    purchase = result.scalars().first()
+    purchase = await get_gift_by_claim_identifier(db, code, for_update=True)
 
     if purchase is None or not purchase.is_gift:
         raise HTTPException(

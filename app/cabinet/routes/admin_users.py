@@ -60,6 +60,7 @@ from app.database.models import (
     WheelSpin,
     WithdrawalRequest,
 )
+from app.services.gift_claim_service import gift_public_code
 from app.services.permission_service import PermissionService
 from app.utils.subscription_utils import coerce_panel_device_limit
 from app.utils.timezone import panel_datetime_to_utc
@@ -4292,7 +4293,7 @@ def _build_gift_item(
     device_limit = p.tariff.device_limit if p.tariff else 1
     return AdminUserGiftItem(
         id=p.id,
-        token=p.token[:12],
+        token=gift_public_code(p),
         status=p.status,
         tariff_name=tariff_name,
         period_days=p.period_days,

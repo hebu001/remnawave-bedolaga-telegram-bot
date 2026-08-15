@@ -17,6 +17,11 @@ from app.database.crud.landing import get_active_landing_by_slug, get_purchase_b
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.user import get_user_by_email
 from app.database.models import GuestPurchase, GuestPurchaseStatus, LandingPage, Tariff
+from app.services.gift_claim_service import (
+    build_gift_bot_link,
+    build_gift_web_link,
+    get_gift_by_claim_identifier,
+)
 from app.services.guest_purchase_service import (
     GuestPurchaseError,
     _find_or_create_user,
@@ -287,14 +292,8 @@ def _build_purchase_status_response(purchase: GuestPurchase) -> PurchaseStatusRe
     claim_url: str | None = None
     bot_claim_link: str | None = None
     if is_claimable:
-        cabinet_base = (settings.CABINET_URL or '').rstrip('/')
-        if cabinet_base:
-            claim_url = f'{cabinet_base}/buy/gift/{purchase.token}'
-        bot_username = settings.get_bot_username()
-        if bot_username:
-            # Telegram start params are length-limited; use a token prefix.
-            # The bot handler resolves gifts by prefix (start.py:149).
-            bot_claim_link = f'https://t.me/{bot_username}?start=GIFT_{purchase.token[:12]}'
+        claim_url = build_gift_web_link(purchase)
+        bot_claim_link = build_gift_bot_link(purchase)
 
     return PurchaseStatusResponse(
         status=purchase.status,
@@ -533,7 +532,7 @@ async def get_gift_claim(
     if await RateLimitCache.is_ip_rate_limited(client_ip, 'gift_claim_status', limit=30, window=60, fail_closed=True):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Too many requests')
 
-    purchase = await get_purchase_by_token(db, token)
+    purchase = await get_gift_by_claim_identifier(db, token)
     if purchase is None or not purchase.is_gift:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Gift not found')
 
@@ -559,15 +558,9 @@ async def claim_gift(
     if await RateLimitCache.is_ip_rate_limited(client_ip, 'gift_claim', limit=5, window=60, fail_closed=True):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Too many requests')
 
-    # Public endpoint: require the full 64-char token (no short-prefix matching,
-    # which is reserved for the human-typed cabinet code path) to rule out
-    # prefix collisions / enumeration.
-    if len(token) < 64:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Gift not found')
-
-    # Lock the row so concurrent claims serialize (exactly one binds).
-    result = await db.execute(select(GuestPurchase).where(GuestPurchase.token == token).with_for_update())
-    purchase = result.scalars().first()
+    # Lock the row so concurrent claims serialize (exactly one binds). New short
+    # claim codes are exact-match; legacy token forms remain readable.
+    purchase = await get_gift_by_claim_identifier(db, token, for_update=True)
     if purchase is None or not purchase.is_gift:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Gift not found')
 

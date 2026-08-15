@@ -2,7 +2,20 @@
 
 import pytest
 
-from app.handlers.start import _split_start_param_subid
+from app.handlers.start import _parse_gift_start_parameter, _split_start_param_subid
+
+
+class TestGiftStartParameter:
+    def test_parses_current_and_legacy_namespaces(self) -> None:
+        assert _parse_gift_start_parameter('GIFT_' + 'C' * 12) == (True, 'C' * 12)
+        assert _parse_gift_start_parameter('giftclaim_' + 'C' * 12) == (True, 'C' * 12)
+
+    def test_reserves_even_malformed_gift_namespace(self) -> None:
+        assert _parse_gift_start_parameter('GIFT_bad') == (True, 'bad')
+
+    def test_non_gift_payload_is_untouched(self) -> None:
+        assert _parse_gift_start_parameter('ref_abc') == (False, None)
+        assert _parse_gift_start_parameter(None) == (False, None)
 
 
 class TestSplitStartParamSubid:

@@ -4367,6 +4367,9 @@ class GuestPurchase(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String(64), unique=True, nullable=False, index=True)
+    # Public gift bearer code. Kept separate from the internal payment token so
+    # links stay compact and claims use an exact indexed lookup, not a prefix.
+    claim_code = Column(String(12), unique=True, nullable=True, index=True)
     landing_id = Column(Integer, ForeignKey('landing_pages.id', ondelete='SET NULL'), nullable=True)
     contact_type = Column(String(20), nullable=False)  # 'email' or 'telegram'
     contact_value = Column(String(255), nullable=False)

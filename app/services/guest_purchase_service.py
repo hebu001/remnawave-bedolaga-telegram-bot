@@ -1158,10 +1158,13 @@ async def notify_gift_claim_available(
     """
     if not purchase.is_gift:
         return
-    cabinet_base = (settings.CABINET_URL or '').rstrip('/')
-    if not cabinet_base:
+
+    from app.services.gift_claim_service import build_gift_web_link
+
+    claim_url = build_gift_web_link(purchase)
+    if not claim_url:
         return
-    claim_url = f'{cabinet_base}/buy/gift/{purchase.token}'
+    cabinet_base = (settings.CABINET_URL or '').rstrip('/')
 
     from app.cabinet.services.email_service import email_service
     from app.cabinet.services.email_templates import EmailNotificationTemplates

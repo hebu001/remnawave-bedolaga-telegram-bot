@@ -24,6 +24,7 @@ def _gift(**overrides) -> SimpleNamespace:
         id=1,
         is_gift=True,
         token='T' * 64,
+        claim_code='C' * 12,
         period_days=30,
         gift_message=None,
         gift_recipient_type=None,
@@ -76,7 +77,7 @@ async def test_email_recipient_and_buyer_both_get_claim_link() -> None:
     )
     # The buyer's backstop email must carry the actual claim URL.
     buyer_call = next(c for c in send.call_args_list if c.kwargs['to_email'] == 'buyer@example.com')
-    assert f'/buy/gift/{purchase.token}' in buyer_call.kwargs['body_html']
+    assert f'/gift?tab=activate&code={purchase.claim_code}' in buyer_call.kwargs['body_html']
 
 
 @pytest.mark.asyncio
