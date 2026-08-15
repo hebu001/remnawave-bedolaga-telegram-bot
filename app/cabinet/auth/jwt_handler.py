@@ -1,6 +1,7 @@
 """JWT token handling for cabinet authentication."""
 
 import hashlib
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -94,6 +95,10 @@ def create_refresh_token(user_id: int) -> str:
         'type': 'refresh',
         'exp': expires,
         'iat': datetime.now(UTC),
+        # Makes every rotated token unique even when two tokens for the same
+        # user are issued within the same second (JWT datetimes are encoded
+        # with second precision).
+        'jti': secrets.token_urlsafe(16),
     }
 
     secret = settings.get_cabinet_jwt_secret()

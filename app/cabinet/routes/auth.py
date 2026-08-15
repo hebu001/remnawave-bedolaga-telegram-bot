@@ -200,6 +200,41 @@ async def _store_refresh_token(
     await db.commit()
 
 
+async def _rotate_refresh_token(
+    db: AsyncSession,
+    token_record: CabinetRefreshToken,
+    user_id: int,
+) -> str:
+    """Replace a used refresh token and extend the authenticated session.
+
+    The caller must hold a row lock for ``token_record``. Revoking the old
+    token and inserting its replacement in one commit prevents token replay
+    while making the refresh-token lifetime sliding for active sessions.
+    """
+    new_refresh_token = create_refresh_token(user_id)
+    new_token_hash = hashlib.sha256(new_refresh_token.encode()).hexdigest()
+    rotated_at = datetime.now(UTC)
+
+    token_record.revoked_at = rotated_at
+    db.add(
+        CabinetRefreshToken(
+            user_id=user_id,
+            token_hash=new_token_hash,
+            device_info=token_record.device_info,
+            expires_at=get_refresh_token_expires_at(),
+        )
+    )
+    await db.commit()
+
+    logger.info(
+        'Cabinet refresh token rotated',
+        user_id=user_id,
+        old_token_fp=token_record.token_hash[:16],
+        new_token_fp=new_token_hash[:16],
+    )
+    return new_refresh_token
+
+
 async def _process_campaign_bonus(
     db: AsyncSession,
     user: User,
@@ -1703,6 +1738,7 @@ async def login_email(
 @router.post('/refresh', response_model=TokenResponse)
 async def refresh_token(
     request: RefreshTokenRequest,
+    raw_request: Request,
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Refresh access token using refresh token."""
@@ -1725,10 +1761,12 @@ async def refresh_token(
     # Verify token exists in database and is not revoked
     token_hash = hashlib.sha256(request.refresh_token.encode()).hexdigest()
     result = await db.execute(
-        select(CabinetRefreshToken).where(
+        select(CabinetRefreshToken)
+        .where(
             CabinetRefreshToken.token_hash == token_hash,
             CabinetRefreshToken.revoked_at.is_(None),
         )
+        .with_for_update()
     )
     token_record = result.scalar_one_or_none()
 
@@ -1742,6 +1780,12 @@ async def refresh_token(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='Refresh token is no longer valid',
+        )
+
+    if token_record.user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Invalid token owner',
         )
 
     user = await get_user_by_id(db, user_id)
@@ -1761,10 +1805,17 @@ async def refresh_token(
         role_level=user_role_level,
     )
     expires_in = settings.get_cabinet_access_token_expire_minutes() * 60
+    # Rotation is capability-negotiated so older already-open cabinet bundles,
+    # which only persisted access_token from this response, are not logged out
+    # during a rolling deployment. Current clients always send this header.
+    rotation_supported = raw_request.headers.get('X-Refresh-Token-Rotation') == '1'
+    new_refresh_token = (
+        await _rotate_refresh_token(db, token_record, user.id) if rotation_supported else request.refresh_token
+    )
 
     return TokenResponse(
         access_token=access_token,
-        refresh_token=request.refresh_token,
+        refresh_token=new_refresh_token,
         token_type='bearer',
         expires_in=expires_in,
     )
