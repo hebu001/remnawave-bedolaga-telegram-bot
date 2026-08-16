@@ -60,9 +60,7 @@ async def _build_referral_info(db_user: User, db: AsyncSession, bot: Bot) -> tup
     ]
 
     if settings.REFERRAL_MINIMUM_TOPUP_KOPEKS > 0:
-        lines.append(
-            texts.t('REFERRAL_MINIMUM_TOPUP', '• Мин пополнение от {minimum}').format(minimum=minimum_topup)
-        )
+        lines.append(texts.t('REFERRAL_MINIMUM_TOPUP', '• Мин пополнение от {minimum}').format(minimum=minimum_topup))
 
     if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
         lines.append(
@@ -462,11 +460,7 @@ async def create_invite_message(callback: types.CallbackQuery, db_user: User):
         link=bot_referral_link,
         cabinet_block=share_cabinet_block,
     )
-    share_url = (
-        'https://t.me/share/url'
-        '?url='
-        f'&text={quote(share_text, safe="")}'
-    )
+    share_url = f'https://t.me/share/url?url=&text={quote(share_text, safe="")}'
 
     keyboard = types.InlineKeyboardMarkup(
         inline_keyboard=[

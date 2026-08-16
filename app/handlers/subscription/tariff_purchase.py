@@ -228,9 +228,7 @@ async def format_tariffs_list_text(
 
         # Компактный формат: Название — 250 ГБ / 10 📱 от 179₽🔥
         purchased_mark = ' ✅' if tariff.id in purchased_tariff_ids else ''
-        lines.append(
-            f'<b>{html.escape(tariff.name)}</b>{purchased_mark} — {traffic} / {device_limit} 📱 {price_text}'
-        )
+        lines.append(f'<b>{html.escape(tariff.name)}</b>{purchased_mark} — {traffic} / {device_limit} 📱 {price_text}')
 
         # Описание тарифа если есть
         if tariff.description:
@@ -1563,9 +1561,7 @@ async def select_tariff_period(
     base_price = result.original_total
     final_price = result.final_total
     total_discount = result.promo_group_discount + result.promo_offer_discount
-    discount_percent = (
-        round((1 - final_price / base_price) * 100) if base_price > 0 and total_discount > 0 else 0
-    )
+    discount_percent = round((1 - final_price / base_price) * 100) if base_price > 0 and total_discount > 0 else 0
 
     # Проверяем баланс
     user_balance = db_user.balance_kopeks or 0
