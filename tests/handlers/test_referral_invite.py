@@ -6,8 +6,11 @@ quote, so plain-URL bot/cabinet links fell out of the copied text. The fix
 wraps both links in <code>.
 """
 
+import html as html_lib
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import parse_qs, urlparse
 
 import app.handlers.referral as ref
 
@@ -17,6 +20,7 @@ async def test_create_invite_message_wraps_links_in_code(monkeypatch):
 
     async def fake_edit(callback, text, keyboard):
         captured['text'] = text
+        captured['keyboard'] = keyboard
 
     monkeypatch.setattr(ref, 'edit_or_answer_photo', fake_edit)
     # get_*_referral_link are methods on the Settings class — patch on the class.
@@ -26,7 +30,8 @@ async def test_create_invite_message_wraps_links_in_code(monkeypatch):
     monkeypatch.setattr(
         type(ref.settings), 'get_cabinet_referral_link', lambda self, code: 'https://cab.example/?ref=X&u=1'
     )
-    monkeypatch.setattr(ref.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 0)
+    monkeypatch.setattr(ref.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 15_000)
+    monkeypatch.setattr(ref.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 5_000)
 
     db_user = SimpleNamespace(referral_code='X', language='ru')
     bot = MagicMock()
@@ -45,3 +50,27 @@ async def test_create_invite_message_wraps_links_in_code(monkeypatch):
     assert '&lt;code&gt;' not in html
     # Still rendered inside the copyable quote.
     assert '<blockquote>' in html and '</blockquote>' in html
+    assert '🔒 Доступен в белых списках' in html
+
+    send_button = captured['keyboard'].inline_keyboard[0][0]
+    assert send_button.text == 'Отправить'
+    assert send_button.icon_custom_emoji_id == '5375514865047745154'
+    share_url = urlparse(send_button.url)
+    assert (share_url.scheme, share_url.netloc, share_url.path) == ('https', 't.me', '/share/url')
+    share_params = parse_qs(share_url.query, keep_blank_values=True)
+    assert share_params['url'] == ['']
+
+    quote_match = re.search(r'<blockquote>(.*?)</blockquote>', html, re.DOTALL)
+    assert quote_match is not None
+    quoted_text = html_lib.unescape(re.sub(r'</?code>', '', quote_match.group(1)))
+    assert share_params['text'] == [quoted_text]
+    assert quoted_text == (
+        '🎉 Присоединяйся к VPN сервису!\n\n'
+        '💎 При первом пополнении от 150 ₽ ты получишь 50 ₽ бонусом на баланс!\n\n'
+        '🚀 Быстрое подключение\n'
+        '🌍 Серверы по всему миру\n'
+        '🔒 Доступен в белых списках\n\n'
+        '👇 Переходи по ссылке:\n'
+        'https://t.me/bot?start=ref_X\n\n'
+        '🌐 https://cab.example/?ref=X&u=1'
+    )

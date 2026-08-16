@@ -327,6 +327,36 @@ async def _answer_with_photo(self: Message, text: str = None, **kwargs):
 
 
 async def _edit_with_photo(self: Message, text: str, **kwargs):
+    # Telegram permanently attaches message_effect_id to the original message:
+    # editMessageText/editMessageMedia cannot remove it.  The rich main menu is
+    # intentionally sent with an effect, so the first callback page must replace
+    # that message instead of editing it in place.  All regular callback pages go
+    # through the patched Message.edit_text, which makes this a single isolation
+    # point instead of duplicating the check in every handler.
+    if getattr(self, 'effect_id', None):
+        try:
+            await self.delete()
+        except TelegramBadRequest as error:
+            # If Telegram no longer allows deletion, keep the old edit fallback;
+            # sending a second message would leave a duplicate in the chat.
+            logger.warning(
+                'Не удалось отделить callback-страницу от сообщения с эффектом',
+                message_id=getattr(self, 'message_id', None),
+                effect_id=getattr(self, 'effect_id', None),
+                error=str(error),
+            )
+        else:
+            if settings.ENABLE_LOGO_MODE:
+                return await _answer_with_photo(self, text, **kwargs)
+
+            kwargs.setdefault('disable_web_page_preview', True)
+            try:
+                return await _original_answer(self, text, **kwargs)
+            except TelegramBadRequest as error:
+                if is_topic_required_error(error):
+                    return None
+                raise
+
     # Уважаем флаг в рантайме: если логотип выключен — не подменяем редактирование
     if not settings.ENABLE_LOGO_MODE:
         kwargs.setdefault('disable_web_page_preview', True)

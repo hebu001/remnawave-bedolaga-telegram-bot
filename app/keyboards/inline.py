@@ -10,7 +10,7 @@ from app.config import PERIOD_PRICES, settings
 from app.database.models import User
 from app.localization.loader import DEFAULT_LANGUAGE
 from app.localization.texts import get_texts
-from app.utils.miniapp_buttons import build_miniapp_or_callback_button
+from app.utils.miniapp_buttons import build_miniapp_or_callback_button, strip_leading_emoji
 from app.utils.price_display import PriceInfo, format_price_button
 from app.utils.pricing_utils import (
     apply_percentage_discount,
@@ -359,6 +359,65 @@ def _is_support_enabled() -> bool:
         return settings.SUPPORT_MENU_ENABLED
 
 
+def _is_cabinet_callback_action_enabled(callback_data: str) -> bool:
+    """Apply the same global feature gates used by the full main menu."""
+    if callback_data == 'menu_trial':
+        return settings.TRIAL_DURATION_DAYS > 0 and settings.TRIAL_DISABLED_FOR != 'all'
+    if callback_data == 'simple_subscription_purchase':
+        return settings.SIMPLE_SUBSCRIPTION_ENABLED
+    if callback_data == 'menu_referrals':
+        return settings.is_referral_program_enabled()
+    if callback_data == 'contests_menu':
+        return settings.CONTESTS_ENABLED and settings.CONTESTS_BUTTON_VISIBLE
+    if callback_data == 'menu_support':
+        return _is_support_enabled()
+    if callback_data == 'activate_button':
+        return settings.ACTIVATE_BUTTON_VISIBLE
+    if callback_data == 'menu_language':
+        return settings.is_language_selection_enabled()
+    return True
+
+
+def _get_cabinet_callback_action_text(
+    callback_data: str,
+    texts,
+    *,
+    language: str,
+    cached_styles: dict,
+    balance_kopeks: int,
+) -> str:
+    """Resolve the localized default label for an allowed callback action."""
+    if callback_data == 'menu_buy':
+        return texts.MENU_BUY_SUBSCRIPTION
+    if callback_data == 'menu_trial':
+        return texts.MENU_TRIAL
+    if callback_data == 'simple_subscription_purchase':
+        return texts.MENU_SIMPLE_SUBSCRIPTION
+    if callback_data == 'menu_promocode':
+        return texts.MENU_PROMOCODE
+    if callback_data == 'menu_referrals':
+        return texts.MENU_REFERRALS
+    if callback_data == 'contests_menu':
+        return texts.t('CONTESTS_BUTTON', '🎲 Конкурсы')
+    if callback_data == 'menu_support':
+        return texts.MENU_SUPPORT
+    if callback_data == 'activate_button':
+        return settings.ACTIVATE_BUTTON_TEXT
+    if callback_data == 'menu_info':
+        return texts.t('MENU_INFO', 'ℹ️ Инфо')
+    if callback_data == 'menu_language':
+        return texts.MENU_LANGUAGE
+    if callback_data == 'menu_balance':
+        return _get_balance_text(cached_styles, language, texts, balance_kopeks)
+    if callback_data == 'menu_subscription':
+        return (
+            texts.t('MY_SUBSCRIPTIONS_BUTTON', '📱 Мои подписки')
+            if settings.is_multi_tariff_enabled()
+            else texts.MENU_SUBSCRIPTION
+        )
+    return callback_data
+
+
 def _build_cabinet_main_menu_keyboard(
     language: str,
     texts,
@@ -374,7 +433,7 @@ def _build_cabinet_main_menu_keyboard(
     and how many fit per keyboard row (``max_per_row``).
     """
     from app.utils.button_styles_cache import CALLBACK_TO_SECTION, get_cached_button_styles
-    from app.utils.menu_layout_cache import get_cached_menu_layout
+    from app.utils.menu_layout_cache import VALID_CALLBACK_ACTIONS, get_cached_menu_layout
     from app.utils.miniapp_buttons import (
         CALLBACK_TO_CABINET_STYLE,
         _resolve_style,
@@ -437,15 +496,34 @@ def _build_cabinet_main_menu_keyboard(
         row_buttons: list[InlineKeyboardButton] = []
 
         for btn_id in btn_ids:
-            # --- Custom URL buttons ---
+            # --- Custom URL / raw callback buttons ---
             if btn_id.startswith('custom_'):
                 custom_cfg = custom_buttons_cfg.get(btn_id)
-                if not custom_cfg or not custom_cfg.get('url') or not custom_cfg.get('enabled', True):
+                if not custom_cfg or not custom_cfg.get('enabled', True):
+                    continue
+                button_type = custom_cfg.get('type', 'custom')
+                callback_data = custom_cfg.get('callback_data')
+                if button_type == 'callback':
+                    if callback_data not in VALID_CALLBACK_ACTIONS:
+                        continue
+                    if not _is_cabinet_callback_action_enabled(callback_data):
+                        continue
+                elif not custom_cfg.get('url'):
                     continue
                 custom_text = (
                     custom_cfg.get('labels', {}).get(language, '')
                     or custom_cfg.get('labels', {}).get('ru', '')
-                    or 'Link'
+                    or (
+                        _get_cabinet_callback_action_text(
+                            callback_data,
+                            texts,
+                            language=language,
+                            cached_styles=cached_styles,
+                            balance_kopeks=balance_kopeks,
+                        )
+                        if button_type == 'callback'
+                        else 'Link'
+                    )
                 )
                 resolved_style = _resolve_style(custom_cfg.get('style'))
                 resolved_emoji = custom_cfg.get('icon_custom_emoji_id') or None
@@ -453,16 +531,19 @@ def _build_cabinet_main_menu_keyboard(
                     from app.utils.miniapp_buttons import strip_leading_emoji
 
                     custom_text = strip_leading_emoji(custom_text)
-                open_in = custom_cfg.get('open_in', 'external')
-                link_kwarg = (
-                    {'web_app': types.WebAppInfo(url=custom_cfg['url'])}
-                    if open_in == 'webapp'
-                    else {'url': custom_cfg['url']}
-                )
+                if button_type == 'callback':
+                    target_kwarg = {'callback_data': callback_data}
+                else:
+                    open_in = custom_cfg.get('open_in', 'external')
+                    target_kwarg = (
+                        {'web_app': types.WebAppInfo(url=custom_cfg['url'])}
+                        if open_in == 'webapp'
+                        else {'url': custom_cfg['url']}
+                    )
                 row_buttons.append(
                     InlineKeyboardButton(
                         text=custom_text,
-                        **link_kwarg,
+                        **target_kwarg,
                         style=resolved_style,
                         icon_custom_emoji_id=resolved_emoji,
                     ),
@@ -2287,18 +2368,30 @@ def get_referral_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMar
     keyboard = [
         [
             InlineKeyboardButton(
-                text=texts.t('CREATE_INVITE_BUTTON', '📝 Создать приглашение'), callback_data='referral_create_invite'
-            )
-        ],
-        [InlineKeyboardButton(text=texts.t('SHOW_QR_BUTTON', '📱 Показать QR код'), callback_data='referral_show_qr')],
-        [
-            InlineKeyboardButton(
-                text=texts.t('REFERRAL_LIST_BUTTON', '👥 Список рефералов'), callback_data='referral_list'
+                text=strip_leading_emoji(texts.t('CREATE_INVITE_BUTTON', 'Отправить приглашение')),
+                callback_data='referral_create_invite',
+                icon_custom_emoji_id='5258362837411045098',
             )
         ],
         [
             InlineKeyboardButton(
-                text=texts.t('REFERRAL_ANALYTICS_BUTTON', '📊 Аналитика'), callback_data='referral_analytics'
+                text=strip_leading_emoji(texts.t('SHOW_QR_BUTTON', 'Показать QR код')),
+                callback_data='referral_show_qr',
+                icon_custom_emoji_id='5226513232549664618',
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=strip_leading_emoji(texts.t('REFERRAL_LIST_BUTTON', 'Список рефералов')),
+                callback_data='referral_list',
+                icon_custom_emoji_id='5258513401784573443',
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=strip_leading_emoji(texts.t('REFERRAL_ANALYTICS_BUTTON', 'Аналитика')),
+                callback_data='referral_analytics',
+                icon_custom_emoji_id='5258330865674494479',
             )
         ],
     ]
@@ -2314,7 +2407,15 @@ def get_referral_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMar
             ]
         )
 
-    keyboard.append([InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')])
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                text=strip_leading_emoji(texts.BACK),
+                callback_data='back_to_menu',
+                icon_custom_emoji_id='5258236805890710909',
+            )
+        ]
+    )
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 

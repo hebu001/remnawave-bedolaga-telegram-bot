@@ -71,6 +71,7 @@ from app.services.web_auth_service import WEB_AUTH_TOKEN_MIN_LENGTH, link_web_au
 from app.states import RegistrationStates
 from app.utils.long_messages import answer_long_text, edit_long_text, send_long_text
 from app.utils.rich_menu import try_answer_rich_main_menu, try_send_rich_main_menu
+from app.utils.start_parameters import PENDING_PARTNER_MENU_KEY, is_partner_menu_start_parameter
 from app.utils.user_utils import generate_unique_referral_code
 
 
@@ -78,6 +79,25 @@ logger = structlog.get_logger(__name__)
 
 
 _SUBID_DELIMITER = '_subid_'
+
+
+async def _open_pending_partner_menu(
+    message: types.Message,
+    state: FSMContext,
+    user,
+    db: AsyncSession,
+) -> bool:
+    """Open the partner section after registration/channel checks when requested."""
+    data = await state.get_data() or {}
+    if not data.get(PENDING_PARTNER_MENU_KEY):
+        return False
+
+    from app.handlers.referral import show_referral_info_message
+
+    await show_referral_info_message(message, user, db)
+    await state.clear()
+    logger.info('Partner menu opened from /start deep link', telegram_id=user.telegram_id)
+    return True
 
 
 def _parse_gift_start_parameter(param: str | None) -> tuple[bool, str | None]:
@@ -397,7 +417,10 @@ async def _activate_pending_trial(
     try:
         texts = get_texts(user.language)
         confirmation = await answer_func(
-            texts.t('MAIN_MENU_RICH_TRIAL_ACTIVATED', '🎉 <b>Тестовая подписка активирована!</b>'),
+            texts.t(
+                'MAIN_MENU_RICH_TRIAL_ACTIVATED',
+                '🎉 <b>Тестовая подписка активирована!</b>',
+            ),
             parse_mode=ParseMode.HTML,
         )
         # Подтверждение эфемерное: новая подписка и так видна в меню ниже.
@@ -992,6 +1015,26 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
     if state_needs_update:
         await state.set_data(data)
 
+    # Static advertising deep link: /start partner. Keep this intent separate
+    # from campaign/referral attribution so a first-touch campaign can remain
+    # intact while the requested UI section still opens after registration.
+    partner_menu_requested = is_partner_menu_start_parameter(msg_start_arg) or is_partner_menu_start_parameter(
+        start_parameter
+    )
+    if partner_menu_requested:
+        user = db_user or await get_user_by_telegram_id(db, message.from_user.id)
+        if user and user.status != UserStatus.DELETED.value:
+            from app.handlers.referral import show_referral_info_message
+
+            await show_referral_info_message(message, user, db)
+            await state.clear()
+            logger.info('Partner menu opened from /start deep link', telegram_id=user.telegram_id)
+            return
+
+        await state.update_data(**{PENDING_PARTNER_MENU_KEY: True})
+        if is_partner_menu_start_parameter(start_parameter):
+            start_parameter = None
+
     # Handle gift code deep links: /start GIFT_{token} (or giftclaim_{token} alias)
     is_gift_namespace, gift_token = _parse_gift_start_parameter(start_parameter)
     if is_gift_namespace:
@@ -1276,6 +1319,9 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
             await db.commit()
 
         texts = get_texts(user.language)
+
+        if await _open_pending_partner_menu(message, state, user, db):
+            return
 
         if referral_code and not user.referred_by_id:
             await message.answer(
@@ -1979,6 +2025,9 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
                 )
             )
 
+        if await _open_pending_partner_menu(callback.message, state, existing_user, db):
+            return
+
         await db.refresh(existing_user, ['subscriptions'])
 
         existing_user_subs = getattr(existing_user, 'subscriptions', None) or []
@@ -2195,6 +2244,9 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
             refresh_error=refresh_error,
         )
 
+    if await _open_pending_partner_menu(callback.message, state, user, db):
+        return
+
     await state.clear()
 
     if campaign_message:
@@ -2310,6 +2362,9 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
                     'ℹ️ Вы уже зарегистрированы в системе. Реферальная ссылка не может быть применена.',
                 )
             )
+
+        if await _open_pending_partner_menu(message, state, existing_user, db):
+            return
 
         await db.refresh(existing_user, ['subscriptions'])
 
@@ -2553,6 +2608,9 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
             telegram_id=user.telegram_id,
             refresh_error=refresh_error,
         )
+
+    if await _open_pending_partner_menu(message, state, user, db):
+        return
 
     await state.clear()
 
@@ -2807,7 +2865,10 @@ async def required_sub_channel_check(
 
             # Обрабатываем payload только если ещё не обработан
             # (проверяем по наличию referral_code или campaign_id в state)
-            if not state_data.get('referral_code') and not state_data.get('campaign_id'):
+            if is_partner_menu_start_parameter(pending_start_payload):
+                state_data[PENDING_PARTNER_MENU_KEY] = True
+                logger.info('Partner menu deep link restored after channel check', telegram_id=query.from_user.id)
+            elif not state_data.get('referral_code') and not state_data.get('campaign_id'):
                 campaign = await get_campaign_by_start_parameter(
                     db,
                     pending_start_payload,
@@ -2909,6 +2970,9 @@ async def required_sub_channel_check(
             logger.info('🗑️ CHANNEL CHECK: Redis payload удален после успешной проверки подписки')
 
         if user and user.status != UserStatus.DELETED.value:
+            if await _open_pending_partner_menu(query.message, state, user, db):
+                return None
+
             # Uses primary subscription (multi-tariff compatible via property)
             has_active_subscription, subscription_is_active = _calculate_subscription_flags(user.subscription)
 
@@ -3075,6 +3139,9 @@ async def required_sub_channel_check(
                             )
                         except Exception as e:
                             logger.error('Ошибка отправки сообщения о бонусе кампании', error=e)
+
+                    if await _open_pending_partner_menu(query.message, state, user, db):
+                        return None
 
                     # Показываем главное меню после создания пользователя
                     # Uses primary subscription (multi-tariff compatible via property)

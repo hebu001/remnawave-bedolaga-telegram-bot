@@ -15,6 +15,7 @@ from pathlib import Path
 
 import app.handlers.menu as menu_mod
 import app.utils.rich_menu as rich_menu_mod
+from app.config import Settings
 
 
 _START_PATH = Path(__file__).resolve().parents[1] / 'app' / 'handlers' / 'start.py'
@@ -90,3 +91,11 @@ def test_trial_deeplink_wired_in_start():
     tail = source[confirmation : confirmation + 800]
     assert '_delete_message_later' in tail
     assert 'delay=30' in tail
+
+
+def test_rich_menu_has_no_action_footer_or_default_message_effect():
+    source = inspect.getsource(rich_menu_mod.build_main_menu_rich_html)
+
+    assert 'MAIN_MENU_ACTION_PROMPT' not in source
+    assert '<footer>' not in source
+    assert Settings.model_fields['MAIN_MENU_RICH_EFFECT_ID'].default == ''

@@ -31,6 +31,7 @@ def _rich_menu_env(monkeypatch):
     """Включает rich-меню, изолирует логотип/эффект и сбрасывает флаги недоступности."""
     rich_menu._reset_rich_menu_availability()
     monkeypatch.setattr(settings, 'MAIN_MENU_RICH_ENABLED', True, raising=False)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_EFFECT_ID', '', raising=False)
     monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', '', raising=False)
     monkeypatch.setattr(settings, 'WEBHOOK_URL', None, raising=False)
     yield
@@ -335,6 +336,31 @@ async def test_try_edit_text_message_uses_edit_message_text(monkeypatch):
     assert method.rich_message.html == '<p>menu</p>'
     assert method.reply_markup is keyboard
     callback.bot.send_rich_message.assert_not_awaited()
+
+
+async def test_try_edit_main_menu_recreates_message_to_apply_effect(monkeypatch):
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_EFFECT_ID', '5104841245755180586', raising=False)
+
+    callback = _make_callback()
+    callback.message.effect_id = None
+
+    edited = await rich_menu.try_edit_rich_main_menu(
+        callback,
+        _make_user(None),
+        DummyTexts(),
+        AsyncMock(),
+        _make_keyboard(),
+    )
+
+    assert edited is True
+    callback.message.delete.assert_awaited_once()
+    callback.bot.assert_not_awaited()
+    callback.bot.send_rich_message.assert_awaited_once()
+    assert callback.bot.send_rich_message.await_args.kwargs['message_effect_id'] == '5104841245755180586'
 
 
 async def test_try_edit_photo_message_recreates_via_send(monkeypatch):
@@ -708,6 +734,21 @@ async def test_send_passes_message_effect(monkeypatch):
 
     assert sent is True
     assert bot.send_rich_message.await_args.kwargs['message_effect_id'] == '5046509860389126442'
+
+
+async def test_send_has_no_effect_by_default(monkeypatch):
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+
+    bot = AsyncMock()
+    sent = await rich_menu.try_send_rich_main_menu(
+        bot, 1, _make_user(None), DummyTexts(), AsyncMock(), _make_keyboard()
+    )
+
+    assert sent is True
+    assert bot.send_rich_message.await_args.kwargs['message_effect_id'] is None
 
 
 async def test_rejected_effect_degrades_and_resends(monkeypatch):

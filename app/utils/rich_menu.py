@@ -496,9 +496,6 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     # пустая строка перед блоком ссылок (как в классическом меню)
     blocks.append('<br>' + '<br>'.join(tail))
 
-    action_prompt = _rich_text(texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:'))
-    blocks.append(f'<footer>{action_prompt}</footer>')
-
     return ''.join(blocks)
 
 
@@ -632,9 +629,16 @@ async def try_edit_rich_main_menu(
         and not getattr(message, 'photo', None)
         and (message.text is not None or getattr(message, 'rich_message', None) is not None)
     )
+    # message_effect_id is immutable: after a callback page replaced the
+    # effect-bearing main message, editing that page back into rich HTML would
+    # produce a main menu without the configured effect.  Recreate only the
+    # main menu when an effect is configured; callback pages themselves are
+    # recreated without an effect by message_patch._edit_with_photo().
+    effect_id = None if _effect_unavailable else (settings.MAIN_MENU_RICH_EFFECT_ID or '').strip() or None
+    should_recreate_for_effect = bool(effect_id) and getattr(message, 'effect_id', None) != effect_id
 
     try:
-        if is_editable_as_rich:
+        if is_editable_as_rich and not should_recreate_for_effect:
             # parse_mode=None явно: иначе дефолтный parse_mode бота (HTML) сериализуется
             # в запрос рядом с rich_message.
             await bot(
@@ -647,9 +651,9 @@ async def try_edit_rich_main_menu(
                 )
             )
         else:
-            # Фото/медиа-сообщение (логотип) или недоступное (>48ч) нельзя превратить
-            # в rich редактированием — пересоздаём, как это делает edit_or_answer_photo
-            # при смене типа сообщения.
+            # Фото/медиа-сообщение, недоступное сообщение или главное
+            # меню с эффектом пересоздаём, как edit_or_answer_photo при смене
+            # типа сообщения.
             if not isinstance(message, InaccessibleMessage):
                 try:
                     await message.delete()

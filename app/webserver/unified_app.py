@@ -78,7 +78,13 @@ def _create_base_app(lifespan: Any = None) -> FastAPI:
                     allow_origins=['*'],
                     allow_credentials=False,
                     allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-                    allow_headers=['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Telegram-Init-Data'],
+                    allow_headers=[
+                        'Authorization',
+                        'Content-Type',
+                        'X-CSRF-Token',
+                        'X-Telegram-Init-Data',
+                        'X-Refresh-Token-Rotation',
+                    ],
                 )
             else:
                 app.add_middleware(
@@ -86,7 +92,13 @@ def _create_base_app(lifespan: Any = None) -> FastAPI:
                     allow_origins=cabinet_origins,
                     allow_credentials=True,
                     allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-                    allow_headers=['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Telegram-Init-Data'],
+                    allow_headers=[
+                        'Authorization',
+                        'Content-Type',
+                        'X-CSRF-Token',
+                        'X-Telegram-Init-Data',
+                        'X-Refresh-Token-Rotation',
+                    ],
                 )
             if settings.is_cabinet_enabled():
                 from app.cabinet.routes import router as cabinet_router

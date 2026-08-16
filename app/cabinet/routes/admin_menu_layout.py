@@ -1,8 +1,9 @@
-"""Admin routes for cabinet menu layout configuration (rows + custom URL buttons).
+"""Admin routes for cabinet menu layout configuration.
 
-Serves a MERGED view combining ``CABINET_MENU_LAYOUT`` (row arrangement, custom buttons)
-and ``CABINET_BUTTON_STYLES`` (per-section style/emoji/enabled/labels) to the frontend.
-On save, splits the payload back into two SystemSetting keys.
+Serves a MERGED view combining ``CABINET_MENU_LAYOUT`` (row arrangement,
+custom URL/callback buttons) and ``CABINET_BUTTON_STYLES`` (per-section
+style/emoji/enabled/labels) to the frontend. On save, splits the payload back
+into two SystemSetting keys.
 """
 
 import json
@@ -25,8 +26,10 @@ from app.utils.button_styles_cache import (
 )
 from app.utils.menu_layout_cache import (
     BUILTIN_SECTIONS,
+    CALLBACK_ACTIONS,
     DEFAULT_MENU_LAYOUT,
     MENU_LAYOUT_KEY,
+    VALID_CALLBACK_ACTIONS,
     VALID_CUSTOM_BUTTON_STYLES,
     get_cached_menu_layout,
     load_menu_layout_cache,
@@ -51,16 +54,17 @@ URL_PATTERN = re.compile(r'^(https?://|tg://)')
 
 
 class ButtonConfig(BaseModel):
-    """Configuration for a single button (built-in or custom URL)."""
+    """Configuration for one built-in, URL, or Telegram callback button."""
 
     id: str = Field(max_length=100)
-    type: Literal['builtin', 'custom']
+    type: Literal['builtin', 'custom', 'callback']
     style: str = Field(default='primary', max_length=20)
     icon_custom_emoji_id: str = Field(default='', max_length=100)
     enabled: bool = True
     labels: dict[str, str] = Field(default_factory=dict, max_length=10)
     url: str | None = Field(default=None, max_length=2048)
     open_in: Literal['external', 'webapp'] = 'external'
+    callback_data: str | None = Field(default=None, max_length=64)
 
 
 class RowConfig(BaseModel):
@@ -75,6 +79,7 @@ class MenuConfigResponse(BaseModel):
     """Full merged menu configuration returned to the frontend."""
 
     rows: list[RowConfig]
+    callback_actions: list[str]
 
 
 class MenuConfigUpdateRequest(BaseModel):
@@ -118,7 +123,7 @@ def _build_merged_response(
     """Merge layout rows with button_styles into a unified response.
 
     Built-in buttons get style/emoji/enabled/labels from ``button_styles``.
-    Custom URL buttons get all config from layout's ``custom_buttons``.
+    Custom URL/callback buttons get all config from layout's ``custom_buttons``.
     """
     custom_buttons: dict[str, dict] = layout.get('custom_buttons', {})
 
@@ -154,18 +159,20 @@ def _build_merged_response(
                     ),
                 )
             elif btn_id.startswith('custom_') and btn_id in custom_buttons:
-                # Custom URL button: pull config from layout's custom_buttons
+                # Custom URL/callback button: pull config from layout's custom_buttons
                 cb = custom_buttons[btn_id]
+                button_type = cb.get('type', 'custom')
                 merged_buttons.append(
                     ButtonConfig(
                         id=btn_id,
-                        type='custom',
+                        type=button_type,
                         style=cb.get('style', 'primary'),
                         icon_custom_emoji_id=cb.get('icon_custom_emoji_id', ''),
                         enabled=cb.get('enabled', True),
                         labels=cb.get('labels', {}),
                         url=cb.get('url'),
                         open_in=cb.get('open_in', 'external'),
+                        callback_data=cb.get('callback_data'),
                     ),
                 )
 
@@ -177,7 +184,7 @@ def _build_merged_response(
             ),
         )
 
-    return MenuConfigResponse(rows=rows)
+    return MenuConfigResponse(rows=rows, callback_actions=list(CALLBACK_ACTIONS))
 
 
 def _split_update(
@@ -209,16 +216,21 @@ def _split_update(
                     'enabled': btn.enabled,
                     'labels': btn.labels,
                 }
-            elif btn.type == 'custom' and btn.id.startswith('custom_'):
-                custom_buttons[btn.id] = {
+            elif btn.type in ('custom', 'callback') and btn.id.startswith('custom_'):
+                custom_button = {
                     'id': btn.id,
-                    'url': btn.url or '',
+                    'type': btn.type,
                     'style': btn.style,
                     'icon_custom_emoji_id': btn.icon_custom_emoji_id,
                     'enabled': btn.enabled,
                     'labels': btn.labels,
-                    'open_in': btn.open_in,
                 }
+                if btn.type == 'callback':
+                    custom_button['callback_data'] = btn.callback_data or ''
+                else:
+                    custom_button['url'] = btn.url or ''
+                    custom_button['open_in'] = btn.open_in
+                custom_buttons[btn.id] = custom_button
 
         layout_data[row_key] = {
             'id': row.id or row_key,
@@ -264,10 +276,10 @@ def _validate_update_payload(rows: list[RowConfig]) -> None:
                     detail=f'Unknown built-in section: "{btn.id}".',
                 )
 
-            if btn.type == 'custom' and not btn.id.startswith('custom_'):
+            if btn.type in ('custom', 'callback') and not btn.id.startswith('custom_'):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f'Custom button id must start with "custom_": "{btn.id}".',
+                    detail=f'Custom/callback button id must start with "custom_": "{btn.id}".',
                 )
 
             # Validate URL for custom buttons
@@ -282,6 +294,14 @@ def _validate_update_payload(rows: list[RowConfig]) -> None:
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f'Custom button "{btn.id}" with webapp mode requires an https:// URL.',
                     )
+
+            # Only stable, public main-menu actions may be configured. Never
+            # accept arbitrary callback_data from the frontend.
+            if btn.type == 'callback' and btn.callback_data not in VALID_CALLBACK_ACTIONS:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f'Unsupported callback action for button "{btn.id}".',
+                )
 
             # Validate style
             all_allowed = ALLOWED_STYLE_VALUES | VALID_CUSTOM_BUTTON_STYLES

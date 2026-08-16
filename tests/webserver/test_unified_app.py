@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI, status
+from httpx import ASGITransport, AsyncClient
 
 from app.config import settings
 from app.services.payment_service import PaymentService
@@ -15,6 +16,49 @@ _backup_dir = Path('data/backups')
 _backup_dir.mkdir(parents=True, exist_ok=True)
 
 from app.webserver.unified_app import create_unified_app
+
+
+@pytest.mark.anyio
+async def test_cabinet_cors_allows_refresh_token_rotation_header(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bot = AsyncMock()
+    dispatcher = SimpleNamespace(feed_update=AsyncMock())
+    payment_service = AsyncMock(spec=PaymentService)
+
+    monkeypatch.setattr(settings, 'WEB_API_ENABLED', True, raising=False)
+    monkeypatch.setattr(settings, 'WEB_API_ALLOWED_ORIGINS', '', raising=False)
+    monkeypatch.setattr(
+        settings,
+        'CABINET_ALLOWED_ORIGINS',
+        'https://miniapp.evoevoevo.com',
+        raising=False,
+    )
+    monkeypatch.setattr(settings, 'MINIAPP_STATIC_PATH', str(tmp_path / 'missing-miniapp'), raising=False)
+    monkeypatch.setattr(settings, 'MEDIA_UPLOAD_DIR', str(tmp_path / 'uploads'), raising=False)
+    monkeypatch.setattr(settings, 'BACKUP_LOCATION', str(tmp_path / 'backups'), raising=False)
+
+    app = create_unified_app(
+        bot,
+        dispatcher,  # type: ignore[arg-type]
+        payment_service,
+        enable_telegram_webhook=False,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url='https://bed.evoevoevo.com') as client:
+        response = await client.options(
+            '/cabinet/auth/refresh',
+            headers={
+                'Origin': 'https://miniapp.evoevoevo.com',
+                'Access-Control-Request-Method': 'POST',
+                'Access-Control-Request-Headers': 'content-type,x-refresh-token-rotation',
+            },
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert 'x-refresh-token-rotation' in response.headers['access-control-allow-headers'].lower()
 
 
 @pytest.mark.anyio

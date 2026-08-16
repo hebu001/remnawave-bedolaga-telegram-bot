@@ -23,6 +23,7 @@ from app.services.channel_subscription_service import channel_subscription_servi
 from app.services.subscription_service import SubscriptionService
 from app.utils.cache import cache
 from app.utils.check_reg_process import is_registration_process
+from app.utils.start_parameters import PENDING_PARTNER_MENU_KEY, is_partner_menu_start_parameter
 
 
 logger = structlog.get_logger(__name__)
@@ -294,6 +295,11 @@ class ChannelCheckerMiddleware(BaseMiddleware):
         # Save to FSM state
         if state:
             state_data = await state.get_data() or {}
+            if is_partner_menu_start_parameter(payload):
+                # UI navigation is independent from first-touch attribution.
+                # Preserve both when an advertising campaign is already pending.
+                state_data[PENDING_PARTNER_MENU_KEY] = True
+                await state.set_data(state_data)
             existing_payload = state_data.get('pending_start_payload')
 
             # Защита первого касания: если в FSM уже хранится payload

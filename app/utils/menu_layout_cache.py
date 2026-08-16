@@ -1,7 +1,8 @@
 """Lightweight in-process cache for cabinet menu row layout configuration.
 
 Stores per-row button arrangement (which buttons per row, max_per_row)
-and custom URL buttons. Loaded from SystemSetting key ``CABINET_MENU_LAYOUT``.
+and custom URL/callback buttons. Loaded from SystemSetting key
+``CABINET_MENU_LAYOUT``.
 """
 
 import json
@@ -29,6 +30,26 @@ BUILTIN_SECTIONS: tuple[str, ...] = (
 )
 
 VALID_MAX_PER_ROW = frozenset({1, 2, 3})
+
+# Callback actions that can be placed into the Cabinet-mode Telegram menu.
+# Keep this as an explicit allow-list: accepting arbitrary callback_data from
+# the admin frontend would expose every internal bot callback as a public menu
+# action, including stateful/admin-only handlers.
+CALLBACK_ACTIONS: tuple[str, ...] = (
+    'menu_buy',
+    'menu_trial',
+    'simple_subscription_purchase',
+    'menu_promocode',
+    'menu_referrals',
+    'contests_menu',
+    'menu_support',
+    'activate_button',
+    'menu_info',
+    'menu_language',
+    'menu_balance',
+    'menu_subscription',
+)
+VALID_CALLBACK_ACTIONS = frozenset(CALLBACK_ACTIONS)
 
 # Valid Telegram Bot API style values for custom buttons.
 VALID_CUSTOM_BUTTON_STYLES = frozenset({'primary', 'success', 'danger', 'default'})
@@ -84,14 +105,22 @@ def _validate_row(row_id: str, data: dict) -> dict | None:
 
 
 def _validate_custom_button(btn_id: str, data: dict) -> dict | None:
-    """Validate and sanitize a single custom URL button. Returns cleaned dict or None."""
+    """Validate one custom URL/callback button. Return cleaned data or ``None``."""
     if not isinstance(data, dict):
         return None
     if not btn_id.startswith('custom_'):
         return None
 
+    button_type = data.get('type', 'custom')
+    if button_type not in ('custom', 'callback'):
+        return None
+
     url = data.get('url')
-    if not isinstance(url, str) or not url.strip():
+    callback_data = data.get('callback_data')
+    if button_type == 'custom':
+        if not isinstance(url, str) or not url.strip():
+            return None
+    elif not isinstance(callback_data, str) or callback_data not in VALID_CALLBACK_ACTIONS:
         return None
 
     style = data.get('style', 'primary')
@@ -111,21 +140,32 @@ def _validate_custom_button(btn_id: str, data: dict) -> dict | None:
     if not isinstance(enabled, bool):
         enabled = True
 
+    cleaned = {
+        'id': btn_id,
+        'type': button_type,
+        'style': style,
+        'labels': clean_labels,
+        'icon_custom_emoji_id': icon_custom_emoji_id,
+        'enabled': enabled,
+    }
+
+    if button_type == 'callback':
+        cleaned['callback_data'] = callback_data
+        return cleaned
+
     open_in = data.get('open_in', 'external')
     if open_in not in ('external', 'webapp'):
         open_in = 'external'
     if open_in == 'webapp' and not url.strip().startswith('https://'):
         open_in = 'external'
 
-    return {
-        'id': btn_id,
-        'url': url.strip(),
-        'style': style,
-        'labels': clean_labels,
-        'icon_custom_emoji_id': icon_custom_emoji_id,
-        'enabled': enabled,
-        'open_in': open_in,
-    }
+    cleaned.update(
+        {
+            'url': url.strip(),
+            'open_in': open_in,
+        }
+    )
+    return cleaned
 
 
 def _validate_layout(data: dict) -> dict[str, object]:
