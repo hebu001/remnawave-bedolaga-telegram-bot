@@ -94,3 +94,57 @@ async def test_referral_info_can_be_opened_from_start_message(monkeypatch):
     message.answer.assert_awaited_once()
     assert message.answer.await_args.args[0] == 'partner text'
     assert message.answer.await_args.kwargs['parse_mode'] == 'HTML'
+
+
+async def test_referral_info_supports_legacy_combined_reward_template(monkeypatch):
+    captured = {}
+
+    class LegacyTexts:
+        BACK = 'Назад'
+
+        @staticmethod
+        def format_price(kopeks):
+            return f'{kopeks // 100} ₽'
+
+        @staticmethod
+        def t(key, default=None):
+            if key == 'REFERRAL_REWARD_NEW_USER':
+                return '• Новый пользователь получает: <b>{bonus}</b> при первом пополнении от <b>{minimum}</b>'
+            return default
+
+    async def fake_edit(callback, text, keyboard):
+        captured['text'] = text
+
+    async def fake_summary(db, user_id):
+        return {
+            'invited_count': 0,
+            'paid_referrals_count': 0,
+            'active_referrals_count': 0,
+        }
+
+    monkeypatch.setattr(ref, 'get_texts', lambda language: LegacyTexts())
+    monkeypatch.setattr(ref, 'edit_or_answer_photo', fake_edit)
+    monkeypatch.setattr(ref, 'get_user_referral_summary', fake_summary)
+    monkeypatch.setattr(ref, 'get_referral_keyboard', lambda language: MagicMock())
+    monkeypatch.setattr(type(ref.settings), 'is_referral_program_enabled', lambda self: True)
+    monkeypatch.setattr(
+        type(ref.settings),
+        'get_bot_referral_link',
+        lambda self, code, bot: 'https://t.me/example_bot?start=reflegacy',
+    )
+    monkeypatch.setattr(type(ref.settings), 'get_cabinet_referral_link', lambda self, code: '')
+    monkeypatch.setattr(ref.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 5000)
+    monkeypatch.setattr(ref.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 15000)
+    monkeypatch.setattr(ref.settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 10000)
+
+    db_user = SimpleNamespace(id=1, referral_code='legacy', language='ru')
+    bot = MagicMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(username='example_bot'))
+    callback = MagicMock(bot=bot)
+    callback.answer = AsyncMock()
+
+    await ref.show_referral_info(callback, db_user, MagicMock())
+
+    text = captured['text']
+    assert 'Новый пользователь получает: <b>50₽</b> при первом пополнении от <b>150₽</b>' in text
+    assert '• Мин пополнение от' not in text

@@ -59,15 +59,21 @@ async def _build_referral_info(db_user: User, db: AsyncSession, bot: Bot) -> tup
         ),
     ]
 
-    if settings.REFERRAL_MINIMUM_TOPUP_KOPEKS > 0:
+    new_user_reward_template = texts.t(
+        'REFERRAL_REWARD_NEW_USER',
+        '• Бонус новому пользователю +{bonus}',
+    )
+    minimum_is_in_reward_template = '{minimum}' in new_user_reward_template
+
+    if settings.REFERRAL_MINIMUM_TOPUP_KOPEKS > 0 and not minimum_is_in_reward_template:
         lines.append(texts.t('REFERRAL_MINIMUM_TOPUP', '• Мин пополнение от {minimum}').format(minimum=minimum_topup))
 
     if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
         lines.append(
-            texts.t(
-                'REFERRAL_REWARD_NEW_USER',
-                '• Бонус новому пользователю +{bonus}',
-            ).format(bonus=new_user_bonus)
+            new_user_reward_template.format(
+                bonus=new_user_bonus,
+                minimum=minimum_topup,
+            )
         )
 
     if settings.REFERRAL_INVITER_BONUS_KOPEKS > 0:
