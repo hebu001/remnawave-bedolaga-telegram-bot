@@ -494,7 +494,7 @@ class SubscriptionRenewalService:
                     error=error,
                 )
 
-        reset_traffic = was_expired and settings.RESET_TRAFFIC_ON_PAYMENT
+        reset_traffic = settings.RESET_TRAFFIC_ON_PAYMENT
         reset_devices = settings.RESET_DEVICES_ON_RENEWAL
         subscription_service = SubscriptionService()
         try:
