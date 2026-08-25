@@ -475,9 +475,12 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     subscription = getattr(user, 'subscription', None)
     sub_url = getattr(subscription, 'subscription_url', None) if subscription else None
     if sub_url and not settings.should_hide_subscription_link():
-        # только ссылка — в выделенной раскрываемой цитате
+        # Обычная цитата совместима с текущими RichBlock-моделями aiogram.
+        # Telegram начал возвращать <blockquote expandable> как отдельный
+        # expandable_blockquote, из-за чего ответ sendRichMessage и callback не
+        # проходили Pydantic-валидацию в aiogram 3.29–3.30.
         link = f'<a href="{html.escape(sub_url, quote=True)}">{html.escape(sub_url)}</a>'
-        subscription_block += f'<blockquote expandable>{link}</blockquote>'
+        subscription_block += f'<blockquote>{link}</blockquote>'
 
     blocks.append('<br>'.join(profile) + '<br><br>' + subscription_block)
 

@@ -24,6 +24,50 @@ _INGRESS_RATE_WINDOW = 60.0
 _ingress_hits: dict[int, deque[float]] = defaultdict(deque)
 
 
+def _normalize_callback_rich_blocks(payload: Any) -> Any:
+    """Normalize Telegram rich blocks that current aiogram models do not know.
+
+    Telegram can include the original rich message in a callback update.  Since
+    August 2026 it may serialize ``<blockquote expandable>`` as the new
+    ``expandable_blockquote`` block type.  aiogram 3.29–3.30 reject that type
+    before routing the callback.  Convert it to the older blockquote structure
+    (which contains paragraph blocks instead of a direct ``text`` field).  Map
+    only blocks inside the callback message; ordinary message entities with the
+    same type must remain untouched.
+    """
+
+    if not isinstance(payload, dict):
+        return payload
+
+    callback = payload.get('callback_query')
+    if not isinstance(callback, dict):
+        return payload
+    message = callback.get('message')
+    if not isinstance(message, dict):
+        return payload
+    rich_message = message.get('rich_message')
+    if not isinstance(rich_message, dict):
+        return payload
+    blocks = rich_message.get('blocks')
+
+    def normalize(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                normalize(item)
+            return
+        if not isinstance(value, dict):
+            return
+        if value.get('type') == 'expandable_blockquote':
+            text = value.pop('text', '')
+            value['type'] = 'blockquote'
+            value.setdefault('blocks', [{'type': 'paragraph', 'text': text}])
+        for child in value.values():
+            normalize(child)
+
+    normalize(blocks)
+    return payload
+
+
 def _ingress_rate_limited(payload: dict) -> bool:
     obj = (
         payload.get('message')
@@ -268,6 +312,7 @@ def create_telegram_router(
                 return JSONResponse({'status': 'ok'})
             if _ingress_rate_limited(payload):
                 return JSONResponse({'status': 'ok'})
+            _normalize_callback_rich_blocks(payload)
 
         try:
             update = Update.model_validate(payload)
