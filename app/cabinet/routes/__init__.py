@@ -86,7 +86,7 @@ router = APIRouter(prefix='/cabinet', tags=['Cabinet'], redirect_slashes=False)
 # `/public` prefix so it's clearly separated from authenticated routes.
 router.include_router(site_verification_router)
 
-# Public (unauthenticated) payments from the Remnawave subscription page.
+# Server-to-server payments from the Remnawave subscription-page BFF.
 router.include_router(subpage_router)
 
 # Include all sub-routers

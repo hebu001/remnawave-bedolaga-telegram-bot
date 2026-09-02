@@ -1,10 +1,8 @@
-"""Public payment endpoints for the Remnawave subscription page (sub page).
+"""Payment endpoints for the Remnawave subscription-page backend.
 
-No authentication: the shortUuid from the subscription link identifies the
-target subscription. The surface is strictly "money in": price options and
-renewal payment only — no personal data, no balance spending, no mutations
-beyond a webhook-confirmed renewal. Response field names are camelCase — the
-sub-page widget consumes them as-is.
+Every request is authenticated with a short-lived, replay-protected HMAC from
+the BFF. The shortUuid identifies the target subscription but is never accepted
+as the sole credential. Response field names are camelCase for the widget.
 """
 
 from __future__ import annotations
@@ -14,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cabinet.auth.subpage_bff import verify_subpage_bff_request
 from app.config import settings
 from app.database.models import YooKassaPayment
 from app.services.subpage_payment_service import (
@@ -27,12 +26,15 @@ from app.services.subpage_payment_service import (
 from app.utils.cache import RateLimitCache
 
 from ..dependencies import get_cabinet_db
-from ..ip_utils import get_client_ip
 
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(prefix='/subpage', tags=['Subpage Payments'])
+router = APIRouter(
+    prefix='/subpage',
+    tags=['Subpage Payments'],
+    dependencies=[Depends(verify_subpage_bff_request)],
+)
 
 
 class SubpageMethod(BaseModel):
@@ -83,7 +85,9 @@ def _ensure_enabled() -> None:
 
 
 async def _rate_limit(request: Request, action: str, limit: int, window: int) -> None:
-    client_ip = get_client_ip(request)
+    client_ip = getattr(request.state, 'subpage_client_ip', '')
+    if not client_ip:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized')
     if await RateLimitCache.is_ip_rate_limited(client_ip, action, limit=limit, window=window, fail_closed=True):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -109,13 +113,8 @@ async def _available_methods(db: AsyncSession, user) -> list[SubpageMethod]:
             if m.get('id') in SUBPAGE_SUPPORTED_METHODS
         ]
     except Exception as error:
-        logger.warning('Subpage: method ranking failed, using env fallback', error=str(error))
-        methods: list[SubpageMethod] = []
-        if settings.is_yookassa_enabled():
-            methods.append(SubpageMethod(id='yookassa', name='Карта / СБП (ЮKassa)'))
-        if settings.is_wata_enabled():
-            methods.append(SubpageMethod(id='wata', name='Карта (WATA)'))
-        return methods
+        logger.error('Subpage: method ranking failed', error=str(error))
+        return []
 
 
 @router.get('/{short_uuid}/renewal-options', response_model=SubpageRenewalOptionsResponse)
@@ -323,6 +322,10 @@ async def get_subpage_invoice_status(
     record = await get_invoice_record(invoice_token)
     if record is None:
         return SubpageInvoiceStatusResponse(status='expired')
+
+    signed_short_uuid = getattr(raw_request.state, 'subpage_short_uuid', '')
+    if not signed_short_uuid or record.get('short_uuid') != signed_short_uuid:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Not found')
 
     invoice_status = record.get('status', 'pending')
 

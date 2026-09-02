@@ -1,8 +1,8 @@
 """Payments initiated from the Remnawave subscription page (sub page).
 
-Unauthenticated flow: anyone holding a subscription link (shortUuid) may PAY FOR
-that subscription's renewal, but can never read personal data, spend the
-owner's balance or mutate anything else. Money flows in only.
+Requests arrive only through the subscription-page BFF and carry a short-lived,
+replay-protected HMAC. The flow can pay for the identified subscription but can
+never read personal data or spend the owner's balance. Money flows in only.
 
 Invoice records live in Redis under ``subpage_invoice:{token}``; fulfillment is
 driven by the payment-provider webhook via :func:`try_fulfill_subpage_renewal`,

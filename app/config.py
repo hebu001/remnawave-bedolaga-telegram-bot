@@ -1278,6 +1278,8 @@ class Settings(BaseSettings):
     # build payment return URLs (e.g. https://sub.example.com).
     SUBPAGE_PAYMENT_ENABLED: bool = False
     SUBPAGE_URL: str | None = None
+    # Shared HMAC secret used only by the subscription-page backend.
+    SUBPAGE_BFF_SECRET: str | None = None
 
     # OAuth 2.0 provider settings for cabinet
     OAUTH_GOOGLE_CLIENT_ID: str = ''
@@ -3654,7 +3656,13 @@ class Settings(BaseSettings):
         return bool(self.CABINET_ENABLED)
 
     def is_subpage_payment_enabled(self) -> bool:
-        return bool(self.SUBPAGE_PAYMENT_ENABLED and self.SUBPAGE_URL and self.CABINET_ENABLED)
+        return bool(
+            self.SUBPAGE_PAYMENT_ENABLED
+            and self.SUBPAGE_URL
+            and self.CABINET_ENABLED
+            and self.SUBPAGE_BFF_SECRET
+            and len(self.SUBPAGE_BFF_SECRET) >= 32
+        )
 
     def get_cabinet_jwt_secret(self) -> str:
         if self.CABINET_JWT_SECRET:
