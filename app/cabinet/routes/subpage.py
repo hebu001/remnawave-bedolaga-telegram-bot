@@ -10,12 +10,15 @@ from __future__ import annotations
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cabinet.auth.subpage_bff import verify_subpage_bff_request
 from app.config import settings
-from app.database.models import YooKassaPayment
+from app.database.models import Subscription, YooKassaPayment
 from app.services.subpage_payment_service import (
+    _subscription_load_options,
+    attach_invoice_payment,
     create_invoice_record,
     format_period_label,
     get_invoice_record,
@@ -77,6 +80,8 @@ class SubpageInvoiceResponse(BaseModel):
 class SubpageInvoiceStatusResponse(BaseModel):
     status: str
     newExpiresAt: str | None = None
+    balanceCredited: bool = False
+    message: str | None = None
 
 
 def _ensure_enabled() -> None:
@@ -206,8 +211,24 @@ async def create_subpage_invoice(
     if body.periodDays not in get_renewal_periods(subscription):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported period')
 
+    from app.database.crud.user import lock_user_for_pricing
     from app.services.pricing_engine import pricing_engine
 
+    user = await lock_user_for_pricing(db, user.id)
+    subscription = await db.scalar(
+        select(Subscription)
+        .options(*_subscription_load_options())
+        .where(
+            Subscription.id == subscription.id,
+            Subscription.user_id == user.id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if subscription is None or not is_subscription_renewable(subscription):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Subscription is not renewable')
+    if body.periodDays not in get_renewal_periods(subscription):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Unsupported period')
     pricing = await pricing_engine.calculate_renewal_price(db, subscription, body.periodDays, user=user)
     amount_kopeks = pricing.final_total
     if amount_kopeks <= 0:
@@ -220,14 +241,16 @@ async def create_subpage_invoice(
     if amount_kopeks < min_amount or amount_kopeks > max_amount:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Amount out of provider limits')
 
-    # Token is minted before the provider call so it can ride along in the
-    # payment metadata; the Redis record is written only after the provider
-    # accepts the payment.
-    import secrets as _secrets
-
     from app.services.payment_service import PaymentService
 
-    invoice_token = _secrets.token_urlsafe(24)
+    invoice_token = await create_invoice_record(
+        db,
+        short_uuid=short_uuid,
+        user=user,
+        subscription=subscription,
+        pricing=pricing,
+        method=body.method,
+    )
 
     subpage_base = (settings.SUBPAGE_URL or '').rstrip('/')
     return_url = f'{subpage_base}/{short_uuid}?invoice={invoice_token}'
@@ -240,6 +263,7 @@ async def create_subpage_invoice(
         'period_days': str(body.periodDays),
         'expected_amount_kopeks': str(amount_kopeks),
         'source': 'subpage',
+        'order_version': '1',
     }
 
     payment_service = PaymentService()
@@ -255,7 +279,7 @@ async def create_subpage_invoice(
             return_url=return_url,
         )
         payment_url = result.get('confirmation_url') if result else None
-        provider_payment_id = str(result.get('yookassa_payment_id')) if result else ''
+        provider_payment_id = str(result.get('yookassa_payment_id') or '') if result else ''
     else:
         result = await payment_service.create_wata_payment(
             db=db,
@@ -265,35 +289,19 @@ async def create_subpage_invoice(
             language=getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE,
             return_url=return_url,
             failed_url=return_url,
+            metadata=metadata,
         )
         payment_url = result.get('payment_url') if result else None
-        provider_payment_id = str(result.get('payment_link_id')) if result else ''
-        # WATA creation has no metadata param — patch the local record afterwards
-        # (same pattern as the guest-purchase flow).
-        if result:
-            from app.database.crud.wata import get_wata_payment_by_id
-
-            wata_record = await get_wata_payment_by_id(db, result['local_payment_id'])
-            if wata_record is not None:
-                merged = dict(getattr(wata_record, 'metadata_json', None) or {})
-                merged.update(metadata)
-                wata_record.metadata_json = merged
-                await db.commit()
-
-    if not result or not payment_url:
+        provider_payment_id = str(result.get('payment_link_id') or '') if result else ''
+    if not result or not payment_url or not provider_payment_id:
         logger.error('Subpage: payment creation failed', short_uuid=short_uuid, method=body.method)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Payment provider error')
 
-    await create_invoice_record(
-        short_uuid=short_uuid,
-        subscription_id=subscription.id,
-        user_id=user.id,
-        period_days=body.periodDays,
-        amount_kopeks=amount_kopeks,
+    await attach_invoice_payment(
+        db,
+        invoice_token,
         local_payment_id=result.get('local_payment_id'),
         provider_payment_id=provider_payment_id,
-        method=body.method,
-        token=invoice_token,
     )
 
     logger.info(
@@ -319,7 +327,7 @@ async def get_subpage_invoice_status(
     _ensure_enabled()
     await _rate_limit(raw_request, 'subpage_status', limit=60, window=60)
 
-    record = await get_invoice_record(invoice_token)
+    record = await get_invoice_record(db, invoice_token)
     if record is None:
         return SubpageInvoiceStatusResponse(status='expired')
 
@@ -341,4 +349,12 @@ async def get_subpage_invoice_status(
     return SubpageInvoiceStatusResponse(
         status=invoice_status,
         newExpiresAt=record.get('new_expires_at'),
+        balanceCredited=bool(record.get('balance_credited')),
+        message=(
+            'Оплата зачислена на баланс. Условия счёта изменились; выберите продление в личном кабинете.'
+            if record.get('balance_credited')
+            else 'Оплата требует проверки. Обратитесь в поддержку.'
+            if record.get('reason')
+            else None
+        ),
     )

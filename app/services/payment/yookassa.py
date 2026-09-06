@@ -392,6 +392,7 @@ class YooKassaPaymentMixin:
         event_object: dict[str, Any] | None = None,
     ) -> bool:
         """Переносит успешный платёж YooKassa в транзакции и начисляет баланс пользователю."""
+        payment_external_id = payment.yookassa_payment_id
         try:
             from sqlalchemy import select
 
@@ -401,6 +402,34 @@ class YooKassaPaymentMixin:
             locked_result = await db.execute(select(YKPayment).where(YKPayment.id == payment.id).with_for_update())
             payment = locked_result.scalar_one()
 
+            # Reject test-mode payments in production
+            if getattr(payment, 'test_mode', False) and not getattr(settings, 'YOOKASSA_TEST_MODE', False):
+                logger.warning(
+                    'YooKassa: rejecting test_mode payment in production',
+                    yookassa_payment_id=payment.yookassa_payment_id,
+                )
+                return False
+
+            # Subpage owns a separate fulfillment state. A DEPOSIT is not proof
+            # that renewal completed, so route it before standard payment dedupe.
+            import json
+
+            subpage_metadata = getattr(payment, 'metadata_json', None) or {}
+            if isinstance(subpage_metadata, str):
+                subpage_metadata = json.loads(subpage_metadata)
+            if isinstance(subpage_metadata, dict) and subpage_metadata.get('purpose') == 'subpage_renewal':
+                from app.services.subpage_payment_service import try_fulfill_subpage_renewal
+
+                return await try_fulfill_subpage_renewal(
+                    db,
+                    metadata=subpage_metadata,
+                    payment_amount_kopeks=payment.amount_kopeks,
+                    provider_payment_id=payment.yookassa_payment_id,
+                    provider_name='yookassa',
+                    payment_user_id=payment.user_id,
+                    currency=payment.currency,
+                )
+
             # Fast-path: already processed
             if getattr(payment, 'transaction_id', None):
                 logger.info(
@@ -409,14 +438,6 @@ class YooKassaPaymentMixin:
                     transaction_id=payment.transaction_id,
                 )
                 return True
-
-            # Reject test-mode payments in production
-            if getattr(payment, 'test_mode', False) and not getattr(settings, 'YOOKASSA_TEST_MODE', False):
-                logger.warning(
-                    'YooKassa: rejecting test_mode payment in production',
-                    yookassa_payment_id=payment.yookassa_payment_id,
-                )
-                return False
 
             payment_module = import_module('app.services.payment_service')
 
@@ -593,19 +614,6 @@ class YooKassaPaymentMixin:
                 provider_name='yookassa',
             )
             if guest_result is not None:
-                return True
-
-            # --- Subscription-page renewal flow -------------------------------
-            from app.services.subpage_payment_service import try_fulfill_subpage_renewal
-
-            subpage_result = await try_fulfill_subpage_renewal(
-                db,
-                metadata=payment_metadata,
-                payment_amount_kopeks=webhook_amount_kopeks,
-                provider_payment_id=payment.yookassa_payment_id,
-                provider_name='yookassa',
-            )
-            if subpage_result is not None:
                 return True
 
             # --- Standard user payment flow ------------------------------------
@@ -1178,9 +1186,10 @@ class YooKassaPaymentMixin:
             return True
 
         except Exception as error:
+            await db.rollback()
             logger.error(
                 'Ошибка обработки успешного платежа YooKassa',
-                yookassa_payment_id=payment.yookassa_payment_id,
+                yookassa_payment_id=payment_external_id,
                 error=error,
             )
             return False

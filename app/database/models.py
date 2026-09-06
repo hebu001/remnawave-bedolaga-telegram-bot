@@ -2598,6 +2598,58 @@ class Transaction(Base):
         return self.amount_kopeks / 100
 
 
+class SubpageInvoice(Base):
+    """Durable quote and fulfillment state; Redis is never the payment ledger."""
+
+    __tablename__ = 'subpage_invoices'
+    __table_args__ = (
+        UniqueConstraint('method', 'provider_payment_id', name='uq_subpage_invoice_provider_payment'),
+        Index('ix_subpage_invoices_recovery', 'status', 'next_attempt_at'),
+        CheckConstraint('amount_kopeks > 0 AND period_days > 0', name='ck_subpage_invoice_positive'),
+    )
+
+    token = Column(String(128), primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='SET NULL'), nullable=True)
+    short_uuid = Column(String(64), nullable=False)
+    period_days = Column(Integer, nullable=False)
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(3), nullable=False, default='RUB')
+    method = Column(String(32), nullable=False)
+    provider_payment_id = Column(String(255), nullable=True)
+    local_payment_id = Column(Integer, nullable=True)
+    configuration = Column(JSON, nullable=True)
+    pricing = Column(JSON, nullable=True)
+    status = Column(String(32), nullable=False, default='pending')
+    reason = Column(String(64), nullable=True)
+    paid_amount_kopeks = Column(Integer, nullable=True)
+    deposit_transaction_id = Column(Integer, ForeignKey('transactions.id', ondelete='SET NULL'), nullable=True)
+    renewal_transaction_id = Column(Integer, ForeignKey('transactions.id', ondelete='SET NULL'), nullable=True)
+    new_expires_at = Column(AwareDateTime(), nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(AwareDateTime(), nullable=False, default=lambda: datetime.now(UTC))
+    created_at = Column(AwareDateTime(), nullable=False, default=lambda: datetime.now(UTC))
+    updated_at = Column(AwareDateTime(), nullable=False, default=lambda: datetime.now(UTC))
+
+
+class RenewalSyncTask(Base):
+    """Coalesced, versioned panel intent committed with each paid renewal."""
+
+    __tablename__ = 'renewal_sync_tasks'
+    __table_args__ = (Index('ix_renewal_sync_tasks_due', 'status', 'next_attempt_at'),)
+
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), primary_key=True)
+    version = Column(Integer, nullable=False, default=1)
+    status = Column(String(20), nullable=False, default='pending')
+    reset_traffic = Column(Boolean, nullable=False, default=False)
+    reset_devices = Column(Boolean, nullable=False, default=False)
+    sync_squads = Column(Boolean, nullable=False, default=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(255), nullable=True)
+    next_attempt_at = Column(AwareDateTime(), nullable=False, default=lambda: datetime.now(UTC))
+    updated_at = Column(AwareDateTime(), nullable=False, default=lambda: datetime.now(UTC))
+
+
 class SubscriptionConversion(Base):
     __tablename__ = 'subscription_conversions'
     __table_args__ = (

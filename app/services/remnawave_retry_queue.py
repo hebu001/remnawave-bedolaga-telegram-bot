@@ -68,6 +68,13 @@ class RemnaWaveRetryQueue:
         )
 
     async def process_pending(self) -> None:
+        from app.services.renewal_sync_service import process_pending_renewal_syncs
+        from app.services.subpage_payment_service import process_pending_subpage_orders
+
+        # Durable paid orders and renewal intents are processed even when the
+        # legacy in-memory queue is empty (including immediately after restart).
+        await process_pending_subpage_orders()
+        await process_pending_renewal_syncs()
         if not self._queue:
             return
 
@@ -153,8 +160,11 @@ class RemnaWaveRetryQueue:
     async def _run_loop(self) -> None:
         try:
             while True:
+                try:
+                    await self.process_pending()
+                except Exception as error:
+                    logger.error('Payment recovery loop failed; will retry', error_type=type(error).__name__)
                 await asyncio.sleep(self._interval)
-                await self.process_pending()
         except asyncio.CancelledError:
             raise
 

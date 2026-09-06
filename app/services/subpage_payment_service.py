@@ -4,28 +4,33 @@ Requests arrive only through the subscription-page BFF and carry a short-lived,
 replay-protected HMAC. The flow can pay for the identified subscription but can
 never read personal data or spend the owner's balance. Money flows in only.
 
-Invoice records live in Redis under ``subpage_invoice:{token}``; fulfillment is
-driven by the payment-provider webhook via :func:`try_fulfill_subpage_renewal`,
-mirroring the guest-purchase flow in ``app/services/payment/common.py``.
+Invoice quotes, payment capture and fulfillment live in PostgreSQL. Redis is
+read only to recognize legacy invoices during rollout. Paid orders can be
+recovered without redelivery from the provider.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import secrets
-from datetime import UTC, datetime
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database.models import (
     PaymentMethod,
+    SubpageInvoice,
     Subscription,
     SubscriptionStatus,
+    Transaction,
     TransactionType,
     User,
     UserPromoGroup,
@@ -47,8 +52,6 @@ def _subscription_load_options():
 
 
 SUBPAGE_INVOICE_PREFIX = 'subpage_invoice'
-SUBPAGE_INVOICE_TTL = 3600  # pending invoice lifetime
-SUBPAGE_INVOICE_DONE_TTL = 86400  # keep terminal statuses around for the result page
 
 _SHORT_UUID_RE = re.compile(r'^[A-Za-z0-9_-]{8,64}$')
 
@@ -156,60 +159,184 @@ def format_period_label(period_days: int) -> str:
     return f'{period_days} дней'
 
 
-async def create_invoice_record(
-    *,
-    token: str | None = None,
-    short_uuid: str,
-    subscription_id: int,
-    user_id: int,
-    period_days: int,
-    amount_kopeks: int,
-    local_payment_id: int | None,
-    provider_payment_id: str,
-    method: str = 'yookassa',
-) -> str:
-    token = token or secrets.token_urlsafe(24)
-    record = {
-        'status': 'pending',
-        'method': method,
-        'short_uuid': short_uuid,
-        'subscription_id': subscription_id,
-        'user_id': user_id,
-        'period_days': period_days,
-        'amount_kopeks': amount_kopeks,
-        'local_payment_id': local_payment_id,
-        'provider_payment_id': provider_payment_id,
-        'created_at': datetime.now(UTC).isoformat(),
-        'new_expires_at': None,
+def quote_configuration(user: User, subscription: Subscription) -> dict[str, Any]:
+    """Commercial configuration only; expiry/balance changes do not alter a quote."""
+    tariff = subscription.tariff
+    tariff_fields = (
+        'traffic_limit_gb',
+        'device_limit',
+        'device_price_kopeks',
+        'max_device_limit',
+        'allowed_squads',
+        'external_squad_uuid',
+        'server_traffic_limits',
+        'traffic_reset_mode',
+        'period_prices',
+        'is_daily',
+        'daily_price_kopeks',
+        'custom_days_enabled',
+        'price_per_day_kopeks',
+        'min_days',
+        'max_days',
+        'custom_traffic_enabled',
+        'traffic_price_per_gb_kopeks',
+        'min_traffic_gb',
+        'max_traffic_gb',
+    )
+    expires = user.promo_offer_discount_expires_at
+    return {
+        'tariff_id': subscription.tariff_id,
+        'device_limit': subscription.device_limit,
+        'traffic_limit_gb': subscription.traffic_limit_gb,
+        'purchased_traffic_gb': subscription.purchased_traffic_gb,
+        'connected_squads': sorted(subscription.connected_squads or []),
+        'tariff': {key: getattr(tariff, key) for key in tariff_fields} if tariff else None,
+        'offer': {
+            'percent': user.promo_offer_discount_percent,
+            'source': user.promo_offer_discount_source,
+            'expires': expires.isoformat() if expires else None,
+        },
     }
-    stored = await cache.set(_invoice_key(token), record, expire=SUBPAGE_INVOICE_TTL)
-    if not stored:
-        raise RuntimeError('Failed to store subpage invoice in Redis')
+
+
+async def create_invoice_record(
+    db: AsyncSession,
+    *,
+    short_uuid: str,
+    user: User,
+    subscription: Subscription,
+    pricing,
+    method: str,
+    token: str | None = None,
+) -> str:
+    """Persist the immutable quote BEFORE sending a request to the provider."""
+    token = token or secrets.token_urlsafe(24)
+    db.add(
+        SubpageInvoice(
+            token=token,
+            short_uuid=short_uuid,
+            user_id=user.id,
+            subscription_id=subscription.id,
+            period_days=pricing.period_days,
+            amount_kopeks=pricing.final_total,
+            method=method,
+            configuration=quote_configuration(user, subscription),
+            pricing=asdict(pricing),
+        )
+    )
+    await db.commit()
     return token
 
 
-async def get_invoice_record(token: str) -> dict[str, Any] | None:
+async def attach_invoice_payment(
+    db: AsyncSession,
+    token: str,
+    *,
+    local_payment_id: int | None,
+    provider_payment_id: str,
+) -> None:
+    invoice = await db.scalar(select(SubpageInvoice).where(SubpageInvoice.token == token).with_for_update())
+    if invoice is None or not provider_payment_id:
+        raise ValueError('subpage_invoice_not_found')
+    if invoice.provider_payment_id and invoice.provider_payment_id != provider_payment_id:
+        raise ValueError('subpage_provider_payment_conflict')
+    invoice.provider_payment_id = provider_payment_id
+    invoice.local_payment_id = local_payment_id
+    # A webhook may have already completed the order. Never reset its status.
+    await db.commit()
+
+
+async def get_invoice_record(db: AsyncSession, token: str) -> dict[str, Any] | None:
     if not token or len(token) > 128:
         return None
+    invoice = await db.get(SubpageInvoice, token)
+    if invoice is not None:
+        public_status = {'paid': 'pending', 'credited_only': 'failed', 'review': 'failed'}.get(
+            invoice.status, invoice.status
+        )
+        return {
+            'status': public_status,
+            'short_uuid': invoice.short_uuid,
+            'method': invoice.method,
+            'local_payment_id': invoice.local_payment_id,
+            'new_expires_at': invoice.new_expires_at.isoformat() if invoice.new_expires_at else None,
+            'balance_credited': invoice.status == 'credited_only',
+            'reason': invoice.reason,
+        }
+    # Compatibility with invoices issued before migration 0103. New records are
+    # never written to Redis, and a missing cache entry cannot erase a DB order.
     data = await cache.get(_invoice_key(token))
     return data if isinstance(data, dict) else None
 
 
-async def mark_invoice(token: str, status: str, new_expires_at: str | None = None) -> None:
-    record = await get_invoice_record(token)
-    if record is None:
-        record = {'status': status}
-    record['status'] = status
-    record['new_expires_at'] = new_expires_at
-    await cache.set(_invoice_key(token), record, expire=SUBPAGE_INVOICE_DONE_TTL)
-
-
 def _extract_subpage_invoice_token(metadata: dict[str, Any] | None) -> str | None:
-    if not isinstance(metadata, dict):
+    if not isinstance(metadata, dict) or metadata.get('purpose') != 'subpage_renewal':
         return None
-    if metadata.get('purpose') != 'subpage_renewal':
-        return None
-    return metadata.get('invoice_token') or None
+    token = metadata.get('invoice_token')
+    if not isinstance(token, str) or not token or len(token) > 128:
+        raise ValueError('subpage_invoice_token_invalid')
+    return token
+
+
+async def _adopt_legacy_invoice(
+    db: AsyncSession,
+    token: str,
+    metadata: dict[str, Any],
+    *,
+    payment_user_id: int | None,
+    provider_name: str,
+    provider_payment_id: str,
+) -> SubpageInvoice:
+    subscription_id = int(metadata.get('subscription_id', 0))
+    period_days = int(metadata.get('period_days', 0))
+    amount = int(metadata.get('expected_amount_kopeks', 0))
+    if subscription_id <= 0 or period_days <= 0 or amount <= 0:
+        raise ValueError('legacy_subpage_metadata_invalid')
+    sub = await db.get(Subscription, subscription_id)
+    cached = await cache.get(_invoice_key(token))
+    cached = cached if isinstance(cached, dict) else {}
+    if sub is not None and sub.user_id != payment_user_id:
+        raise ValueError('legacy_subpage_owner_mismatch')
+    if cached.get('user_id') is not None and cached['user_id'] != payment_user_id:
+        raise ValueError('legacy_subpage_owner_mismatch')
+    short_uuid = cached.get('short_uuid') or (sub.remnawave_short_uuid if sub else '') or ''
+    legacy_status = 'pending'
+    legacy_end = None
+    if cached.get('status') == 'succeeded':
+        deposit = await db.scalar(
+            select(Transaction).where(
+                Transaction.external_id == provider_payment_id,
+                Transaction.payment_method == provider_name,
+                Transaction.type == TransactionType.DEPOSIT.value,
+                Transaction.user_id == payment_user_id,
+                Transaction.amount_kopeks == amount,
+                Transaction.is_completed.is_(True),
+            )
+        )
+        if deposit is not None:
+            legacy_status = 'succeeded'
+            if cached.get('new_expires_at'):
+                legacy_end = datetime.fromisoformat(cached['new_expires_at'])
+    # We cannot reconstruct the price/configuration at the time of a legacy
+    # quote. Its payment is credited, but never used to buy today's configuration.
+    await db.execute(
+        insert(SubpageInvoice)
+        .values(
+            token=token,
+            user_id=payment_user_id,
+            subscription_id=sub.id if sub else None,
+            short_uuid=short_uuid,
+            period_days=period_days,
+            amount_kopeks=amount,
+            method=provider_name,
+            provider_payment_id=provider_payment_id,
+            status=legacy_status,
+            new_expires_at=legacy_end,
+            reason=None if legacy_status == 'succeeded' else 'legacy_quote_missing',
+        )
+        .on_conflict_do_nothing(index_elements=[SubpageInvoice.token])
+    )
+    return await db.scalar(select(SubpageInvoice).where(SubpageInvoice.token == token).with_for_update())
 
 
 async def try_fulfill_subpage_renewal(
@@ -219,171 +346,226 @@ async def try_fulfill_subpage_renewal(
     payment_amount_kopeks: int,
     provider_payment_id: str,
     provider_name: str,
+    payment_user_id: int | None,
+    currency: str = 'RUB',
 ) -> bool | None:
-    """Fulfill a subscription renewal paid from the sub page.
+    """Capture a verified payment durably, then resume the order.
 
-    Returns ``True`` when the payment was consumed (fulfilled or terminally
-    failed), ``None`` when the payment is not a subpage renewal (caller
-    proceeds with its normal flow).
-
-    Money-safety invariant: the paid amount is first credited to the owner's
-    balance as a DEPOSIT transaction carrying ``external_id`` (idempotency
-    anchor — unique per provider payment), then the renewal charges it back.
-    Any failure after the credit leaves the money on the balance.
+    Transient failures propagate to the provider handler. Capture is committed
+    first so a restart can resume a paid order even without another webhook.
     """
     token = _extract_subpage_invoice_token(metadata)
     if token is None:
         return None
-
-    invoice = await get_invoice_record(token)
-    if invoice is not None and invoice.get('status') == 'succeeded':
-        logger.info('Subpage renewal already fulfilled, skipping', token_prefix=token[:6])
-        return True
-
+    if provider_name not in ('wata', 'yookassa') or not provider_payment_id or payment_amount_kopeks <= 0:
+        raise ValueError('subpage_payment_invalid')
     try:
-        subscription_id = int(metadata.get('subscription_id', 0))
-        period_days = int(metadata.get('period_days', 0))
-        expected_amount = int(metadata.get('expected_amount_kopeks', 0))
-    except (TypeError, ValueError):
-        subscription_id = period_days = expected_amount = 0
-
-    if subscription_id <= 0 or period_days <= 0 or expected_amount <= 0:
-        logger.error(
-            'Subpage renewal: malformed metadata',
-            provider=provider_name,
-            provider_payment_id=provider_payment_id,
-        )
-        await mark_invoice(token, 'failed')
-        return True
-
-    if payment_amount_kopeks != expected_amount:
-        logger.error(
-            'Subpage renewal: webhook amount does not match invoice amount',
-            webhook_kopeks=payment_amount_kopeks,
-            expected_kopeks=expected_amount,
-            provider=provider_name,
-            provider_payment_id=provider_payment_id,
-        )
-        await mark_invoice(token, 'failed')
-        return True
-
-    result = await db.execute(
-        select(Subscription).options(*_subscription_load_options()).where(Subscription.id == subscription_id).limit(1)
-    )
-    subscription = result.scalars().first()
-    if subscription is None or subscription.user is None:
-        logger.error(
-            'Subpage renewal: subscription not found',
-            subscription_id=subscription_id,
-            provider_payment_id=provider_payment_id,
-        )
-        await mark_invoice(token, 'failed')
-        return True
-
-    user = subscription.user
-
-    from app.database.crud.transaction import create_transaction, get_transaction_by_external_id
-    from app.database.crud.user import add_user_balance
-
-    payment_method = {
-        'yookassa': PaymentMethod.YOOKASSA,
-        'wata': PaymentMethod.WATA,
-    }.get(provider_name)
-
-    if payment_method is not None:
-        existing = await get_transaction_by_external_id(db, provider_payment_id, payment_method)
-        if existing is not None:
-            logger.info(
-                'Subpage renewal: provider payment already has a transaction, skipping',
+        invoice = await db.scalar(select(SubpageInvoice).where(SubpageInvoice.token == token).with_for_update())
+        if invoice is None:
+            if metadata.get('order_version') == '1':
+                raise ValueError('durable_subpage_order_missing')
+            invoice = await _adopt_legacy_invoice(
+                db,
+                token,
+                metadata,
+                payment_user_id=payment_user_id,
+                provider_name=provider_name,
                 provider_payment_id=provider_payment_id,
             )
-            return True
-
-    credited = await add_user_balance(
-        db,
-        user,
-        payment_amount_kopeks,
-        f'Пополнение через страницу подписки ({provider_name})',
-        create_transaction=False,
-        commit=False,
-    )
-    if not credited:
-        logger.critical(
-            'Subpage renewal: failed to credit balance',
-            user_id=user.id,
-            provider_payment_id=provider_payment_id,
-        )
-        await mark_invoice(token, 'failed')
+        if invoice.user_id != payment_user_id or invoice.method != provider_name:
+            raise ValueError('subpage_payment_owner_or_method_mismatch')
+        if invoice.provider_payment_id and invoice.provider_payment_id != provider_payment_id:
+            raise ValueError('subpage_provider_payment_conflict')
+        if invoice.paid_amount_kopeks is not None and invoice.paid_amount_kopeks != payment_amount_kopeks:
+            raise ValueError('subpage_payment_amount_changed')
+        invoice.provider_payment_id = provider_payment_id
+        invoice.paid_amount_kopeks = payment_amount_kopeks
+        if currency.upper() != invoice.currency:
+            invoice.status, invoice.reason = 'review', 'currency_mismatch'
+        elif invoice.status == 'pending':
+            invoice.status = 'paid'
+        invoice.updated_at = datetime.now(UTC)
+        await db.commit()
+        await fulfill_paid_invoice(db, token)
         return True
-
-    try:
-        await create_transaction(
-            db=db,
-            user_id=user.id,
-            type=TransactionType.DEPOSIT,
-            amount_kopeks=payment_amount_kopeks,
-            description=f'Пополнение через страницу подписки ({provider_name})',
-            payment_method=payment_method,
-            external_id=provider_payment_id,
-            commit=True,
-        )
-    except Exception as error:
-        # Unique (external_id, method) violation => concurrent webhook already
-        # credited this payment. Roll back our balance mutation and bail out.
+    except (Exception, asyncio.CancelledError):
         await db.rollback()
-        logger.warning(
-            'Subpage renewal: deposit transaction already exists (replay), skipping',
-            provider_payment_id=provider_payment_id,
-            error=str(error),
-        )
-        return True
+        raise
 
+
+async def fulfill_paid_invoice(db: AsyncSession, token: str) -> None:
+    from app.database.crud.transaction import create_transaction, emit_transaction_side_effects
+    from app.database.crud.user import lock_user_for_pricing
     from app.services.pricing_engine import pricing_engine
-    from app.services.subscription_renewal_service import (
-        SubscriptionRenewalChargeError,
-        SubscriptionRenewalService,
-    )
+    from app.services.subscription_renewal_service import SubscriptionRenewalService
 
+    invoice = await db.get(SubpageInvoice, token)
+    if invoice is None or invoice.status != 'paid':
+        return
+    user_id = invoice.user_id
+    if user_id is None:
+        invoice.status, invoice.reason = 'review', 'owner_deleted'
+        await db.commit()
+        return
     try:
-        pricing = await pricing_engine.calculate_renewal_price(db, subscription, period_days, user=user)
-        renewal_service = SubscriptionRenewalService()
-        renewal_result = await renewal_service.finalize(
-            db,
-            user,
-            subscription,
-            pricing,
-            charge_balance_amount=payment_amount_kopeks,
-            description=f'Продление подписки на {period_days} дней (страница подписки)',
-            payment_method=payment_method,
+        # Same lock order as purchases: user -> invoice -> subscription.
+        user = await lock_user_for_pricing(db, user_id)
+        invoice = await db.scalar(
+            select(SubpageInvoice)
+            .where(SubpageInvoice.token == token)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-    except SubscriptionRenewalChargeError:
-        logger.critical(
-            'Subpage renewal: balance charge failed after credit — money left on balance',
-            user_id=user.id,
-            provider_payment_id=provider_payment_id,
+        if invoice.status != 'paid':
+            await db.rollback()
+            return
+        method = PaymentMethod(invoice.method)
+        amount = invoice.paid_amount_kopeks
+        external_id = invoice.provider_payment_id
+        deposit = await db.scalar(
+            select(Transaction).where(
+                Transaction.external_id == external_id,
+                Transaction.payment_method == method.value,
+            )
         )
-        await mark_invoice(token, 'failed')
-        return True
+        new_deposit = deposit is None
+        if deposit is not None:
+            if (
+                deposit.user_id != user_id
+                or deposit.type != TransactionType.DEPOSIT.value
+                or deposit.amount_kopeks != amount
+                or not deposit.is_completed
+            ):
+                raise ValueError('subpage_existing_deposit_mismatch')
+        else:
+            user.balance_kopeks += amount
+            deposit = await create_transaction(
+                db,
+                user_id=user_id,
+                type=TransactionType.DEPOSIT,
+                amount_kopeks=amount,
+                description=f'Пополнение через страницу подписки ({invoice.method})',
+                payment_method=method,
+                external_id=external_id,
+                commit=False,
+            )
+        invoice.deposit_transaction_id = deposit.id
+        sub = await db.scalar(
+            select(Subscription)
+            .options(*_subscription_load_options())
+            .where(
+                Subscription.id == invoice.subscription_id,
+                Subscription.user_id == user_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        # populate_existing on eager User must not overwrite the pending credit.
+        # create_transaction(commit=False) flushed that credit before this query.
+        reason = None
+        pricing = None
+        if not invoice.configuration or not invoice.pricing:
+            reason = 'legacy_quote_missing' if new_deposit else 'legacy_payment_already_processed'
+        elif sub is None or not is_subscription_renewable(sub):
+            reason = 'subscription_unavailable'
+        elif amount != invoice.amount_kopeks:
+            reason = 'amount_mismatch'
+        elif quote_configuration(user, sub) != invoice.configuration:
+            reason = 'configuration_changed'
+        else:
+            pricing = await pricing_engine.calculate_renewal_price(db, sub, invoice.period_days, user=user)
+            current = asdict(pricing)
+            if any(current[key] != invoice.pricing.get(key) for key in current if key != 'breakdown'):
+                reason = 'price_or_discount_changed'
+            elif user.balance_kopeks < amount:
+                reason = 'previous_credit_already_spent'
+
+        result = None
+        description = f'Продление подписки на {invoice.period_days} дней (страница подписки)'
+        period_days = invoice.period_days
+        if reason:
+            invoice.status = (
+                'review'
+                if reason in ('legacy_payment_already_processed', 'previous_credit_already_spent')
+                else 'credited_only'
+            )
+            invoice.reason = reason
+        else:
+            result = await SubscriptionRenewalService().finalize(
+                db,
+                user,
+                sub,
+                pricing,
+                charge_balance_amount=amount,
+                description=description,
+                payment_method=method,
+                commit=False,
+            )
+            invoice.status, invoice.reason = 'succeeded', None
+            invoice.renewal_transaction_id = result.transaction.id
+            invoice.new_expires_at = result.subscription.end_date
+        invoice.updated_at = datetime.now(UTC)
+        await db.commit()
+    except (Exception, asyncio.CancelledError):
+        await db.rollback()
+        raise
+
+    # The monetary result is final. A failure in optional events must never
+    # repeat a renewal; the panel intent is already in the same committed DB.
+    try:
+        if new_deposit:
+            await emit_transaction_side_effects(
+                db,
+                deposit,
+                amount_kopeks=amount,
+                user_id=user_id,
+                type=TransactionType.DEPOSIT,
+                payment_method=method,
+                external_id=external_id,
+            )
+        if result:
+            await SubscriptionRenewalService().after_commit(
+                db,
+                user,
+                result,
+                period_days=period_days,
+                description=description,
+                payment_method=method,
+            )
     except Exception as error:
-        logger.critical(
-            'Subpage renewal: extension failed — money left on balance',
-            user_id=user.id,
-            subscription_id=subscription_id,
-            provider_payment_id=provider_payment_id,
-            error=str(error),
+        await db.rollback()
+        logger.warning('Subpage post-commit work failed', token_prefix=token[:6], error_type=type(error).__name__)
+
+
+async def process_pending_subpage_orders(*, session_factory=None, limit: int = 20) -> None:
+    from app.database.database import AsyncSessionLocal
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as db:
+        tokens = list(
+            (
+                await db.scalars(
+                    select(SubpageInvoice.token)
+                    .where(
+                        SubpageInvoice.status == 'paid',
+                        SubpageInvoice.next_attempt_at <= datetime.now(UTC),
+                    )
+                    .order_by(SubpageInvoice.next_attempt_at)
+                    .limit(limit)
+                )
+            ).all()
         )
-        await mark_invoice(token, 'failed')
-        return True
-
-    new_end = renewal_result.subscription.end_date
-    await mark_invoice(token, 'succeeded', new_end.isoformat() if new_end else None)
-
-    logger.info(
-        'Subpage renewal fulfilled',
-        user_id=user.id,
-        subscription_id=subscription_id,
-        period_days=period_days,
-        amount_kopeks=payment_amount_kopeks,
-        provider_payment_id=provider_payment_id,
-    )
-    return True
+    for token in tokens:
+        async with factory() as db:
+            try:
+                await fulfill_paid_invoice(db, token)
+            except Exception as error:
+                await db.rollback()
+                invoice = await db.scalar(select(SubpageInvoice).where(SubpageInvoice.token == token).with_for_update())
+                if invoice is not None and invoice.status == 'paid':
+                    invoice.attempts += 1
+                    invoice.next_attempt_at = datetime.now(UTC) + timedelta(
+                        seconds=min(3600, 30 * 2 ** min(invoice.attempts, 7))
+                    )
+                    await db.commit()
+                logger.error('Subpage fulfillment deferred', token_prefix=token[:6], error_type=type(error).__name__)

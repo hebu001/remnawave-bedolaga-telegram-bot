@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import structlog
 from aiogram import Bot
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot_factory import create_bot
 from app.config import settings
@@ -24,17 +24,14 @@ from app.database.crud.user import subtract_user_balance
 from app.database.models import PaymentMethod, Subscription, Transaction, TransactionType, User
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.pricing_engine import RenewalPricing
-from app.services.remnawave_service import RemnaWaveConfigurationError
-from app.services.subscription_service import SubscriptionService
+from app.services.renewal_sync_service import (
+    REMNAWAVE_SYNC_TIMEOUT,
+    process_renewal_sync,
+    schedule_renewal_sync,
+)
 
 
 logger = structlog.get_logger(__name__)
-
-# Cap the inline RemnaWave panel sync during renewal. The charge + extension are
-# committed before the sync, so a slow/unavailable panel must not hold the request
-# open (the cabinet pay button is bound to it and would spin after delivery). Past
-# this budget the sync is deferred to remnawave_retry_queue.
-REMNAWAVE_SYNC_TIMEOUT = 10.0
 
 
 class SubscriptionRenewalError(Exception):
@@ -368,6 +365,7 @@ class SubscriptionRenewalService:
         charge_balance_amount: int | None = None,
         description: str | None = None,
         payment_method: PaymentMethod | None = None,
+        commit: bool = True,
     ) -> SubscriptionRenewalResult:
         final_total = int(pricing.final_total)
         final_total = max(final_total, 0)
@@ -440,108 +438,87 @@ class SubscriptionRenewalService:
                 payment_method=payment_method,
                 commit=False,
             )
-            await db.commit()
+            await schedule_renewal_sync(
+                db,
+                subscription_after.id,
+                reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
+                reset_devices=settings.RESET_DEVICES_ON_RENEWAL,
+            )
+            if commit:
+                await db.commit()
+            else:
+                await db.flush()
         except (Exception, asyncio.CancelledError):
             await db.rollback()
             raise
 
-        await emit_transaction_side_effects(
-            db,
-            transaction,
-            amount_kopeks=final_total,
-            user_id=user.id,
-            type=TransactionType.SUBSCRIPTION_PAYMENT,
-            payment_method=payment_method or PaymentMethod.BALANCE,
-            description=description_text,
-        )
-
-        reset_traffic = settings.RESET_TRAFFIC_ON_PAYMENT
-        reset_devices = settings.RESET_DEVICES_ON_RENEWAL
-        subscription_service = SubscriptionService()
-        try:
-            await db.refresh(user)
-            if settings.is_multi_tariff_enabled():
-                _should_create = not subscription_after.remnawave_uuid
-            else:
-                _should_create = not getattr(user, 'remnawave_uuid', None)
-
-            async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
-                if _should_create:
-                    await subscription_service.create_remnawave_user(
-                        db,
-                        subscription_after,
-                        reset_traffic=reset_traffic,
-                        reset_reason='subscription renewal',
-                    )
-                else:
-                    await subscription_service.update_remnawave_user(
-                        db,
-                        subscription_after,
-                        reset_traffic=reset_traffic,
-                        reset_reason='subscription renewal',
-                    )
-        except RemnaWaveConfigurationError as error:  # pragma: no cover - configuration issues
-            logger.warning('RemnaWave update skipped', error=error)
-        except Exception as error:  # pragma: no cover - defensive logging
-            logger.error(
-                'Failed to sync RemnaWave user for subscription',
-                subscription_after_id=subscription_after.id,
-                error=error,
-            )
-            from app.services.remnawave_retry_queue import remnawave_retry_queue
-
-            remnawave_retry_queue.enqueue(
-                subscription_id=subscription_after.id,
-                user_id=subscription_after.user_id,
-                action='create' if not getattr(subscription_after, 'remnawave_uuid', None) else 'update',
-            )
-
-        # Сброс привязанных устройств при продлении (если включено)
-        if reset_devices:
-            try:
-                from app.services.remnawave_service import RemnaWaveService
-
-                rw_service = RemnaWaveService()
-                _uuid = (
-                    getattr(subscription_after, 'remnawave_uuid', None)
-                    if settings.is_multi_tariff_enabled()
-                    else getattr(user, 'remnawave_uuid', None)
-                )
-                if _uuid:
-                    async with rw_service.get_api_client() as api:
-                        await api.reset_user_devices(_uuid)
-                    logger.info(
-                        'Devices reset on renewal',
-                        subscription_id=subscription_after.id,
-                        user_id=user.id,
-                    )
-            except Exception as error:
-                logger.warning('Failed to reset devices on renewal', error=error, exc_info=True)
-
-        await db.refresh(user)
-        await db.refresh(subscription_after)
-
-        if transaction and old_end_date and subscription_after.end_date:
-            await with_admin_notification_service(
-                lambda service: service.send_subscription_extension_notification(
-                    db,
-                    user,
-                    subscription_after,
-                    transaction,
-                    period_days,
-                    old_end_date,
-                    new_end_date=subscription_after.end_date,
-                    balance_after=user.balance_kopeks,
-                )
-            )
-
-        return SubscriptionRenewalResult(
+        result = SubscriptionRenewalResult(
             subscription=subscription_after,
             transaction=transaction,
             total_amount_kopeks=final_total,
             charged_from_balance_kopeks=charge_from_balance,
             old_end_date=old_end_date,
         )
+        if commit:
+            await self.after_commit(
+                db, user, result, period_days=period_days, description=description_text, payment_method=payment_method
+            )
+        return result
+
+    async def after_commit(
+        self,
+        db: AsyncSession,
+        user: User,
+        result: SubscriptionRenewalResult,
+        *,
+        period_days: int,
+        description: str,
+        payment_method: PaymentMethod | None = None,
+    ) -> None:
+        """Run only after the caller has committed both money and fulfillment."""
+        subscription_id = result.subscription.id
+        try:
+            await emit_transaction_side_effects(
+                db,
+                result.transaction,
+                amount_kopeks=result.total_amount_kopeks,
+                user_id=user.id,
+                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                payment_method=payment_method or PaymentMethod.BALANCE,
+                description=description,
+            )
+        except Exception as error:
+            await db.rollback()
+            logger.warning('Renewal events failed after commit', error_type=type(error).__name__)
+
+        # The durable job already exists. Inline work only reduces delivery latency.
+        try:
+            async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
+                await process_renewal_sync(
+                    subscription_id,
+                    session_factory=async_sessionmaker(db.bind, expire_on_commit=False),
+                    force=True,
+                )
+        except Exception as error:
+            logger.warning(
+                'Renewal sync left pending', subscription_id=subscription_id, error_type=type(error).__name__
+            )
+
+        await db.refresh(user)
+        await db.refresh(result.subscription)
+        if result.transaction and result.old_end_date and result.subscription.end_date:
+            await with_admin_notification_service(
+                lambda service: service.send_subscription_extension_notification(
+                    db,
+                    user,
+                    result.subscription,
+                    result.transaction,
+                    period_days,
+                    result.old_end_date,
+                    new_end_date=result.subscription.end_date,
+                    balance_after=user.balance_kopeks,
+                )
+            )
 
 
 def calculate_missing_amount(balance_kopeks: int, total_kopeks: int) -> int:

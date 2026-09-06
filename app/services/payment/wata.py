@@ -75,6 +75,7 @@ class WataPaymentMixin:
         language: str | None = None,
         return_url: str | None = None,
         failed_url: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not getattr(self, 'wata_service', None):
             logger.error('WATA service is not initialised')
@@ -144,7 +145,8 @@ class WataPaymentMixin:
         expiration_raw = response.get('expirationDateTime')
         expires_at = WataService._parse_datetime(expiration_raw)
 
-        metadata = {
+        payment_metadata = {
+            **(metadata or {}),
             'response': response,
             'language': language or settings.DEFAULT_LANGUAGE,
         }
@@ -160,7 +162,7 @@ class WataPaymentMixin:
             type_=response.get('type'),
             url=payment_url,
             order_id=order_id,
-            metadata=metadata,
+            metadata=payment_metadata,
             expires_at=expires_at,
             terminal_public_id=terminal_public_id,
             success_redirect_url=success_url,
@@ -237,7 +239,7 @@ class WataPaymentMixin:
         )
 
         if status_lower == 'paid':
-            if payment.is_paid:
+            if payment.is_paid and metadata.get('purpose') != 'subpage_renewal':
                 logger.info('WATA платеж уже помечен как оплачен', payment_link_id=payment.payment_link_id)
                 # Update callback payload without releasing the lock prematurely
                 payment.callback_payload = payload
@@ -430,7 +432,7 @@ class WataPaymentMixin:
             )
 
         # FOR UPDATE lock already acquired by caller — just check idempotency
-        if payment.transaction_id:
+        if payment.transaction_id and (payment.metadata_json or {}).get('purpose') != 'subpage_renewal':
             logger.info(
                 'WATA платеж уже привязан к транзакции',
                 payment_link_id=payment.payment_link_id,
@@ -490,6 +492,8 @@ class WataPaymentMixin:
             payment_amount_kopeks=payment.amount_kopeks,
             provider_payment_id=payment.payment_link_id,
             provider_name='wata',
+            payment_user_id=payment.user_id,
+            currency=payment.currency,
         )
         if subpage_result is not None:
             return payment

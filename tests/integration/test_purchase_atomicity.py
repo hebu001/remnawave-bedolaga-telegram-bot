@@ -25,7 +25,7 @@ from app.config import settings
 from app.database.crud import subscription as subscription_crud
 from app.database.crud.user import lock_user_for_pricing
 from app.database.models import Base, ServerSquad, Subscription, SubscriptionServer, Tariff, Transaction, User
-from app.services import subscription_renewal_service as renewal
+from app.services import renewal_sync_service, subscription_renewal_service as renewal
 from app.services.pricing_engine import pricing_engine
 from app.services.user_cart_service import user_cart_service
 from app.webapi.routes import miniapp
@@ -100,7 +100,7 @@ async def context(sessions, monkeypatch):
         create_remnawave_user=AsyncMock(side_effect=assert_committed),
     )
     monkeypatch.setattr(miniapp, 'SubscriptionService', lambda: panel)
-    monkeypatch.setattr(renewal, 'SubscriptionService', lambda: panel)
+    monkeypatch.setattr(renewal_sync_service, 'SubscriptionService', lambda: panel)
     effects = AsyncMock(side_effect=assert_committed)
     monkeypatch.setattr(miniapp, 'emit_transaction_side_effects', effects)
     monkeypatch.setattr(renewal, 'emit_transaction_side_effects', effects)
