@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import User
+from app.services.backup_io import BackupIOBusy
 from app.services.backup_service import backup_service
 from app.utils.decorators import admin_required, error_handler
 
@@ -171,7 +172,11 @@ async def show_backup_list(callback: types.CallbackQuery, db_user: User, db: Asy
         except:
             page = 1
 
-    backups = await backup_service.get_backup_list()
+    try:
+        backups = await backup_service.get_backup_list()
+    except BackupIOBusy:
+        await callback.answer('⏳ Обработка бекапов занята. Повторите запрос через несколько секунд.', show_alert=True)
+        return
 
     if not backups:
         text = '📦 <b>Список бекапов пуст</b>\n\nБекапы еще не создавались.'
@@ -195,7 +200,11 @@ async def show_backup_list(callback: types.CallbackQuery, db_user: User, db: Asy
 async def manage_backup_file(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     filename = callback.data.replace('backup_manage_', '')
 
-    backups = await backup_service.get_backup_list()
+    try:
+        backups = await backup_service.get_backup_list()
+    except BackupIOBusy:
+        await callback.answer('⏳ Обработка бекапов занята. Повторите запрос через несколько секунд.', show_alert=True)
+        return
     backup_info = None
 
     for backup in backups:

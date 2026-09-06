@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, File, HTTPException, Query, Security, UploadFile, status
 from fastapi.responses import FileResponse
 
+from app.services.backup_io import BackupIOBusy
 from app.services.backup_service import backup_service
 
 from ..background.backup_tasks import backup_task_manager
@@ -25,6 +26,23 @@ from ..schemas.backups import (
 
 
 router = APIRouter()
+
+
+def _resolve_backup_path(filename: str) -> Path:
+    """Resolve a file inside the backup directory, including symlink targets."""
+    relative_path = Path(filename)
+    if not filename or '\x00' in filename or relative_path.is_absolute() or '..' in relative_path.parts:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Invalid backup path')
+    backup_dir = backup_service.backup_dir.resolve()
+    try:
+        resolved_path = (backup_dir / relative_path).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Invalid backup path') from exc
+    if resolved_path == backup_dir or not resolved_path.is_relative_to(backup_dir):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Access denied')
+    if resolved_path.exists() and not resolved_path.is_file():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Invalid backup path')
+    return resolved_path
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -99,7 +117,14 @@ async def list_backups(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> BackupListResponse:
-    backups = await backup_service.get_backup_list()
+    try:
+        backups = await backup_service.get_backup_list()
+    except BackupIOBusy as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={'Retry-After': '5'},
+        ) from exc
     total = len(backups)
 
     slice_backups = backups[offset : offset + limit]
@@ -178,18 +203,10 @@ async def download_backup(
     filename: str,
     _: Any = Security(require_api_token),
 ) -> FileResponse:
-    backup_path = backup_service.backup_dir / filename
+    backup_path = _resolve_backup_path(filename)
 
     if not backup_path.exists():
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'Backup file not found')
-
-    if not backup_path.is_file():
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Invalid backup path')
-
-    resolved_path = backup_path.resolve()
-    backup_dir_resolved = backup_service.backup_dir.resolve()
-    if not str(resolved_path).startswith(str(backup_dir_resolved)):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Access denied')
 
     return FileResponse(
         path=str(backup_path),
@@ -208,15 +225,10 @@ async def restore_backup(
     payload: BackupRestoreRequest,
     _: Any = Security(require_api_token),
 ) -> BackupRestoreResponse:
-    backup_path = backup_service.backup_dir / filename
+    backup_path = _resolve_backup_path(filename)
 
     if not backup_path.exists():
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'Backup file not found')
-
-    resolved_path = backup_path.resolve()
-    backup_dir_resolved = backup_service.backup_dir.resolve()
-    if not str(resolved_path).startswith(str(backup_dir_resolved)):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Access denied')
 
     success, message = await backup_service.restore_backup(str(backup_path), clear_existing=payload.clear_existing)
 
@@ -247,12 +259,7 @@ async def upload_and_restore_backup(
     if not any(safe_filename.endswith(ext) for ext in allowed_extensions):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f'Invalid file type. Allowed: {", ".join(allowed_extensions)}')
 
-    temp_path = backup_service.backup_dir / f'uploaded_{safe_filename}'
-
-    resolved_path = temp_path.resolve()
-    backup_dir_resolved = backup_service.backup_dir.resolve()
-    if not str(resolved_path).startswith(str(backup_dir_resolved)):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Invalid file path')
+    temp_path = _resolve_backup_path(f'uploaded_{safe_filename}')
 
     try:
         content = await file.read()
@@ -283,12 +290,7 @@ async def delete_backup(
     filename: str,
     _: Any = Security(require_api_token),
 ) -> BackupDeleteResponse:
-    backup_path = backup_service.backup_dir / filename
-
-    resolved_path = backup_path.resolve()
-    backup_dir_resolved = backup_service.backup_dir.resolve()
-    if not str(resolved_path).startswith(str(backup_dir_resolved)):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Access denied')
+    _resolve_backup_path(filename)
 
     success, message = await backup_service.delete_backup(filename)
 

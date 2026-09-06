@@ -3196,6 +3196,9 @@ class MonitoringLog(Base):
 
 class SentNotification(Base):
     __tablename__ = 'sent_notifications'
+    __table_args__ = (
+        Index('ix_sent_notifications_lookup', 'subscription_id', 'user_id', 'notification_type', 'days_before'),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)

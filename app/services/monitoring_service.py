@@ -18,6 +18,7 @@ from app.database.crud.discount_offer import (
 )
 from app.database.crud.notification import (
     clear_notification_by_type,
+    get_sent_notification_keys,
     notification_sent,
     record_notification,
 )
@@ -706,9 +707,23 @@ class MonitoringService:
         try:
             warning_days = settings.get_autopay_warning_days()
             all_processed_users = set()
+            # Resolve each threshold once per cycle, not once per subscription.
+            expiring_by_days = {}
+            for days in warning_days:
+                if days not in expiring_by_days:
+                    expiring_by_days[days] = await self._get_expiring_paid_subscriptions(db, days)
+            subscription_ids_by_days = {
+                days: {subscription.id for subscription in subscriptions}
+                for days, subscriptions in expiring_by_days.items()
+            }
+            sent_keys = await get_sent_notification_keys(
+                db,
+                ((s.user_id, s.id) for subscriptions in expiring_by_days.values() for s in subscriptions),
+                ['expiring'],
+            )
 
             for days in warning_days:
-                expiring_subscriptions = await self._get_expiring_paid_subscriptions(db, days)
+                expiring_subscriptions = expiring_by_days[days]
                 sent_count = 0
 
                 # Batch-запрос: собираем user_id с autopay и проверяем наличие карт одним запросом
@@ -726,7 +741,7 @@ class MonitoringService:
                 )
 
                 for subscription in expiring_subscriptions:
-                    user = await get_user_by_id(db, subscription.user_id)
+                    user = subscription.user
                     if not user:
                         continue
 
@@ -743,10 +758,7 @@ class MonitoringService:
                     sub_key = f'user_{user.id}_sub_{subscription.id}_today'
                     user_identifier = user.telegram_id or f'email:{user.id}'
 
-                    if (
-                        await notification_sent(db, user.id, subscription.id, 'expiring', days)
-                        or sub_key in all_processed_users
-                    ):
+                    if (user.id, subscription.id, 'expiring', days) in sent_keys or sub_key in all_processed_users:
                         logger.debug(
                             'Уведомление уже отправлено, пропускаем',
                             user_identifier=user_identifier,
@@ -759,8 +771,7 @@ class MonitoringService:
                     should_send = True
                     for other_days in warning_days:
                         if other_days < days:
-                            other_subs = await self._get_expiring_paid_subscriptions(db, other_days)
-                            if any(s.id == subscription.id for s in other_subs):
+                            if subscription.id in subscription_ids_by_days[other_days]:
                                 should_send = False
                                 logger.debug(
                                     '🎯 Пропускаем уведомление на дней для пользователя есть более срочное на дней',
@@ -782,6 +793,7 @@ class MonitoringService:
                         )
                         if success:
                             await record_notification(db, user.id, subscription.id, 'expiring', days)
+                            sent_keys.add((user.id, subscription.id, 'expiring', days))
                             all_processed_users.add(sub_key)
                             sent_count += 1
                             logger.info(
@@ -797,6 +809,7 @@ class MonitoringService:
                         )
                         if success:
                             await record_notification(db, user.id, subscription.id, 'expiring', days)
+                            sent_keys.add((user.id, subscription.id, 'expiring', days))
                             all_processed_users.add(sub_key)
                             sent_count += 1
                             logger.info(
@@ -845,19 +858,21 @@ class MonitoringService:
                 )
             )
             trial_expiring = result.scalars().all()
+            sent_keys = await get_sent_notification_keys(db, ((s.user_id, s.id) for s in trial_expiring), ['trial_2h'])
 
             for subscription in trial_expiring:
                 user = subscription.user
                 if not user:
                     continue
 
-                if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
+                if (user.id, subscription.id, 'trial_2h', None) in sent_keys:
                     continue
 
                 if self.bot:
                     success = await self._send_trial_ending_notification(user, subscription)
                     if success:
                         await record_notification(db, user.id, subscription.id, 'trial_2h')
+                        sent_keys.add((user.id, subscription.id, 'trial_2h', None))
                         logger.info(
                             '🎁 Пользователю отправлено уведомление об окончании тестовой подписки через 2 часа',
                             telegram_id=user.telegram_id,
@@ -1208,6 +1223,27 @@ class MonitoringService:
                 sub for sub in all_subscriptions if not (sub.tariff and getattr(sub.tariff, 'is_daily', False))
             ]
 
+            sent_keys = await get_sent_notification_keys(
+                db,
+                ((s.user_id, s.id) for s in subscriptions),
+                ['expired_1d', 'expired_discount_wave2', 'expired_discount_wave3'],
+            )
+
+            active_owner_ids: set[int] = set()
+            if settings.is_multi_tariff_enabled():
+                owner_ids = sorted({s.user_id for s in subscriptions})
+                for offset in range(0, len(owner_ids), 500):
+                    active_owners = await db.scalars(
+                        select(Subscription.user_id)
+                        .where(
+                            Subscription.user_id.in_(owner_ids[offset : offset + 500]),
+                            Subscription.status == SubscriptionStatus.ACTIVE.value,
+                            Subscription.end_date > now,
+                        )
+                        .distinct()
+                    )
+                    active_owner_ids.update(active_owners)
+
             sent_day1 = 0
             sent_wave2 = 0
             sent_wave3 = 0
@@ -1220,20 +1256,9 @@ class MonitoringService:
                 if subscription.end_date is None:
                     continue
 
-                # Skip if user has another ACTIVE subscription — they still have service
-                if settings.is_multi_tariff_enabled():
-                    other_active = await db.execute(
-                        select(Subscription.id)
-                        .where(
-                            Subscription.user_id == user.id,
-                            Subscription.id != subscription.id,
-                            Subscription.status == SubscriptionStatus.ACTIVE.value,
-                            Subscription.end_date > now,
-                        )
-                        .limit(1)
-                    )
-                    if other_active.scalar_one_or_none() is not None:
-                        continue
+                # Candidates are expired, so any ACTIVE subscription is another one.
+                if user.id in active_owner_ids:
+                    continue
 
                 time_since_end = now - subscription.end_date
                 if time_since_end.total_seconds() < 0:
@@ -1243,15 +1268,16 @@ class MonitoringService:
 
                 # Day 1 reminder
                 if NotificationSettingsService.is_expired_1d_enabled() and 1 <= days_since < 2:
-                    if not await notification_sent(db, user.id, subscription.id, 'expired_1d'):
+                    if (user.id, subscription.id, 'expired_1d', None) not in sent_keys:
                         success = await self._send_expired_day1_notification(db, user, subscription)
                         if success:
                             await record_notification(db, user.id, subscription.id, 'expired_1d')
+                            sent_keys.add((user.id, subscription.id, 'expired_1d', None))
                             sent_day1 += 1
 
                 # Second wave (2-3 days) discount
                 if NotificationSettingsService.is_second_wave_enabled() and 2 <= days_since < 4:
-                    if not await notification_sent(db, user.id, subscription.id, 'expired_discount_wave2'):
+                    if (user.id, subscription.id, 'expired_discount_wave2', None) not in sent_keys:
                         percent = NotificationSettingsService.get_second_wave_discount_percent()
                         valid_hours = NotificationSettingsService.get_second_wave_valid_hours()
                         offer = await upsert_discount_offer(
@@ -1274,13 +1300,14 @@ class MonitoringService:
                         )
                         if success:
                             await record_notification(db, user.id, subscription.id, 'expired_discount_wave2')
+                            sent_keys.add((user.id, subscription.id, 'expired_discount_wave2', None))
                             sent_wave2 += 1
 
                 # Third wave (N days) discount
                 if NotificationSettingsService.is_third_wave_enabled():
                     trigger_days = NotificationSettingsService.get_third_wave_trigger_days()
                     if trigger_days <= days_since < trigger_days + 1:
-                        if not await notification_sent(db, user.id, subscription.id, 'expired_discount_wave3'):
+                        if (user.id, subscription.id, 'expired_discount_wave3', None) not in sent_keys:
                             percent = NotificationSettingsService.get_third_wave_discount_percent()
                             valid_hours = NotificationSettingsService.get_third_wave_valid_hours()
                             offer = await upsert_discount_offer(
@@ -1304,6 +1331,7 @@ class MonitoringService:
                             )
                             if success:
                                 await record_notification(db, user.id, subscription.id, 'expired_discount_wave3')
+                                sent_keys.add((user.id, subscription.id, 'expired_discount_wave3', None))
                                 sent_wave3 += 1
 
             if sent_day1 or sent_wave2 or sent_wave3:

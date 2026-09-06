@@ -4,7 +4,9 @@ import html as html_lib
 import json as json_lib
 import math
 import os
+import re
 import shutil
+import stat
 import tarfile
 import tempfile
 from dataclasses import asdict, dataclass
@@ -128,6 +130,7 @@ from app.database.models import (
     server_squad_promo_groups,
     tariff_promo_groups,
 )
+from app.services.backup_io import BackupIOBusy, backup_io
 
 
 logger = structlog.get_logger(__name__)
@@ -202,6 +205,9 @@ class BackupService:
         # первый цикл осиротевает и живёт параллельно. Осиротевшие циклы
         # одновременно пишут один gzip-архив и рвут его (#3030).
         self._scheduler_lock = asyncio.Lock()
+        self._backup_list_task: asyncio.Task | None = None
+        self._backup_metadata_cache: dict[str, tuple[dict, dict]] = {}
+        self._creation_task: asyncio.Task | None = None
         self._settings = self._load_settings()
 
         self._base_backup_models = [
@@ -496,6 +502,52 @@ class BackupService:
     async def create_backup(
         self, created_by: int | None = None, compress: bool = True, include_logs: bool = None
     ) -> tuple[bool, str, str | None]:
+        existing = getattr(self, '_creation_task', None)
+        if existing is not None and not existing.done():
+            return False, '❌ Создание бекапа уже выполняется', None
+        task = asyncio.create_task(self._create_backup_impl(created_by, compress, include_logs))
+        self._creation_task = task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Worker threads/subprocesses cannot be cancelled by cancelling their
+            # awaiter. Finish the isolated operation before scheduler restart or
+            # temporary-directory cleanup; even repeated cancellation is safe.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            task.result()
+            raise
+
+    def _publish_backup_archive_sync(self, staging_dir: Path, backup_path: Path, compress: bool, metadata: dict) -> int:
+        partial_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=self.backup_dir, prefix='.backup-', suffix='.partial', delete=False
+            ) as stream:
+                partial_path = Path(stream.name)
+            with tarfile.open(partial_path, 'w:gz' if compress else 'w') as archive:
+                archive.add(staging_dir / 'metadata.json', arcname='metadata.json')
+                for item in staging_dir.iterdir():
+                    if item.name != 'metadata.json':
+                        archive.add(item, arcname=item.name)
+            with partial_path.open('rb') as stream:
+                os.fsync(stream.fileno())
+            partial_path.replace(backup_path)
+            file_stats = backup_path.stat()
+            self._write_backup_sidecar_sync(
+                backup_path, self._backup_identity(file_stats), self._listing_metadata(metadata)
+            )
+            return file_stats.st_size
+        finally:
+            if partial_path is not None:
+                partial_path.unlink(missing_ok=True)
+
+    async def _create_backup_impl(
+        self, created_by: int | None, compress: bool, include_logs: bool | None
+    ) -> tuple[bool, str, str | None]:
         try:
             logger.info('📄 Начинаем создание бекапа...')
 
@@ -504,13 +556,14 @@ class BackupService:
 
             overview = await self._collect_database_overview()
 
-            timestamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
+            timestamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')
             archive_suffix = '.tar.gz' if compress else '.tar'
             filename = f'backup_{timestamp}{archive_suffix}'
             backup_path = self.backup_dir / filename
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
+            temporary = await asyncio.to_thread(tempfile.TemporaryDirectory)
+            try:
+                temp_path = Path(temporary.name)
                 staging_dir = temp_path / 'backup'
                 await asyncio.to_thread(lambda: staging_dir.mkdir(parents=True, exist_ok=True))
 
@@ -527,7 +580,7 @@ class BackupService:
                     'backup_type': 'full',
                     'tables_count': overview.get('tables_count', 0),
                     'total_records': overview.get('total_records', 0),
-                    'compressed': True,
+                    'compressed': compress,
                     'created_by': created_by,
                     'database': database_info,
                     'files': files_info,
@@ -539,18 +592,13 @@ class BackupService:
                 async with aiofiles.open(metadata_path, 'w', encoding='utf-8') as meta_file:
                     await meta_file.write(json_lib.dumps(metadata, ensure_ascii=False, indent=2))
 
-                mode = 'w:gz' if compress else 'w'
-
-                def _write_archive() -> None:
-                    # tar.add reads + gzip-compresses each file; running it inline froze the
-                    # whole event loop (and thus the bot) for the duration of every auto-backup.
-                    with tarfile.open(backup_path, mode) as tar:
-                        for item in staging_dir.iterdir():
-                            tar.add(item, arcname=item.name)
-
-                await asyncio.to_thread(_write_archive)
-
-            file_size = (await asyncio.to_thread(backup_path.stat)).st_size
+                file_size = await backup_io.run(
+                    lambda: self._publish_backup_archive_sync(staging_dir, backup_path, compress, metadata),
+                    wait_on_cancel=True,
+                )
+            finally:
+                # Deleting a multi-GB snapshot may itself take seconds.
+                await asyncio.to_thread(temporary.cleanup)
 
             await self._cleanup_old_backups()
 
@@ -1826,144 +1874,262 @@ class BackupService:
             'corrupted': True,
         }
 
-    async def get_backup_list(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _backup_sidecar_path(backup_file: Path) -> Path:
+        # Hidden companion files never match the backup_* archive listing.
+        return backup_file.with_name(f'.{backup_file.name}.metadata.json')
+
+    @staticmethod
+    def _backup_identity(file_stats: os.stat_result) -> dict[str, int]:
+        return {
+            'size': file_stats.st_size,
+            'mtime_ns': file_stats.st_mtime_ns,
+            'ctime_ns': file_stats.st_ctime_ns,
+            'device': file_stats.st_dev,
+            'inode': file_stats.st_ino,
+        }
+
+    @staticmethod
+    def _backup_files_sync(backup_dir: Path) -> list[tuple[Path, os.stat_result]]:
         backups = []
-
-        try:
-            for backup_file in sorted(
-                await asyncio.to_thread(lambda: list(self.backup_dir.glob('backup_*'))), reverse=True
-            ):
-                if not await asyncio.to_thread(backup_file.is_file):
+        with os.scandir(backup_dir) as entries:
+            for entry in entries:
+                if (
+                    not entry.name.startswith('backup_')
+                    or not entry.name.endswith(('.tar.gz', '.tar', '.json.gz', '.json'))
+                    or entry.name.endswith('.metadata.json')
+                ):
                     continue
-
-                file_stats = await asyncio.to_thread(backup_file.stat)
-
-                # Empty file (0 bytes) — прерванный бэкап / гонка записи. Не пытаемся
-                # его открыть, иначе tarfile/gzip/json валятся с ReadError и логируют
-                # ERROR (а через TelegramNotifierProcessor — заливают админ-чат).
-                if file_stats.st_size == 0:
-                    logger.warning('Skipping empty backup file', backup_file=str(backup_file))
-                    backups.append(
-                        self._build_corrupted_backup_entry(backup_file, file_stats, reason='Файл пуст (0 байт)')
-                    )
-                    continue
-
                 try:
-                    metadata: dict[str, Any] = {}
+                    file_stats = entry.stat(follow_symlinks=False)
+                    if stat.S_ISREG(file_stats.st_mode):
+                        backups.append((Path(entry.path), file_stats))
+                except OSError:
+                    # Concurrent retention/deletion of one file does not hide the rest.
+                    continue
+        return sorted(backups, key=lambda pair: pair[0].name, reverse=True)
 
-                    if self._is_archive_backup(backup_file):
-                        mode = 'r:gz' if backup_file.suffixes and backup_file.suffixes[-1] == '.gz' else 'r'
-                        with tarfile.open(backup_file, mode) as tar:
-                            try:
-                                member = tar.getmember('metadata.json')
-                                with tar.extractfile(member) as meta_file:
-                                    metadata = json_lib.load(meta_file)
-                            except KeyError:
-                                metadata = {}
-                    else:
-                        if backup_file.suffix == '.gz':
-                            with gzip.open(backup_file, 'rt', encoding='utf-8') as f:
-                                backup_structure = json_lib.load(f)
-                        else:
-                            with open(backup_file, encoding='utf-8') as f:
-                                backup_structure = json_lib.load(f)
-                        metadata = backup_structure.get('metadata', {})
+    @staticmethod
+    def _listing_metadata(metadata: Any) -> dict[str, Any]:
+        """Persist only small, scalar listing fields, never settings/data/secrets."""
+        if not isinstance(metadata, dict):
+            raise ValueError('Метаданные бекапа должны быть объектом')
+        database = metadata.get('database', {})
+        if not isinstance(database, dict):
+            raise ValueError('Метаданные database должны быть объектом')
+        summary = {
+            'timestamp': metadata.get('timestamp'),
+            'tables_count': metadata.get('tables_count', database.get('tables_count', 0)),
+            'total_records': metadata.get('total_records', database.get('total_records', 0)),
+            'created_by': metadata.get('created_by'),
+            'database_type': metadata.get('database_type', database.get('type', 'unknown')),
+            'version': metadata.get('format_version', metadata.get('version', '1.0')),
+        }
+        for value in summary.values():
+            if value is not None and (type(value) not in (str, int) or len(str(value)) > 256):
+                raise ValueError('Некорректное поле метаданных бекапа')
+        if summary['timestamp'] is not None and not isinstance(summary['timestamp'], str):
+            raise ValueError('Некорректная дата бекапа')
+        return summary
 
-                    backup_info = {
+    def _read_backup_metadata_sync(self, backup_file: Path) -> dict[str, Any]:
+        if backup_file.name.endswith(('.tar.gz', '.tar')):
+            # getmember() scans the ENTIRE gzip, even when metadata is first.
+            # Stream only until metadata; never extract archive paths to disk.
+            mode = 'r|gz' if backup_file.suffix == '.gz' else 'r|'
+            with tarfile.open(backup_file, mode) as archive:
+                for member in archive:
+                    if member.name not in ('metadata.json', './metadata.json'):
+                        continue
+                    if not member.isfile() or member.size > 1024 * 1024:
+                        raise ValueError('Недопустимый размер или тип metadata.json')
+                    with archive.extractfile(member) as metadata_file:
+                        return self._listing_metadata(json_lib.load(metadata_file))
+            return self._listing_metadata({})
+        opener = gzip.open if backup_file.suffix == '.gz' else open
+        with opener(backup_file, 'rt', encoding='utf-8') as backup_stream:
+            structure = json_lib.load(backup_stream)
+        if not isinstance(structure, dict):
+            raise ValueError('Структура бекапа должна быть объектом')
+        return self._listing_metadata(structure.get('metadata', {}))
+
+    def _read_backup_sidecar_sync(self, backup_file: Path, identity: dict) -> dict | None:
+        try:
+            with self._backup_sidecar_path(backup_file).open('rb') as stream:
+                encoded = stream.read(16 * 1024 + 1)
+            if len(encoded) > 16 * 1024:
+                return None
+            cached = json_lib.loads(encoded)
+            if not isinstance(cached, dict) or cached.get('schema') != 1 or cached.get('identity') != identity:
+                return None
+            summary = cached.get('metadata')
+            if not isinstance(summary, dict):
+                return None
+            if summary.get('corrupted') is True:
+                reason = summary.get('error')
+                return {'corrupted': True, 'error': reason} if isinstance(reason, str) and len(reason) <= 200 else None
+            # Revalidate and strip unknown fields from externally edited sidecars.
+            if set(summary) != {'timestamp', 'tables_count', 'total_records', 'created_by', 'database_type', 'version'}:
+                return None
+            return self._listing_metadata(summary)
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+
+    def _write_backup_sidecar_sync(self, backup_file: Path, identity: dict, metadata: dict) -> None:
+        temporary_path = None
+        try:
+            payload = json_lib.dumps({'schema': 1, 'identity': identity, 'metadata': metadata}, ensure_ascii=False)
+            with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', dir=self.backup_dir, prefix='.backup-index-', delete=False
+            ) as stream:
+                temporary_path = Path(stream.name)
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Avoid publishing stale metadata after an archive replacement/deletion.
+            if self._backup_identity(backup_file.stat()) != identity:
+                return
+            temporary_path.replace(self._backup_sidecar_path(backup_file))
+        except OSError as exc:
+            # Read-only filesystems/full disks must not hide otherwise valid backups.
+            logger.warning(
+                'Не удалось сохранить индекс бекапа', backup_file=backup_file.name, error_type=type(exc).__name__
+            )
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _get_backup_list_sync(self) -> list[dict[str, Any]]:
+        backups = []
+        cache = getattr(self, '_backup_metadata_cache', {})
+        next_cache = {}
+        for backup_file, file_stats in self._backup_files_sync(self.backup_dir):
+            identity = self._backup_identity(file_stats)
+            previous = cache.get(backup_file.name)
+            metadata = (
+                previous[1]
+                if previous and previous[0] == identity
+                else self._read_backup_sidecar_sync(backup_file, identity)
+            )
+            if metadata is None:
+                try:
+                    if file_stats.st_size == 0:
+                        raise ValueError('Файл пуст (0 байт)')
+                    metadata = self._read_backup_metadata_sync(backup_file)
+                except Exception as exc:
+                    # No raw decoder contents: malformed JSON may contain private data.
+                    reason = (
+                        'Файл пуст (0 байт)'
+                        if file_stats.st_size == 0
+                        else f'Не удалось прочитать метаданные: {type(exc).__name__}'
+                    )
+                    logger.warning(
+                        'Backup file appears corrupted', backup_file=backup_file.name, error_type=type(exc).__name__
+                    )
+                    metadata = {'corrupted': True, 'error': reason}
+                try:
+                    if self._backup_identity(backup_file.stat()) != identity:
+                        continue
+                except OSError:
+                    continue
+                self._write_backup_sidecar_sync(backup_file, identity, metadata)
+            if len(next_cache) < 256:
+                next_cache[backup_file.name] = (identity, metadata)
+            if metadata.get('corrupted'):
+                backups.append(self._build_corrupted_backup_entry(backup_file, file_stats, reason=metadata['error']))
+            else:
+                backups.append(
+                    {
+                        **metadata,
                         'filename': backup_file.name,
                         'filepath': str(backup_file),
-                        'timestamp': metadata.get(
-                            'timestamp', datetime.fromtimestamp(file_stats.st_mtime, tz=UTC).isoformat()
-                        ),
-                        'tables_count': metadata.get(
-                            'tables_count', metadata.get('database', {}).get('tables_count', 0)
-                        ),
-                        'total_records': metadata.get(
-                            'total_records', metadata.get('database', {}).get('total_records', 0)
-                        ),
-                        'compressed': self._is_archive_backup(backup_file) or backup_file.suffix == '.gz',
+                        'timestamp': metadata.get('timestamp')
+                        or datetime.fromtimestamp(file_stats.st_mtime, tz=UTC).isoformat(),
+                        'compressed': backup_file.suffix == '.gz',
                         'file_size_bytes': file_stats.st_size,
                         'file_size_mb': round(file_stats.st_size / 1024 / 1024, 2),
-                        'created_by': metadata.get('created_by'),
-                        'database_type': metadata.get(
-                            'database_type', metadata.get('database', {}).get('type', 'unknown')
-                        ),
-                        'version': metadata.get('format_version', metadata.get('version', '1.0')),
                     }
-
-                    backups.append(backup_info)
-
-                except (
-                    tarfile.ReadError,
-                    tarfile.CompressionError,
-                    gzip.BadGzipFile,
-                    json_lib.JSONDecodeError,
-                    EOFError,
-                    UnicodeDecodeError,
-                ) as corruption_error:
-                    # Известные классы повреждения — это не «упало», это плохой
-                    # архив. Логируем как warning, чтобы не уезжало через
-                    # TelegramNotifierProcessor в админ-чат на каждом list-вызове.
-                    logger.warning(
-                        'Backup file appears corrupted',
-                        backup_file=str(backup_file),
-                        error=str(corruption_error)[:200],
-                        error_type=type(corruption_error).__name__,
-                    )
-                    backups.append(
-                        self._build_corrupted_backup_entry(
-                            backup_file,
-                            file_stats,
-                            reason=f'{type(corruption_error).__name__}: {corruption_error!s}'[:200],
-                        )
-                    )
-                except Exception as e:
-                    # Реально неожиданное — оставляем error для расследования.
-                    logger.error('Ошибка чтения метаданных', backup_file=str(backup_file), error=e)
-                    backups.append(
-                        self._build_corrupted_backup_entry(backup_file, file_stats, reason=f'Ошибка чтения: {e!s}')
-                    )
-
-        except Exception as e:
-            logger.error('Ошибка получения списка бекапов', error=e)
-
+                )
+        self._backup_metadata_cache = next_cache
         return backups
+
+    async def get_backup_list(self) -> list[dict[str, Any]]:
+        task = getattr(self, '_backup_list_task', None)
+        if task is None or task.done():
+            task = asyncio.create_task(backup_io.run(self._get_backup_list_sync))
+            self._backup_list_task = task
+            # Retrieve failures even if every waiting HTTP request was cancelled.
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        try:
+            # Share the in-flight scan; a disconnected requester cannot cancel it.
+            result = await asyncio.shield(task)
+            self._last_backup_list = result
+            return [dict(entry) for entry in result]
+        except BackupIOBusy:
+            if hasattr(self, '_last_backup_list'):
+                return [dict(entry) for entry in self._last_backup_list]
+            raise
+
+    def _delete_backup_sync(self, backup_filename: str) -> bool:
+        relative = Path(backup_filename)
+        if not backup_filename or relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('Недопустимое имя файла бекапа')
+        backup_path = self.backup_dir / backup_filename
+        if not backup_path.is_file() or backup_path.is_symlink():
+            return False
+        if not backup_path.resolve().is_relative_to(self.backup_dir.resolve()):
+            raise ValueError('Недопустимое имя файла бекапа')
+        backup_path.unlink()
+        try:
+            self._backup_sidecar_path(backup_path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                'Не удалось удалить индекс бекапа', backup_file=backup_filename, error_type=type(exc).__name__
+            )
+        return True
 
     async def delete_backup(self, backup_filename: str) -> tuple[bool, str]:
         try:
-            backup_path = await asyncio.to_thread((self.backup_dir / backup_filename).resolve)
-            backup_dir_resolved = await asyncio.to_thread(self.backup_dir.resolve)
-            if not str(backup_path).startswith(str(backup_dir_resolved) + os.sep):
-                return False, '❌ Недопустимое имя файла бекапа'
-
-            if not await asyncio.to_thread(backup_path.is_file):
+            deleted = await backup_io.run(lambda: self._delete_backup_sync(backup_filename))
+            if not deleted:
                 return False, f'❌ Файл бекапа не найден: {backup_filename}'
-
-            await asyncio.to_thread(backup_path.unlink)
             message = f'✅ Бекап {backup_filename} удален'
             logger.info(message)
-
             return True, message
-
         except Exception as e:
             error_msg = f'❌ Ошибка удаления бекапа: {e!s}'
             logger.error(error_msg)
             return False, error_msg
 
+    def _cleanup_old_backups_sync(self) -> None:
+        def retention_timestamp(item: tuple[Path, os.stat_result]) -> tuple[float, str]:
+            path, file_stats = item
+            match = re.match(r'^backup_(\d{8}_\d{6})(?:[._-]|$)', path.name)
+            if match:
+                try:
+                    # Generated filenames record UTC creation time. Retention is
+                    # independent of expensive/untrusted metadata inside archives.
+                    timestamp = datetime.strptime(match[1], '%Y%m%d_%H%M%S').replace(tzinfo=UTC).timestamp()
+                    return timestamp, path.name
+                except ValueError:
+                    pass
+            # Legacy/custom names have no authoritative creation timestamp.
+            return file_stats.st_mtime, path.name
+
+        backups = sorted(self._backup_files_sync(self.backup_dir), key=retention_timestamp, reverse=True)
+        for backup_file, _ in backups[max(1, self._settings.max_backups_keep) :]:
+            try:
+                if self._delete_backup_sync(backup_file.name):
+                    logger.info('🗑️ Удален старый бекап', backup=backup_file.name)
+            except OSError as exc:
+                logger.warning('Ошибка удаления старого бекапа', backup=backup_file.name, error_type=type(exc).__name__)
+
     async def _cleanup_old_backups(self):
         try:
-            backups = await self.get_backup_list()
-
-            if len(backups) > self._settings.max_backups_keep:
-                backups.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-
-                for backup in backups[self._settings.max_backups_keep :]:
-                    try:
-                        await self.delete_backup(backup['filename'])
-                        logger.info('🗑️ Удален старый бекап', backup=backup['filename'])
-                    except Exception as e:
-                        logger.error('Ошибка удаления старого бекапа', backup=backup['filename'], error=e)
-
+            await backup_io.run(self._cleanup_old_backups_sync)
         except Exception as e:
             logger.error('Ошибка очистки старых бекапов', error=e)
 

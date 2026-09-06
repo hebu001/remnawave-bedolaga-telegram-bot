@@ -34,6 +34,7 @@ from app.database.crud.user_device_alias import (
     set_alias,
 )
 from app.database.models import Subscription, TransactionType, User
+from app.external.remnawave_api import RemnaWaveAPIError, RemnaWaveTransientError
 from app.services.subscription_service import SubscriptionService
 from app.services.user_cart_service import user_cart_service
 
@@ -1068,8 +1069,12 @@ async def delete_device(
     try:
         service = RemnaWaveService()
         async with service.get_api_client() as api:
-            delete_data = {'userUuid': _puuid, 'hwid': hwid}
-            await api._make_request('POST', '/api/hwid/devices/delete', data=delete_data)
+            deleted = await api.remove_device(_puuid, hwid, strict=True)
+            if not deleted:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail='Panel did not confirm device deletion',
+                )
 
             return {
                 'success': True,
@@ -1077,12 +1082,33 @@ async def delete_device(
                 'deleted_hwid': hwid,
             }
 
-    except Exception as e:
-        logger.error('Error deleting device', error=e)
+    except HTTPException:
+        raise
+    except RemnaWaveTransientError as error:
+        is_timeout = isinstance(error.__cause__, TimeoutError)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Failed to delete device',
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT if is_timeout else status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Panel request timed out' if is_timeout else 'Panel is temporarily unavailable',
+        ) from error
+    except RemnaWaveAPIError as error:
+        upstream_status = error.status_code
+        response_status = (
+            status.HTTP_504_GATEWAY_TIMEOUT
+            if upstream_status == 504
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+            if upstream_status in (429, 502, 503)
+            else status.HTTP_502_BAD_GATEWAY
         )
+        logger.warning('Panel rejected device deletion', upstream_status=upstream_status)
+        raise HTTPException(status_code=response_status, detail='Panel could not delete the device') from error
+    except TimeoutError as error:
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail='Panel request timed out') from error
+    except Exception as error:
+        logger.error('Error deleting device', error_type=type(error).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail='Panel could not delete the device',
+        ) from error
 
 
 @router.delete('/devices')

@@ -1,7 +1,7 @@
 """The API rejects over-limit UTF-8 passwords before reaching bcrypt."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock
 
 import bcrypt
 import pytest
@@ -64,11 +64,14 @@ def test_http_returns_422_without_invoking_password_hash(monkeypatch, path):
 
     app.dependency_overrides[dependencies.get_cabinet_db] = db_override
     app.dependency_overrides[dependencies.get_current_cabinet_user] = lambda: SimpleNamespace(id=1)
-    hashing = Mock(side_effect=AssertionError('invalid password reached bcrypt'))
-    monkeypatch.setattr(auth, 'hash_password', hashing)
+    hashing = AsyncMock(side_effect=AssertionError('invalid password reached bcrypt'))
+    verification = AsyncMock(side_effect=AssertionError('invalid password reached bcrypt'))
+    monkeypatch.setattr(auth, 'hash_password_async', hashing)
+    monkeypatch.setattr(auth, 'verify_password_async', verification)
     with TestClient(app) as client:
         response = client.post(
             '/auth' + path, json={'email': 'user@example.com', 'token': 'reset', 'password': 'я' * 37}
         )
     assert response.status_code == 422
     hashing.assert_not_called()
+    verification.assert_not_called()

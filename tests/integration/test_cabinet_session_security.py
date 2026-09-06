@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,7 +13,7 @@ import pytest_asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import DBAPIError
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
@@ -20,9 +21,16 @@ from starlette.websockets import WebSocketDisconnect
 from app.cabinet import dependencies
 from app.cabinet.auth import jwt_handler, password_utils, session_security, ws_tickets
 from app.cabinet.routes import auth, support_ws, websocket as ws_routes
-from app.cabinet.schemas.auth import AutoLoginRequest, EmailLoginRequest, PasswordResetRequest, RefreshTokenRequest
+from app.cabinet.schemas.auth import (
+    AutoLoginRequest,
+    EmailLoginRequest,
+    EmailRegisterRequest,
+    PasswordResetRequest,
+    RefreshTokenRequest,
+)
 from app.config import settings
 from app.database.models import CabinetRefreshToken, CabinetWsTicket, User
+from app.services import guest_purchase_service as guest
 from tests.integration.test_purchase_atomicity import sessions
 
 
@@ -415,6 +423,186 @@ async def test_login_with_old_password_racing_reset_cannot_issue_current_credent
     release.set()
     with pytest.raises(HTTPException, match='Session revoked'):
         await login_task
+
+
+@pytest.mark.parametrize('change', ['reset', 'password_hash', 'auth_version', 'blocked'])
+async def test_changes_during_async_password_verification_cannot_authorize_stale_proof(
+    sessions, account, monkeypatch, change
+):
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = auth.verify_password_async
+
+    async def paused(password, password_hash):
+        verified = await original(password, password_hash)
+        entered.set()
+        await release.wait()
+        return verified
+
+    monkeypatch.setattr(auth, 'verify_password_async', paused)
+
+    async def login():
+        async with sessions() as db:
+            return await auth.login_email(
+                EmailLoginRequest(email='audit@example.com', password=OLD_PASSWORD), request(), db
+            )
+
+    task = asyncio.create_task(login())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if change == 'reset':
+            await reset(sessions)
+        else:
+            values = {
+                'password_hash': {'password_hash': password_utils.hash_password(NEW_PASSWORD)},
+                'auth_version': {'cabinet_auth_version': 1},
+                'blocked': {'status': 'blocked'},
+            }[change]
+            async with sessions() as db:
+                await db.execute(update(User).where(User.id == account.user_id).values(**values))
+                await db.commit()
+        release.set()
+        with pytest.raises(HTTPException, match='Invalid email or password') as error:
+            await task
+        assert error.value.status_code == 401
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    async with sessions() as db:
+        assert await db.scalar(select(func.count()).select_from(CabinetRefreshToken)) == 1
+        if change == 'reset':
+            assert (await db.scalar(select(CabinetRefreshToken))).revoked_at is not None
+
+
+async def test_cancelled_reset_while_hashing_releases_row_lock_without_consuming_token(sessions, account, monkeypatch):
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original = password_utils.hash_password
+
+    def paused(password):
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(timeout=5):
+            raise TimeoutError('Test did not release password hashing')
+        return original(password)
+
+    monkeypatch.setattr(password_utils, 'hash_password', paused)
+    task = asyncio.create_task(reset(sessions))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        async with asyncio.timeout(2), sessions() as db:
+            user = await session_security.lock_auth_user(db, account.user_id)
+            assert user.password_reset_token == 'reset-secret'
+            assert user.cabinet_auth_version == 0
+            assert password_utils.verify_password(OLD_PASSWORD, user.password_hash)
+            assert (await db.scalar(select(CabinetRefreshToken))).revoked_at is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('change', ['reset', 'email_verified', 'email'])
+async def test_email_link_rechecks_credentials_after_async_hashing(sessions, account, monkeypatch, change):
+    async with sessions() as db:
+        await db.execute(update(User).where(User.id == account.user_id).values(email_verified=False))
+        await db.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = auth.hash_password_async
+
+    async def paused(password):
+        result = await original(password)
+        entered.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(auth, 'hash_password_async', paused)
+    monkeypatch.setattr(auth.disposable_email_service, 'is_disposable', lambda _email: False)
+    monkeypatch.setattr(settings, 'ADMIN_EMAILS', '')
+
+    async def link_email():
+        async with sessions() as db:
+            user = await db.get(User, account.user_id)
+            return await auth.register_email(
+                EmailRegisterRequest(email='other@example.com', password='link-password'), request(), user, db
+            )
+
+    task = asyncio.create_task(link_email())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if change == 'reset':
+            # Reset uses the same async hash API; only pause the email-link call.
+            monkeypatch.setattr(auth, 'hash_password_async', original)
+            await reset(sessions)
+        else:
+            values = {'email_verified': True} if change == 'email_verified' else {'email': 'changed@example.com'}
+            async with sessions() as db:
+                await db.execute(update(User).where(User.id == account.user_id).values(**values))
+                await db.commit()
+        release.set()
+        with pytest.raises(HTTPException) as error:
+            await task
+        assert error.value.status_code == 409
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    async with sessions() as db:
+        user = await db.get(User, account.user_id)
+        assert user.email != 'other@example.com'
+        assert not password_utils.verify_password('link-password', user.password_hash)
+        if change == 'reset':
+            assert user.cabinet_auth_version == 1
+            assert password_utils.verify_password(NEW_PASSWORD, user.password_hash)
+
+
+async def test_concurrent_guest_purchases_generate_only_one_password(sessions, account, monkeypatch):
+    async with sessions() as db:
+        await db.execute(update(User).where(User.id == account.user_id).values(password_hash=None))
+        await db.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = guest.hash_password_async
+    generated = []
+
+    async def paused(password):
+        result = await original(password)
+        generated.append(password)
+        entered.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(guest, 'hash_password_async', paused)
+
+    async def purchase():
+        async with sessions() as db:
+            purchase = SimpleNamespace(cabinet_password=None)
+            user, is_new = await guest._find_or_create_user(db, 'email', 'audit@example.com', purchase=purchase)
+            await db.commit()
+            return user.password_hash, is_new, purchase.cabinet_password
+
+    first = asyncio.create_task(purchase())
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        second = asyncio.create_task(purchase())
+        release.set()
+        results = await asyncio.gather(first, second)
+        assert len(generated) == 1
+        assert sum(is_new for _, is_new, _ in results) == 1
+        assert results[0][0] == results[1][0]
+        assert password_utils.verify_password(generated[0], results[0][0])
+        assert sum(password is not None for _, _, password in results) == 1
+    finally:
+        release.set()
+        for task in (first, second):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_pre_migration_tokens_work_only_until_first_reset(sessions, account):

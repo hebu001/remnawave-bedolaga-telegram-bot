@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import hmac
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 
 import structlog
@@ -50,6 +51,7 @@ from app.services.web_auth_service import (
     poll_web_auth_token,
 )
 from app.utils.cache import RateLimitCache, TokenReplayCache
+from app.utils.password_executor import PasswordWorkloadBusy
 from app.utils.subscription_utils import coerce_panel_device_limit
 from app.utils.timezone import panel_datetime_to_utc
 
@@ -57,11 +59,11 @@ from ..auth import (
     create_access_token,
     create_refresh_token,
     get_token_payload,
-    hash_password,
+    hash_password_async,
     validate_telegram_init_data,
     validate_telegram_login_widget,
     validate_telegram_oidc_token,
-    verify_password,
+    verify_password_async,
 )
 from ..auth.email_verification import (
     generate_email_change_code,
@@ -112,6 +114,17 @@ from ..services.email_template_overrides import get_rendered_override
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix='/auth', tags=['Cabinet Auth'])
+
+
+async def _password_work[T](operation: Awaitable[T]) -> T:
+    try:
+        return await operation
+    except PasswordWorkloadBusy:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='Password service is busy; try again shortly',
+            headers={'Retry-After': '2'},
+        ) from None
 
 
 def _user_to_response(user: User) -> UserResponse:
@@ -1200,8 +1213,18 @@ async def register_email(
         }
 
     # Update user
+    original_credentials = (user.password_hash, user.email, user.email_verified, auth_version(user))
+    password_hash = await _password_work(hash_password_async(request.password))
+    user = await lock_auth_user(db, user.id)
+    if not user or user.status != UserStatus.ACTIVE.value:
+        await db.rollback()
+        raise HTTPException(status_code=401, detail='Session revoked; sign in again')
+    current_credentials = (user.password_hash, user.email, user.email_verified, auth_version(user))
+    if current_credentials != original_credentials:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail='Account credentials changed; reload and try again')
     user.email = request.email
-    user.password_hash = hash_password(request.password)
+    user.password_hash = password_hash
 
     if not settings.is_cabinet_email_verification_enabled():
         # Верификация отключена — сразу помечаем email как verified
@@ -1397,7 +1420,7 @@ async def register_email_standalone(
         )
 
     # Хешировать пароль
-    password_hash = hash_password(request.password)
+    password_hash = await _password_work(hash_password_async(request.password))
 
     # Найти реферера по коду (если указан)
     referrer = None
@@ -1666,11 +1689,23 @@ async def login_email(
             headers={'Retry-After': '60'},
         )
 
+    # One account cannot bypass throttling by rotating IPs. Hash the normalized
+    # address so Redis keys and rate-limiter logs do not contain the email.
+    email_lower = (request.email or '').strip().lower()
+    account_key = hashlib.sha256(email_lower.encode()).hexdigest()
+    if await RateLimitCache.is_ip_rate_limited(
+        f'account:{account_key}', 'email_login_account', limit=10, window=60, fail_closed=True
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail='Too many requests',
+            headers={'Retry-After': '60'},
+        )
+
     # Check if this is a test email login
     is_test_email = settings.is_test_email(request.email)
 
     # Find user by email (case-insensitive)
-    email_lower = (request.email or '').strip().lower()
     result = await db.execute(select(User).where(func.lower(User.email) == email_lower))
     user = result.scalar_one_or_none()
 
@@ -1678,7 +1713,7 @@ async def login_email(
         # For test email - auto-create user if not exists
         if is_test_email and settings.validate_test_email_password(request.email, request.password):
             logger.info('Test email login creating new user', email=request.email)
-            password_hash = hash_password(request.password)
+            password_hash = await _password_work(hash_password_async(request.password))
             user = await create_user_by_email(
                 db=db,
                 email=request.email,
@@ -1701,7 +1736,19 @@ async def login_email(
             detail='Password login not configured for this account',
         )
 
-    if not verify_password(request.password, user.password_hash):
+    verified_hash = user.password_hash
+    verified_version = auth_version(user)
+    if not await _password_work(verify_password_async(request.password, verified_hash)):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Invalid email or password',
+        )
+
+    # Reset and admin changes can commit while bcrypt runs. Refresh under the
+    # same row lock as reset before using this password proof for a session.
+    user = await lock_auth_user(db, user.id)
+    if not user or user.password_hash != verified_hash or auth_version(user) != verified_version:
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='Invalid email or password',
@@ -2033,7 +2080,7 @@ async def reset_password(
         )
 
     try:
-        user.password_hash = hash_password(request.password)
+        user.password_hash = await _password_work(hash_password_async(request.password))
         user.password_reset_token = None
         user.password_reset_expires = None
         await revoke_password_sessions(db, user)

@@ -1419,7 +1419,7 @@ class RemnaWaveAPI:
             logger.error('Ошибка при сбросе устройств', error=e)
             return False
 
-    async def remove_device(self, user_uuid: str, device_hwid: str) -> bool:
+    async def remove_device(self, user_uuid: str, device_hwid: str, *, strict: bool = False) -> bool:
         """Удалить одно HWID-устройство пользователя.
 
         Возвращает True только когда устройство действительно отсутствует.
@@ -1429,7 +1429,8 @@ class RemnaWaveAPI:
         считать «нет исключения == удалено». 404 означает, что устройство/пользователь
         уже отсутствует — это и есть нужный результат, поэтому тоже success.
         Панели, отвечающие «голым» ack без списка devices, обрабатываются как раньше
-        (успешный запрос == удалено).
+        (успешный запрос == удалено). В strict-режиме ошибки передаются вызывающему
+        коду, а ответ обязан подтверждать полное отсутствие устройства.
         """
         delete_data = {'userUuid': user_uuid, 'hwid': device_hwid}
         try:
@@ -1437,16 +1438,78 @@ class RemnaWaveAPI:
         except RemnaWaveAPIError as e:
             if e.status_code == 404:
                 return True  # устройства уже нет — цель достигнута
+            if strict:
+                raise
             logger.error(
                 'Ошибка удаления устройства', device_hwid=device_hwid, status_code=e.status_code, error=e.message
             )
             return False
         except Exception as e:
+            if strict:
+                raise
             logger.error('Ошибка удаления устройства', device_hwid=device_hwid, error=e)
             return False
 
         payload = response.get('response') if isinstance(response, dict) else None
         devices = payload.get('devices') if isinstance(payload, dict) else None
+        if strict:
+
+            def validate_page(page):
+                if not isinstance(page, dict):
+                    raise RemnaWaveAPIError('Device deletion returned malformed device data')
+                entries, total = page.get('devices'), page.get('total')
+                if (
+                    not isinstance(entries, list)
+                    or type(total) is not int
+                    or total < len(entries)
+                    or any(
+                        not isinstance(item, dict) or not isinstance(item.get('hwid'), str) or not item['hwid']
+                        for item in entries
+                    )
+                    or len({item['hwid'] for item in entries}) != len(entries)
+                ):
+                    raise RemnaWaveAPIError('Device deletion returned malformed device data')
+                return entries, total
+
+            # Complete POST responses are authoritative. An ack or partial
+            # response requires a paginated read to establish actual absence.
+            if isinstance(payload, dict) and 'devices' in payload:
+                devices, total = validate_page(payload)
+                if any(item['hwid'] == device_hwid for item in devices):
+                    return False
+                if total == len(devices):
+                    return True
+            elif not isinstance(payload, dict):
+                raise RemnaWaveAPIError('Device deletion returned malformed device data')
+
+            expected_total = None
+            seen_hwids: set[str] = set()
+            # Bound confirmation to 10,000 devices and reject changing totals,
+            # repeated pages or early EOF instead of treating them as deletion.
+            for _page in range(10):
+                try:
+                    verification = await self._make_request(
+                        'GET', f'/api/hwid/devices/{user_uuid}', params={'start': len(seen_hwids), 'size': 1000}
+                    )
+                except RemnaWaveAPIError as error:
+                    if error.status_code == 404:
+                        return True
+                    raise
+                page = verification.get('response') if isinstance(verification, dict) else None
+                entries, total = validate_page(page)
+                if expected_total is None:
+                    expected_total = total
+                hwids = {item['hwid'] for item in entries}
+                if total != expected_total or seen_hwids.intersection(hwids) or len(seen_hwids) + len(entries) > total:
+                    raise RemnaWaveAPIError('Device deletion verification returned inconsistent pagination')
+                if device_hwid in hwids:
+                    return False
+                seen_hwids.update(hwids)
+                if len(seen_hwids) == total:
+                    return True
+                if not entries:
+                    break
+            raise RemnaWaveAPIError('Device deletion verification did not return the complete device list')
         if isinstance(devices, list):
             still_present = any(isinstance(d, dict) and d.get('hwid') == device_hwid for d in devices)
             if still_present:

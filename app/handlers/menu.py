@@ -1,3 +1,4 @@
+import asyncio
 import html
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -6,7 +7,8 @@ import structlog
 from aiogram import Dispatcher, F, types
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import case, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.database.crud.info_pages import get_all_info_pages, get_info_page_by_id
@@ -41,6 +43,7 @@ from app.utils.pricing_utils import format_period_description
 from app.utils.promo_offer import (
     build_promo_offer_hint,
     build_test_access_hint,
+    get_user_active_promo_discount_percent,
 )
 from app.utils.rich_menu import try_edit_rich_main_menu
 from app.utils.telegram_html import html_to_telegram, info_page_faq_to_telegram, split_telegram_text
@@ -1543,12 +1546,17 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     texts = get_texts(db_user.language)
 
     from app.database.crud.server_squad import get_available_server_squads
-    from app.database.crud.subscription import create_paid_subscription, get_subscription_by_user_id
-    from app.database.crud.transaction import create_transaction
-    from app.database.crud.user import subtract_user_balance
-    from app.database.models import PaymentMethod, TransactionType
+    from app.database.crud.subscription import create_paid_subscription
+    from app.database.crud.transaction import create_transaction, emit_transaction_side_effects
+    from app.database.crud.user import lock_user_for_pricing, subtract_user_balance
+    from app.database.models import PaymentMethod, Subscription, SubscriptionStatus, TransactionType
+    from app.services.renewal_sync_service import REMNAWAVE_SYNC_TIMEOUT, process_renewal_sync, schedule_renewal_sync
     from app.services.subscription_renewal_service import SubscriptionRenewalService
-    from app.services.subscription_service import SubscriptionService
+
+    # Serialize both the decision and purchase, including concurrent first clicks.
+    db_user = await lock_user_for_pricing(db, db_user.id)
+    user_id = db_user.id
+    user_id_display = db_user.telegram_id or db_user.email or f'#{user_id}'
 
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_active_subscriptions_by_user_id
@@ -1559,10 +1567,29 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
         _eligible = non_daily or active_subs
         subscription = max(_eligible, key=lambda s: s.days_left) if _eligible else None
     else:
-        subscription = await get_subscription_by_user_id(db, db_user.id)
+        # The generic getter commits when expiring a row, which would release
+        # the pricing lock before the purchase. Keep the caller's transaction open.
+        subscription = await db.scalar(
+            select(Subscription)
+            .where(Subscription.user_id == user_id)
+            .order_by(
+                case(
+                    (Subscription.status == SubscriptionStatus.ACTIVE.value, 0),
+                    (Subscription.status == SubscriptionStatus.TRIAL.value, 1),
+                    else_=2,
+                ),
+                Subscription.end_date.desc().nulls_last(),
+                Subscription.created_at.desc(),
+            )
+            .limit(1)
+        )
 
     # Если подписка активна — ничего не делаем
-    if subscription and subscription.status == 'ACTIVE' and subscription.end_date > datetime.now(UTC):
+    if (
+        subscription
+        and subscription.status == SubscriptionStatus.ACTIVE.value
+        and subscription.end_date > datetime.now(UTC)
+    ):
         await callback.answer(
             texts.t('SUBSCRIPTION_ALREADY_ACTIVE', '✅ Подписка уже активна!'),
             show_alert=True,
@@ -1589,14 +1616,8 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
         if not connected_squads and available_servers:
             connected_squads = [available_servers[0].squad_uuid]
 
-    from app.database.crud.user import lock_user_for_pricing
-
-    db_user = await lock_user_for_pricing(db, db_user.id)
-
     balance = db_user.balance_kopeks
     available_periods = sorted(settings.get_available_subscription_periods(), reverse=True)
-
-    subscription_service = SubscriptionService()
 
     # Найти максимальный период <= баланса
     best_period = None
@@ -1659,6 +1680,7 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
         await callback.answer('❌ Ошибка расчёта стоимости', show_alert=True)
         return
 
+    purchase_committed = False
     try:
         if subscription:
             # Продление существующей подписки (reuse cached pricing from loop above)
@@ -1666,14 +1688,29 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
                 raise ValueError('best_pricing is None despite best_period being set')
             pricing = best_pricing
 
-            await renewal_service.finalize(
+            result = await renewal_service.finalize(
                 db,
                 db_user,
                 subscription,
                 pricing,
                 description=f'Автоматическое продление на {best_period} дней',
                 payment_method=PaymentMethod.BALANCE,
+                commit=False,
             )
+            await db.commit()
+            purchase_committed = True
+            try:
+                await renewal_service.after_commit(
+                    db,
+                    db_user,
+                    result,
+                    period_days=best_period,
+                    description=f'Автоматическое продление на {best_period} дней',
+                    payment_method=PaymentMethod.BALANCE,
+                )
+            except Exception as error:
+                await db.rollback()
+                logger.warning('Activation renewal remains committed', error_type=type(error).__name__)
 
             await callback.answer(
                 texts.t(
@@ -1683,7 +1720,7 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
                 show_alert=True,
             )
         else:
-            # Списать баланс ДО создания подписки (чтобы не было orphaned subscription при неудаче)
+            # Balance, subscription, ledger and retry intent share one commit.
             consume_promo = get_user_active_promo_discount_percent(db_user) > 0
             success = await subtract_user_balance(
                 db,
@@ -1692,6 +1729,7 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
                 f'Активация подписки на {best_period} дней',
                 mark_as_paid_subscription=True,
                 consume_promo_offer=consume_promo,
+                commit=False,
             )
             if not success:
                 await callback.answer('❌ Недостаточно средств', show_alert=True)
@@ -1706,34 +1744,83 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
                 device_limit=device_limit,
                 connected_squads=connected_squads,
                 update_server_counters=True,
+                commit=False,
             )
 
-            # Создать пользователя в RemnaWave
-            await subscription_service.create_remnawave_user(db, new_subscription)
-
-            # Создать транзакцию
-            await create_transaction(
+            transaction = await create_transaction(
                 db=db,
-                user_id=db_user.id,
+                user_id=user_id,
                 type=TransactionType.SUBSCRIPTION_PAYMENT,
                 amount_kopeks=best_price,
                 description=f'Активация подписки на {best_period} дней',
                 payment_method=PaymentMethod.BALANCE,
+                commit=False,
             )
+            subscription_id = new_subscription.id
+            await schedule_renewal_sync(db, subscription_id, reset_traffic=False, reset_devices=False)
+            await db.commit()
+            purchase_committed = True
 
-            await callback.answer(
-                texts.t(
-                    'ACTIVATION_SUCCESS', f'✅ Подписка активирована на {best_period} дней за {best_price // 100} ₽!'
-                ),
-                show_alert=True,
-            )
+            try:
+                await emit_transaction_side_effects(
+                    db,
+                    transaction,
+                    amount_kopeks=best_price,
+                    user_id=user_id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    payment_method=PaymentMethod.BALANCE,
+                    description=f'Активация подписки на {best_period} дней',
+                )
+            except Exception as error:
+                await db.rollback()
+                logger.warning('Activation events failed after commit', error_type=type(error).__name__)
 
-    except Exception as e:
-        user_id_display = db_user.telegram_id or db_user.email or f'#{db_user.id}'
-        logger.error('Ошибка автоматической активации для', user_id_display=user_id_display, error=e)
+            synced = False
+            try:
+                async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
+                    synced = await process_renewal_sync(
+                        subscription_id,
+                        session_factory=async_sessionmaker(db.bind, expire_on_commit=False, autoflush=False),
+                        force=True,
+                    )
+            except Exception as error:
+                logger.warning(
+                    'Activation sync left pending', subscription_id=subscription_id, error_type=type(error).__name__
+                )
+            if synced:
+                await callback.answer(
+                    texts.t(
+                        'ACTIVATION_SUCCESS',
+                        f'✅ Подписка активирована на {best_period} дней за {best_price // 100} ₽!',
+                    ),
+                    show_alert=True,
+                )
+            else:
+                await callback.answer(
+                    texts.t(
+                        'ACTIVATION_SYNC_PENDING',
+                        '✅ Подписка оплачена. Подключение ещё выполняется автоматически. Повторная оплата не нужна.',
+                    ),
+                    show_alert=True,
+                )
+
+    except (Exception, asyncio.CancelledError) as error:
         await db.rollback()
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        logger.error(
+            'Ошибка автоматической активации',
+            user_id_display=user_id_display,
+            purchase_committed=purchase_committed,
+            error_type=type(error).__name__,
+        )
         await callback.answer(
-            texts.t('ACTIVATION_ERROR', '❌ Ошибка активации. Попробуйте позже.'),
+            texts.t(
+                'ACTIVATION_SYNC_PENDING' if purchase_committed else 'ACTIVATION_ERROR',
+                '✅ Подписка оплачена. Подключение ещё выполняется автоматически. Повторная оплата не нужна.'
+                if purchase_committed
+                else '❌ Ошибка активации. Попробуйте позже.',
+            ),
             show_alert=True,
         )
 

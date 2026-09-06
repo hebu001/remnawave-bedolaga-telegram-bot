@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cabinet.auth.jwt_handler import create_auto_login_token
-from app.cabinet.auth.password_utils import hash_password
+from app.cabinet.auth.password_utils import hash_password_async
 from app.cabinet.auth.session_security import auth_version
 from app.config import settings
 from app.database.crud.landing import create_guest_purchase
@@ -37,6 +37,7 @@ from app.database.models import (
     _aware,
 )
 from app.services.subscription_service import SubscriptionService
+from app.utils.password_executor import PasswordWorkloadBusy
 
 
 logger = structlog.get_logger(__name__)
@@ -84,6 +85,15 @@ class GuestPurchaseError(Exception):
         self.message = message
         self.status_code = status_code
         super().__init__(message)
+
+
+async def _hash_guest_password(password: str) -> str:
+    try:
+        return await hash_password_async(password)
+    except PasswordWorkloadBusy:
+        # The purchase remains paid/pending activation for the existing retry
+        # worker; overload must not turn it into a terminal payment failure.
+        raise GuestPurchaseError('Password service is busy; try again shortly', status_code=503) from None
 
 
 async def validate_and_calculate(
@@ -697,14 +707,18 @@ async def _find_or_create_user(
     This preserves FOR UPDATE locks held by the caller.
     """
     if contact_type == 'email':
-        result = await db.execute(select(User).where(User.email == contact_value))
+        # Serialize generated credentials with resets and other purchases for
+        # this account, including while password hashing awaits a worker.
+        result = await db.execute(
+            select(User).where(User.email == contact_value).with_for_update().execution_options(populate_existing=True)
+        )
         user = result.scalars().first()
         if user:
             is_new_account = False
             if not user.password_hash:
                 # User without cabinet access — generate credentials
                 plain_password = secrets.token_urlsafe(12)
-                user.password_hash = hash_password(plain_password)
+                user.password_hash = await _hash_guest_password(plain_password)
                 if purchase:
                     purchase.cabinet_password = plain_password
                 is_new_account = True
@@ -736,7 +750,7 @@ async def _find_or_create_user(
             email=contact_value,
             email_verified=True,
             email_verified_at=datetime.now(UTC),
-            password_hash=hash_password(plain_password),
+            password_hash=await _hash_guest_password(plain_password),
             promo_group_id=resolved_group.id,
             referral_code=referral_code,
         )
@@ -747,7 +761,12 @@ async def _find_or_create_user(
                 db.add(user)
                 await db.flush()
         except IntegrityError:
-            result = await db.execute(select(User).where(User.email == contact_value))
+            result = await db.execute(
+                select(User)
+                .where(User.email == contact_value)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
             user = result.scalars().first()
             if user:
                 # Race condition — user was created concurrently
@@ -756,7 +775,7 @@ async def _find_or_create_user(
                 is_new_account = False
                 if not user.password_hash:
                     regen_password = secrets.token_urlsafe(12)
-                    user.password_hash = hash_password(regen_password)
+                    user.password_hash = await _hash_guest_password(regen_password)
                     if purchase:
                         purchase.cabinet_password = regen_password
                     is_new_account = True
@@ -1249,7 +1268,9 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     if not purchase.user_id:
         raise GuestPurchaseError('No user linked to purchase', status_code=500)
 
-    user_result = await db.execute(select(User).where(User.id == purchase.user_id))
+    user_result = await db.execute(
+        select(User).where(User.id == purchase.user_id).with_for_update().execution_options(populate_existing=True)
+    )
     user = user_result.scalars().first()
     if user is None:
         raise GuestPurchaseError('User not found', status_code=500)
@@ -1258,7 +1279,7 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     is_new_account = False
     if user.auth_type == 'email' and not user.password_hash:
         plain_password = secrets.token_urlsafe(12)
-        user.password_hash = hash_password(plain_password)
+        user.password_hash = await _hash_guest_password(plain_password)
         purchase.cabinet_password = plain_password
         is_new_account = True
     if user.auth_type == 'email' and not user.email_verified:

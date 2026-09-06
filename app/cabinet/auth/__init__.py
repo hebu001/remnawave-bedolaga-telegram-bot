@@ -7,7 +7,7 @@ from .jwt_handler import (
     decode_token,
     get_token_payload,
 )
-from .password_utils import hash_password, verify_password
+from .password_utils import hash_password, hash_password_async, verify_password, verify_password_async
 from .telegram_auth import validate_telegram_init_data, validate_telegram_login_widget, validate_telegram_oidc_token
 
 
@@ -18,8 +18,10 @@ __all__ = [
     'decode_token',
     'get_token_payload',
     'hash_password',
+    'hash_password_async',
     'validate_telegram_init_data',
     'validate_telegram_login_widget',
     'validate_telegram_oidc_token',
     'verify_password',
+    'verify_password_async',
 ]
