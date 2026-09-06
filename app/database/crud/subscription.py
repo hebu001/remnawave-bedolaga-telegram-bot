@@ -382,6 +382,8 @@ async def _revive_paid_subscription(
                 killed_count=len(killed),
             )
     except Exception as trial_err:
+        if not commit:
+            raise
         logger.warning('Failed to deactivate trials on paid revive', error=trial_err)
 
     squad_uuids = list(subscription.connected_squads or [])
@@ -664,6 +666,8 @@ async def create_paid_subscription(
                     killed_count=len(killed),
                 )
         except Exception as trial_err:
+            if not commit:
+                raise
             logger.warning('Failed to deactivate trials on paid purchase', error=trial_err)
 
     logger.info(
@@ -1358,6 +1362,8 @@ async def extend_subscription(
     try:
         await clear_notifications(db, subscription.id, commit=commit)
     except Exception as clear_err:
+        if not commit:
+            raise
         logger.warning('Failed to clear notifications on extend', error=clear_err)
         if commit:
             # A failed internal commit leaves the session in an errored state; reset it
@@ -1380,6 +1386,8 @@ async def extend_subscription(
                     killed_count=len(killed),
                 )
         except Exception as trial_err:
+            if not commit:
+                raise
             logger.warning('Failed to deactivate trials on extend', error=trial_err)
 
     logger.info('✅ Подписка продлена', end_date=subscription.end_date)
@@ -2106,7 +2114,12 @@ async def get_subscriptions_batch(
 
 
 async def add_subscription_servers(
-    db: AsyncSession, subscription: Subscription, server_squad_ids: list[int], paid_prices: list[int] = None
+    db: AsyncSession,
+    subscription: Subscription,
+    server_squad_ids: list[int],
+    paid_prices: list[int] = None,
+    *,
+    commit: bool = True,
 ) -> Subscription:
     await db.refresh(subscription)
 
@@ -2131,8 +2144,11 @@ async def add_subscription_servers(
         )
         db.add(subscription_server)
 
-    await db.commit()
-    await db.refresh(subscription)
+    if commit:
+        await db.commit()
+        await db.refresh(subscription)
+    else:
+        await db.flush()
 
     logger.info(
         '🌐 К подписке добавлено серверов с ценами',

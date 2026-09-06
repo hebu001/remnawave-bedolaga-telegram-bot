@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import math
 import re
@@ -12,7 +13,7 @@ from uuid import uuid4
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -42,6 +43,7 @@ from app.database.crud.subscription import (
 from app.database.crud.tariff import get_tariff_by_id, get_tariffs_for_user
 from app.database.crud.transaction import (
     create_transaction,
+    emit_transaction_side_effects,
     get_user_total_spent_kopeks,
 )
 from app.database.crud.user import get_user_by_telegram_id, subtract_user_balance
@@ -6591,11 +6593,34 @@ async def purchase_tariff_endpoint(
     if is_daily_tariff:
         payload.period_days = 1
 
-    # Calculate price via PricingEngine (single source of truth)
-    subs = getattr(user, 'subscriptions', None) or []
-    # Find subscription with same tariff for device limit inheritance
-    matching_sub = next((s for s in subs if s.tariff_id == tariff.id and s.is_active), None)
-    device_limit = matching_sub.device_limit if matching_sub else None
+    if not is_daily_tariff:
+        available_periods = {int(days) for days in (tariff.period_prices or {})}
+        custom_days_allowed = (
+            tariff.can_purchase_custom_days() and tariff.get_price_for_custom_days(payload.period_days) is not None
+        )
+        if payload.period_days <= 0 or (payload.period_days not in available_periods and not custom_days_allowed):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={'code': 'invalid_period', 'message': 'Selected period is not available for this tariff'},
+            )
+
+    # Resolve and lock the target before pricing and charging. In multi-tariff
+    # mode a catalog purchase must never replace an unrelated paid subscription.
+    target_query = select(Subscription).where(Subscription.user_id == user.id)
+    if settings.is_multi_tariff_enabled():
+        target_query = target_query.where(Subscription.tariff_id == tariff.id)
+    target_result = await db.execute(
+        target_query.order_by(
+            case((Subscription.status == 'active', 0), (Subscription.status == 'trial', 1), else_=2),
+            Subscription.end_date.desc().nulls_last(),
+            Subscription.created_at.desc(),
+        )
+        .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    subscription = target_result.scalar_one_or_none()
+    device_limit = subscription.device_limit if subscription and subscription.tariff_id == tariff.id else None
 
     result = await pricing_engine.calculate_tariff_purchase_price(
         tariff,
@@ -6621,39 +6646,6 @@ async def purchase_tariff_endpoint(
             },
         )
 
-    # Списываем баланс
-    if is_daily_tariff:
-        description = f"Активация суточного тарифа '{tariff.name}' (первый день)"
-    elif discount_percent > 0:
-        description = f"Покупка тарифа '{tariff.name}' на {payload.period_days} дней (скидка {discount_percent}%)"
-    else:
-        description = f"Покупка тарифа '{tariff.name}' на {payload.period_days} дней"
-    success = await subtract_user_balance(
-        db,
-        user,
-        price_kopeks,
-        description,
-        consume_promo_offer=consume_promo_offer,
-        mark_as_paid_subscription=True,
-    )
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={
-                'code': 'balance_charge_failed',
-                'message': 'Failed to charge balance',
-            },
-        )
-
-    # Создаём транзакцию
-    await create_transaction(
-        db=db,
-        user_id=user.id,
-        type=TransactionType.SUBSCRIPTION_PAYMENT,
-        amount_kopeks=price_kopeks,
-        description=description,
-    )
-
     # Получаем список серверов из тарифа
     squads = tariff.allowed_squads or []
 
@@ -6664,45 +6656,97 @@ async def purchase_tariff_endpoint(
         all_servers, _ = await get_all_server_squads(db, available_only=True)
         squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
-    if subscription:
-        # Preserve extra purchased devices when renewing the same tariff
-        if subscription.tariff_id == tariff.id:
-            effective_device_limit = max(tariff.device_limit or 0, subscription.device_limit or 0)
-        else:
-            effective_device_limit = tariff.device_limit
-        # Смена/продление тарифа
-        subscription = await extend_subscription(
-            db=db,
-            subscription=subscription,
-            days=payload.period_days,
-            tariff_id=tariff.id,
-            traffic_limit_gb=tariff.traffic_limit_gb,
-            device_limit=effective_device_limit,
-            connected_squads=squads,
-        )
+    # Списываем баланс
+    if is_daily_tariff:
+        description = f"Активация суточного тарифа '{tariff.name}' (первый день)"
+    elif discount_percent > 0:
+        description = f"Покупка тарифа '{tariff.name}' на {payload.period_days} дней (скидка {discount_percent}%)"
     else:
-        # Создание новой подписки
-        from app.database.crud.subscription import create_paid_subscription
+        description = f"Покупка тарифа '{tariff.name}' на {payload.period_days} дней"
+    # Charge, ledger, subscription and daily state are one DB transaction.
+    try:
+        success = await subtract_user_balance(
+            db,
+            user,
+            price_kopeks,
+            description,
+            consume_promo_offer=consume_promo_offer,
+            mark_as_paid_subscription=True,
+            commit=False,
+        )
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    'code': 'balance_charge_failed',
+                    'message': 'Failed to charge balance',
+                },
+            )
 
-        subscription = await create_paid_subscription(
+        # Создаём транзакцию
+        transaction = await create_transaction(
             db=db,
             user_id=user.id,
-            duration_days=payload.period_days,
-            traffic_limit_gb=tariff.traffic_limit_gb,
-            device_limit=tariff.device_limit,
-            connected_squads=squads,
-            tariff_id=tariff.id,
+            type=TransactionType.SUBSCRIPTION_PAYMENT,
+            amount_kopeks=price_kopeks,
+            description=description,
+            commit=False,
         )
 
-    # Инициализация daily полей при покупке суточного тарифа
-    is_daily_tariff = getattr(tariff, 'is_daily', False)
-    if is_daily_tariff:
-        subscription.is_daily_paused = False
-        subscription.last_daily_charge_at = datetime.now(UTC)
-        # Для суточного тарифа end_date = сейчас + 1 день (первый день уже оплачен)
-        subscription.end_date = datetime.now(UTC) + timedelta(days=1)
+        if subscription:
+            # Preserve extra purchased devices when renewing the same tariff
+            if subscription.tariff_id == tariff.id:
+                effective_device_limit = max(tariff.device_limit or 0, subscription.device_limit or 0)
+            else:
+                effective_device_limit = tariff.device_limit
+            # Смена/продление тарифа
+            subscription = await extend_subscription(
+                db=db,
+                subscription=subscription,
+                days=payload.period_days,
+                tariff_id=tariff.id,
+                traffic_limit_gb=tariff.traffic_limit_gb,
+                device_limit=effective_device_limit,
+                connected_squads=squads,
+                commit=False,
+            )
+        else:
+            # Создание новой подписки
+            from app.database.crud.subscription import create_paid_subscription
+
+            subscription = await create_paid_subscription(
+                db=db,
+                user_id=user.id,
+                duration_days=payload.period_days,
+                traffic_limit_gb=tariff.traffic_limit_gb,
+                device_limit=tariff.device_limit,
+                connected_squads=squads,
+                tariff_id=tariff.id,
+                commit=False,
+            )
+
+        # Инициализация daily полей при покупке суточного тарифа
+        is_daily_tariff = getattr(tariff, 'is_daily', False)
+        if is_daily_tariff:
+            subscription.is_daily_paused = False
+            subscription.last_daily_charge_at = datetime.now(UTC)
+            # Для суточного тарифа end_date = сейчас + 1 день (первый день уже оплачен)
+            subscription.end_date = datetime.now(UTC) + timedelta(days=1)
+
         await db.commit()
-        await db.refresh(subscription)
+    except (Exception, asyncio.CancelledError):
+        await db.rollback()
+        raise
+
+    await emit_transaction_side_effects(
+        db,
+        transaction,
+        amount_kopeks=price_kopeks,
+        user_id=user.id,
+        type=TransactionType.SUBSCRIPTION_PAYMENT,
+        payment_method=PaymentMethod.BALANCE,
+        description=description,
+    )
 
     # Синхронизируем с RemnaWave
     # При покупке тарифа ВСЕГДА сбрасываем трафик в панели
