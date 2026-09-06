@@ -17,6 +17,7 @@ from app.services.user_action_log_service import schedule_cabinet_action_log
 from app.services.user_revival_service import NotDeletedError, revive_deleted_user
 
 from .auth.jwt_handler import get_token_payload
+from .auth.session_security import session_version_matches
 from .auth.telegram_auth import validate_telegram_init_data
 from .ip_utils import get_client_ip
 
@@ -92,6 +93,9 @@ async def get_current_cabinet_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='User not found',
         )
+
+    if not session_version_matches(payload, user):
+        raise HTTPException(status_code=401, detail='Session revoked; sign in again')
 
     # Validate Telegram initData first — we need its outcome both for the
     # cross-account guard (existing) and for the DELETED auto-revival
@@ -277,7 +281,7 @@ async def get_optional_cabinet_user(
 
     user = await get_user_by_id(db, user_id)
 
-    if not user or user.status != 'active':
+    if not user or user.status != 'active' or not session_version_matches(payload, user):
         return None
 
     # Cross-validate Telegram identity (same as get_current_cabinet_user)

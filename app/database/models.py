@@ -2036,6 +2036,7 @@ class User(Base):
     # bootstrap-compat — см. is_user_admin_by_env).
     email_verification_source = Column(String(32), nullable=True)
     password_hash = Column(String(255), nullable=True)
+    cabinet_auth_version = Column(Integer, nullable=False, default=0, server_default='0')
     email_verification_token = Column(String(255), nullable=True)
     email_verification_expires = Column(AwareDateTime(), nullable=True)
     password_reset_token = Column(String(255), nullable=True)
@@ -3912,6 +3913,21 @@ class WebhookDelivery(Base):
 
     def __repr__(self) -> str:
         return f"<WebhookDelivery id={self.id} webhook_id={self.webhook_id} status='{self.status}' event='{self.event_type}'>"
+
+
+class CabinetWsTicket(Base):
+    __tablename__ = 'cabinet_ws_tickets'
+    __table_args__ = (
+        Index('ix_cabinet_ws_tickets_user', 'user_id'),
+        Index('ix_cabinet_ws_tickets_expires', 'expires_at'),
+    )
+
+    token_hash = Column(String(64), primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    auth_version = Column(Integer, nullable=False)
+    origin = Column(String(512), nullable=False)
+    expires_at = Column(AwareDateTime(), nullable=False)
+    access_expires_at = Column(AwareDateTime(), nullable=False)
 
 
 class CabinetRefreshToken(Base):

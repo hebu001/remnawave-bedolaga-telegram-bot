@@ -55,7 +55,8 @@ async def sessions():
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
-        yield async_sessionmaker(engine, expire_on_commit=False)
+        # Match AsyncSessionLocal: implicit flushes must not hide missing writes.
+        yield async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     finally:
         await engine.dispose()
         async with admin.begin() as connection:

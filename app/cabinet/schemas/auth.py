@@ -1,8 +1,14 @@
 """Authentication schemas for cabinet."""
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, EmailStr, Field
+
+from app.cabinet.auth.password_utils import validate_password_bytes
+
+
+BcryptPassword = Annotated[str, AfterValidator(validate_password_bytes)]
 
 
 class TelegramAuthRequest(BaseModel):
@@ -51,7 +57,9 @@ class EmailRegisterRequest(BaseModel):
     """Request to register/link email to existing Telegram account."""
 
     email: EmailStr = Field(..., description='Email address')
-    password: str = Field(..., min_length=8, max_length=128, description='Password (min 8 chars)')
+    password: BcryptPassword = Field(
+        ..., min_length=8, max_length=128, description='Password (min 8 chars, max 72 UTF-8 bytes)'
+    )
 
 
 class EmailVerifyRequest(BaseModel):
@@ -67,7 +75,7 @@ class EmailLoginRequest(BaseModel):
     """Request to login with email and password."""
 
     email: EmailStr = Field(..., description='Email address')
-    password: str = Field(..., min_length=1, max_length=128, description='Password')
+    password: BcryptPassword = Field(..., min_length=1, max_length=128, description='Password (max 72 UTF-8 bytes)')
     campaign_slug: str | None = Field(
         None, min_length=1, max_length=64, pattern=r'^[a-zA-Z0-9_-]+$', description='Campaign slug from web link'
     )
@@ -89,7 +97,9 @@ class PasswordResetRequest(BaseModel):
     """Request to reset password with token."""
 
     token: str = Field(..., max_length=2048, description='Password reset token')
-    password: str = Field(..., min_length=8, max_length=128, description='New password (min 8 chars)')
+    password: BcryptPassword = Field(
+        ..., min_length=8, max_length=128, description='New password (min 8 chars, max 72 UTF-8 bytes)'
+    )
 
 
 class AutoLoginRequest(BaseModel):
@@ -132,7 +142,9 @@ class EmailRegisterStandaloneRequest(BaseModel):
     """Request to register new account with email (no Telegram required)."""
 
     email: EmailStr = Field(..., description='Email address')
-    password: str = Field(..., min_length=8, max_length=128, description='Password (min 8 chars)')
+    password: BcryptPassword = Field(
+        ..., min_length=8, max_length=128, description='Password (min 8 chars, max 72 UTF-8 bytes)'
+    )
     first_name: str | None = Field(None, max_length=64, description='First name')
     language: str = Field('ru', max_length=5, pattern=r'^[a-z]{2}$', description='Preferred language (ISO 639-1)')
     referral_code: str | None = Field(

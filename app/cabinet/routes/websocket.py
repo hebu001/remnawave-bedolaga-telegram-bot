@@ -1,231 +1,212 @@
-"""WebSocket endpoint for cabinet real-time notifications."""
+"""Cabinet notifications with one-use tickets and continuously checked sessions."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
+from dataclasses import dataclass, field
 
 import structlog
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cabinet.auth.jwt_handler import get_token_payload
-from app.config import settings
-from app.database.crud.user import get_user_by_id
+from app.cabinet.auth.session_security import session_version_matches
+from app.cabinet.auth.ws_tickets import TICKET_TTL_SECONDS, consume_ws_ticket, issue_ws_ticket
+from app.cabinet.dependencies import get_cabinet_db, get_current_cabinet_user, security
+from app.cabinet.ip_utils import get_client_ip
 from app.database.database import AsyncSessionLocal
+from app.database.models import User
+from app.services.permission_service import PermissionService
 
 
 logger = structlog.get_logger(__name__)
-
 router = APIRouter()
+SESSION_CHECK_SECONDS = 30.0
+SEND_TIMEOUT_SECONDS = 3.0
+MAX_CONNECTIONS_PER_USER = 5
+MAX_CONNECTIONS = 1000
+MAX_MESSAGE_BYTES = 4096
+
+
+@dataclass(eq=False)
+class CabinetWsSession:
+    websocket: WebSocket
+    payload: dict
+    is_admin: bool = False
+    client_ip: str | None = None
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def user_id(self) -> int:
+        return int(self.payload['sub'])
+
+    @property
+    def seconds_left(self) -> float:
+        return self.payload['exp'] - time.time()
 
 
 class CabinetConnectionManager:
-    """Менеджер WebSocket подключений для кабинета."""
-
-    def __init__(self):
-        # user_id -> set of websocket connections
-        self._user_connections: dict[int, set[WebSocket]] = {}
-        # admin user_ids -> set of websocket connections
-        self._admin_connections: dict[int, set[WebSocket]] = {}
+    def __init__(self, *, session_factory=None):
+        self._sessions: set[CabinetWsSession] = set()
         self._lock = asyncio.Lock()
+        self._session_factory = session_factory
 
-    async def connect(self, websocket: WebSocket, user_id: int, is_admin: bool) -> None:
-        """Зарегистрировать подключение."""
+    async def validate(self, session: CabinetWsSession) -> bool:
+        if session.seconds_left <= 0:
+            return False
+        factory = self._session_factory or AsyncSessionLocal
+        async with factory() as db:
+            user = await db.scalar(select(User).where(User.id == session.user_id))
+            if not user or user.status != 'active' or not session_version_matches(session.payload, user):
+                return False
+            # Evaluate current RBAC/ABAC and trusted legacy-admin configuration;
+            # roles embedded in the original JWT never authorize a broadcast.
+            was_admin = session.is_admin
+            session.is_admin, _ = await PermissionService.check_permission(
+                db, user, 'tickets:read', ip_address=session.client_ip
+            )
+            if was_admin and not session.is_admin:
+                return False  # Reconnect as an ordinary user after a role downgrade.
+        return session.seconds_left > 0
+
+    async def connect(self, session: CabinetWsSession) -> bool:
         async with self._lock:
-            if user_id not in self._user_connections:
-                self._user_connections[user_id] = set()
-            self._user_connections[user_id].add(websocket)
+            per_user = sum(item.user_id == session.user_id for item in self._sessions)
+            if len(self._sessions) >= MAX_CONNECTIONS or per_user >= MAX_CONNECTIONS_PER_USER:
+                return False
+            self._sessions.add(session)
+        return True
 
-            if is_admin:
-                if user_id not in self._admin_connections:
-                    self._admin_connections[user_id] = set()
-                self._admin_connections[user_id].add(websocket)
-
-        logger.debug(
-            'Cabinet WS connected: user_id is_admin total_users',
-            user_id=user_id,
-            is_admin=is_admin,
-            user_connections_count=len(self._user_connections),
-        )
-
-    async def disconnect(self, websocket: WebSocket, user_id: int) -> None:
-        """Отменить регистрацию подключения."""
+    async def disconnect(self, session: CabinetWsSession) -> None:
         async with self._lock:
-            if user_id in self._user_connections:
-                self._user_connections[user_id].discard(websocket)
-                if not self._user_connections[user_id]:
-                    del self._user_connections[user_id]
+            self._sessions.discard(session)
 
-            if user_id in self._admin_connections:
-                self._admin_connections[user_id].discard(websocket)
-                if not self._admin_connections[user_id]:
-                    del self._admin_connections[user_id]
+    async def close(self, session: CabinetWsSession, code: int = 1008) -> None:
+        await self.disconnect(session)
+        try:
+            async with asyncio.timeout(SEND_TIMEOUT_SECONDS):
+                async with session.send_lock:
+                    await session.websocket.close(code=code, reason='Session ended')
+        except Exception:
+            pass
 
-        logger.debug('Cabinet WS disconnected: user_id', user_id=user_id)
+    async def send(self, session: CabinetWsSession, message: dict, *, admin_only: bool = False) -> bool:
+        try:
+            async with asyncio.timeout(SEND_TIMEOUT_SECONDS):
+                async with session.send_lock:
+                    if not await self.validate(session):
+                        raise PermissionError('Session revoked or expired')
+                    if admin_only and not session.is_admin:
+                        return False
+                    await session.websocket.send_text(json.dumps(message, default=str, ensure_ascii=False))
+            return True
+        except Exception as error:
+            logger.debug('Cabinet WS send stopped', user_id=session.user_id, error_type=type(error).__name__)
+            await self.close(session)
+            return False
 
     async def send_to_user(self, user_id: int, message: dict) -> None:
-        """Отправить сообщение конкретному пользователю."""
-        # Snapshot connections under the lock to avoid mutation during iteration
         async with self._lock:
-            connections = list(self._user_connections.get(user_id, set()))
-
-        if not connections:
-            return
-
-        disconnected = set()
-        data = json.dumps(message, default=str, ensure_ascii=False)
-
-        for ws in connections:
-            try:
-                await ws.send_text(data)
-            except Exception as e:
-                logger.warning('Failed to send to user', user_id=user_id, e=e)
-                disconnected.add(ws)
-
-        # Cleanup disconnected
-        if disconnected:
-            async with self._lock:
-                for ws in disconnected:
-                    self._user_connections.get(user_id, set()).discard(ws)
+            sessions = [session for session in self._sessions if session.user_id == user_id]
+        await asyncio.gather(*(self.send(session, message) for session in sessions))
 
     async def send_to_admins(self, message: dict) -> None:
-        """Отправить сообщение всем админам."""
-        # Snapshot connections under the lock to avoid mutation during iteration
         async with self._lock:
-            if not self._admin_connections:
-                return
-            # Create a snapshot: list of (user_id, list of websockets)
-            admin_snapshot = [(user_id, list(connections)) for user_id, connections in self._admin_connections.items()]
-
-        data = json.dumps(message, default=str, ensure_ascii=False)
-        disconnected_by_user: dict[int, set[WebSocket]] = {}
-
-        for user_id, connections in admin_snapshot:
-            for ws in connections:
-                try:
-                    await ws.send_text(data)
-                except Exception as e:
-                    logger.warning('Failed to send to admin', user_id=user_id, e=e)
-                    if user_id not in disconnected_by_user:
-                        disconnected_by_user[user_id] = set()
-                    disconnected_by_user[user_id].add(ws)
-
-        # Cleanup disconnected
-        if disconnected_by_user:
-            async with self._lock:
-                for user_id, ws_set in disconnected_by_user.items():
-                    for ws in ws_set:
-                        self._admin_connections.get(user_id, set()).discard(ws)
+            sessions = [session for session in self._sessions if session.is_admin]
+        # Bound task fan-out so slow recipients cannot occupy all DB connections.
+        for offset in range(0, len(sessions), 20):
+            await asyncio.gather(
+                *(self.send(session, message, admin_only=True) for session in sessions[offset : offset + 20])
+            )
 
 
-# Глобальный менеджер подключений
 cabinet_ws_manager = CabinetConnectionManager()
 
 
-async def verify_cabinet_ws_token(token: str) -> tuple[int | None, bool]:
-    """
-    Проверить JWT токен для WebSocket.
-
-    Returns:
-        tuple[user_id, is_admin] или (None, False) если токен невалидный
-    """
-    if not token:
-        return None, False
-
-    payload = get_token_payload(token, expected_type='access')
-    if not payload:
-        return None, False
-
-    try:
-        user_id = int(payload.get('sub'))
-    except (TypeError, ValueError):
-        return None, False
-
-    try:
-        async with AsyncSessionLocal() as db:
-            user = await get_user_by_id(db, user_id)
-            if not user or user.status != 'active':
-                return None, False
-
-            is_admin = settings.is_admin(
-                telegram_id=user.telegram_id, email=user.email if user.email_verified else None
-            )
-            return user_id, is_admin
-    except (TimeoutError, OSError, ConnectionRefusedError) as e:
-        logger.error('Database connection error in WS token verification', e=str(e)[:200])
-        return None, False
+@router.post('/ws/ticket')
+async def create_cabinet_ws_ticket(
+    request: Request,
+    response: Response,
+    user: User = Depends(get_current_cabinet_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    payload = get_token_payload(credentials.credentials, expected_type='access')
+    if not payload or payload.get('sub') != str(user.id):
+        raise HTTPException(status_code=401, detail='Invalid access token')
+    ticket = await issue_ws_ticket(db, payload, request.headers.get('origin', ''))
+    response.headers['Cache-Control'] = 'no-store'
+    return {'ticket': ticket, 'expires_in': TICKET_TTL_SECONDS}
 
 
 @router.websocket('/ws')
 async def cabinet_websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint для real-time уведомлений кабинета."""
-    client_host = websocket.client.host if websocket.client else 'unknown'
-
-    # Получаем токен из query params
-    token = websocket.query_params.get('token')
-
-    if not token:
-        logger.debug('Cabinet WS: No token from', client_host=client_host)
-        # Принимаем и сразу закрываем с кодом ошибки
-        await websocket.accept()
-        await websocket.close(code=1008, reason='Unauthorized: No token')
+    # Long-lived bearer credentials are deliberately not accepted in a URL.
+    # Client deployment must switch to POST /ws/ticket before this rollout.
+    ticket = websocket.query_params.get('ticket', '')
+    if 'token' in websocket.query_params or not ticket:
+        await websocket.close(code=1008, reason='WebSocket ticket required')
         return
-
-    # Верифицируем токен
-    user_id, is_admin = await verify_cabinet_ws_token(token)
-
-    if not user_id:
-        logger.debug('Cabinet WS: Invalid token from', client_host=client_host)
-        # Принимаем и сразу закрываем с кодом ошибки
-        await websocket.accept()
-        await websocket.close(code=1008, reason='Unauthorized: Invalid token')
-        return
-
-    # Принимаем соединение
+    session = None
     try:
+        async with asyncio.timeout(SEND_TIMEOUT_SECONDS):
+            async with AsyncSessionLocal() as db:
+                payload = await consume_ws_ticket(db, ticket, websocket.headers.get('origin', ''))
+            if payload is None:
+                await websocket.close(code=1008, reason='Invalid WebSocket ticket')
+                return
+            session = CabinetWsSession(websocket, payload, client_ip=get_client_ip(websocket))
+            if not await cabinet_ws_manager.validate(session):
+                await websocket.close(code=1008, reason='Session revoked or expired')
+                return
+        if not await cabinet_ws_manager.connect(session):
+            await websocket.close(code=1013, reason='Too many connections')
+            return
         await websocket.accept()
-        logger.debug('Cabinet WS accepted: user_id is_admin', user_id=user_id, is_admin=is_admin)
-    except Exception as e:
-        logger.error('Cabinet WS: Failed to accept from', client_host=client_host, e=e)
-        return
-
-    # Регистрируем подключение
-    await cabinet_ws_manager.connect(websocket, user_id, is_admin)
-
-    try:
-        # Приветственное сообщение
-        await websocket.send_json(
+        if not await cabinet_ws_manager.send(
+            session,
             {
                 'type': 'connected',
-                'user_id': user_id,
-                'is_admin': is_admin,
-            }
-        )
-
-        # Обрабатываем входящие сообщения
-        while True:
+                'user_id': session.user_id,
+                'is_admin': session.is_admin,
+            },
+        ):
+            return
+        next_check = time.monotonic() + SESSION_CHECK_SECONDS
+        while session.seconds_left > 0:
+            if time.monotonic() >= next_check:
+                async with asyncio.timeout(SEND_TIMEOUT_SECONDS):
+                    if not await cabinet_ws_manager.validate(session):
+                        break
+                next_check = time.monotonic() + SESSION_CHECK_SECONDS
             try:
-                data = await websocket.receive_text()
-                message = json.loads(data)
-
-                # Ping/pong для keepalive
-                if message.get('type') == 'ping':
-                    await websocket.send_json({'type': 'pong'})
-
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=min(max(0.001, next_check - time.monotonic()), session.seconds_left),
+                )
+            except TimeoutError:
+                continue
+            if len(raw.encode('utf-8')) > MAX_MESSAGE_BYTES:
+                break
+            try:
+                message = json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning('Cabinet WS: Invalid JSON from user', user_id=user_id)
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.exception('Cabinet WS error for user', user_id=user_id, e=e)
-                break
-
+                continue
+            if isinstance(message, dict) and message.get('type') == 'ping':
+                if not await cabinet_ws_manager.send(session, {'type': 'pong'}):
+                    return
     except WebSocketDisconnect:
-        logger.debug('Cabinet WS disconnected: user_id', user_id=user_id)
-    except Exception as e:
-        logger.exception('Cabinet WS error', e=e)
+        pass
+    except Exception as error:
+        # Never include request URLs, tickets or JWTs in application logs.
+        logger.debug('Cabinet WS ended', error_type=type(error).__name__)
     finally:
-        await cabinet_ws_manager.disconnect(websocket, user_id)
+        if session is not None:
+            await cabinet_ws_manager.close(session)
 
 
 # Функции для отправки уведомлений (используются из других модулей)

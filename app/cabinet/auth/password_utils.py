@@ -4,6 +4,13 @@ import bcrypt
 
 
 BCRYPT_ROUNDS = 12
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+
+def validate_password_bytes(password: str) -> str:
+    if len(password.encode('utf-8')) > BCRYPT_MAX_PASSWORD_BYTES:
+        raise ValueError('Password must be at most 72 UTF-8 bytes')
+    return password
 
 
 def hash_password(password: str) -> str:
@@ -16,7 +23,7 @@ def hash_password(password: str) -> str:
     Returns:
         Hashed password string
     """
-    password_bytes = password.encode('utf-8')
+    password_bytes = validate_password_bytes(password).encode('utf-8')
     salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
     hashed = bcrypt.hashpw(password_bytes, salt)
     return hashed.decode('utf-8')

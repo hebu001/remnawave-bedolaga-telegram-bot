@@ -34,6 +34,7 @@ def create_access_token(
     user_id: int,
     telegram_id: int | None = None,
     *,
+    auth_version: int = 0,
     permissions: list[str] | None = None,
     roles: list[str] | None = None,
     role_level: int = 0,
@@ -57,6 +58,7 @@ def create_access_token(
     payload = {
         'sub': str(user_id),
         'type': 'access',
+        'auth_version': auth_version,
         'exp': expires,
         'iat': datetime.now(UTC),
     }
@@ -77,7 +79,7 @@ def create_access_token(
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
-def create_refresh_token(user_id: int) -> str:
+def create_refresh_token(user_id: int, *, auth_version: int = 0) -> str:
     """
     Create a long-lived refresh token.
 
@@ -93,6 +95,7 @@ def create_refresh_token(user_id: int) -> str:
     payload = {
         'sub': str(user_id),
         'type': 'refresh',
+        'auth_version': auth_version,
         'exp': expires,
         'iat': datetime.now(UTC),
         # Makes every rotated token unique even when two tokens for the same
@@ -158,12 +161,13 @@ def get_token_payload(token: str, expected_type: str = 'access') -> dict[str, An
     return payload
 
 
-def create_auto_login_token(user_id: int, ttl_hours: int = 72) -> str:
+def create_auto_login_token(user_id: int, ttl_hours: int = 72, *, auth_version: int = 0) -> str:
     """Short-lived JWT for auto-login from guest purchase success page."""
     expires = datetime.now(UTC) + timedelta(hours=ttl_hours)
     payload = {
         'sub': str(user_id),
         'type': 'auto_login',
+        'auth_version': auth_version,
         'exp': expires,
         'iat': datetime.now(UTC),
     }

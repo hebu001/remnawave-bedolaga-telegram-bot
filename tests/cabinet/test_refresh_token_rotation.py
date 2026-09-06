@@ -76,7 +76,7 @@ async def test_refresh_endpoint_returns_rotated_refresh_token() -> None:
     rotate = AsyncMock(return_value='rotated-refresh-token')
     with (
         patch.object(auth, 'get_token_payload', return_value={'sub': '42', 'type': 'refresh'}),
-        patch.object(auth, 'get_user_by_id', AsyncMock(return_value=user)),
+        patch.object(auth, 'lock_auth_user', AsyncMock(return_value=user)),
         patch.object(auth.UserRoleCRUD, 'get_user_permissions', AsyncMock(return_value=([], [], 0))),
         patch.object(auth, 'create_access_token', return_value='new-access-token'),
         patch.object(auth, '_rotate_refresh_token', rotate),
@@ -95,7 +95,7 @@ async def test_refresh_endpoint_returns_rotated_refresh_token() -> None:
     assert response.access_token == 'new-access-token'
     assert response.refresh_token == 'rotated-refresh-token'
     assert response.expires_in == 900
-    rotate.assert_awaited_once_with(db, old_record, 42)
+    rotate.assert_awaited_once_with(db, old_record, 42, credential_version=0)
 
 
 @pytest.mark.asyncio
@@ -116,7 +116,7 @@ async def test_legacy_refresh_client_keeps_old_token_during_rollout() -> None:
     rotate = AsyncMock(return_value='must-not-be-used')
     with (
         patch.object(auth, 'get_token_payload', return_value={'sub': '42', 'type': 'refresh'}),
-        patch.object(auth, 'get_user_by_id', AsyncMock(return_value=user)),
+        patch.object(auth, 'lock_auth_user', AsyncMock(return_value=user)),
         patch.object(auth.UserRoleCRUD, 'get_user_permissions', AsyncMock(return_value=([], [], 0))),
         patch.object(auth, 'create_access_token', return_value='new-access-token'),
         patch.object(auth, '_rotate_refresh_token', rotate),

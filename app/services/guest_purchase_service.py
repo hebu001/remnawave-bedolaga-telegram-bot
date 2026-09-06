@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cabinet.auth.jwt_handler import create_auto_login_token
 from app.cabinet.auth.password_utils import hash_password
+from app.cabinet.auth.session_security import auth_version
 from app.config import settings
 from app.database.crud.landing import create_guest_purchase
 from app.database.crud.subscription import (
@@ -400,7 +401,7 @@ async def fulfill_purchase(
             purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
             purchase.user_id = user.id
             if recipient_type == 'email' and not purchase.is_gift and is_new_account:
-                purchase.auto_login_token = create_auto_login_token(user.id)
+                purchase.auto_login_token = create_auto_login_token(user.id, auth_version=auth_version(user))
             await db.commit()
             await db.refresh(purchase, attribute_names=['landing', 'user', 'buyer'])
 
@@ -493,7 +494,7 @@ async def fulfill_purchase(
             pass
 
         if recipient_type == 'email' and not purchase.is_gift and is_new_account:
-            purchase.auto_login_token = create_auto_login_token(user.id)
+            purchase.auto_login_token = create_auto_login_token(user.id, auth_version=auth_version(user))
 
         await db.commit()
         await db.refresh(purchase, attribute_names=['landing', 'user', 'buyer'])
@@ -1385,7 +1386,7 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
         # The token is surfaced only to the claimer (claim endpoint), never on
         # the buyer's success page (_build_purchase_status_response gates that).
         if user.auth_type == 'email' and is_new_account:
-            purchase.auto_login_token = create_auto_login_token(user.id)
+            purchase.auto_login_token = create_auto_login_token(user.id, auth_version=auth_version(user))
 
         # Single atomic commit: subscription + purchase status + user changes
         await db.commit()

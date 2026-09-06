@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketState
 
 from app.bot_factory import create_bot
 from app.cabinet.auth.jwt_handler import get_token_payload
+from app.cabinet.auth.session_security import session_version_matches
 from app.cabinet.auth.telegram_auth import validate_telegram_init_data
 from app.cabinet.routes.media import (
     _BLOCKED_UPLOAD_CONTENT_TYPES,
@@ -348,6 +349,10 @@ class SupportWsManager:
 
         for session in sessions:
             try:
+                if not await _refresh_session_context(db, session):
+                    await session.websocket.close(code=1008, reason='Session revoked or expired')
+                    await self.disconnect(session)
+                    continue
                 if await _can_view_ticket(db, session.context, ticket):
                     await session.send_json(event)
             except Exception as exc:
@@ -460,8 +465,8 @@ async def _authenticate_ws(
         return None, _shared_error('AUTH_REQUIRED', 'Access token payload is invalid', resource_type='auth')
 
     user = await get_user_by_id(db, user_id)
-    if not user:
-        return None, _shared_error('AUTH_REQUIRED', 'User was not found', resource_type='auth')
+    if not user or not session_version_matches(payload, user):
+        return None, _shared_error('AUTH_REQUIRED', 'Session revoked or user missing', resource_type='auth')
 
     init_data_raw = websocket.headers.get('x-telegram-init-data')
     init_data_matches_user = False
@@ -480,6 +485,21 @@ async def _authenticate_ws(
         return None, account_error
 
     return await _role_context(db, user, payload), None
+
+
+async def _refresh_session_context(db: AsyncSession, session: SupportWsSession) -> bool:
+    """Recheck credentials and roles for commands, broadcasts and idle sockets."""
+    payload = session.context.token_payload
+    expires = session.context.exp_timestamp
+    if expires is not None and expires <= int(_utc_now().timestamp()):
+        return False
+    user = await db.scalar(
+        select(User).where(User.id == session.context.user_id).execution_options(populate_existing=True)
+    )
+    if not user or user.status != 'active' or not session_version_matches(payload, user):
+        return False
+    session.context = await _role_context(db, user, payload)
+    return True
 
 
 async def _has_permission(db: AsyncSession, context: WsUserContext, permission: str) -> bool:
@@ -1471,7 +1491,16 @@ async def support_mobile_websocket_endpoint(websocket: WebSocket):
 
         while True:
             try:
-                raw = await websocket.receive_text()
+                try:
+                    exp = session.context.exp_timestamp
+                    timeout = min(30.0, max(0.001, exp - _utc_now().timestamp())) if exp else 30.0
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+                except TimeoutError:
+                    async with AsyncSessionLocal() as db:
+                        if not await _refresh_session_context(db, session):
+                            await websocket.close(code=1008, reason='Session revoked or expired')
+                            return
+                    continue
                 if len(raw) > MAX_MESSAGE_BYTES:
                     await session.send_json(
                         _command_result(
@@ -1497,6 +1526,9 @@ async def support_mobile_websocket_endpoint(websocket: WebSocket):
                         await websocket.close(code=1008, reason='Access token expired')
                         return
                 async with AsyncSessionLocal() as db:
+                    if command != 'auth.reauthenticate' and not await _refresh_session_context(db, session):
+                        await websocket.close(code=1008, reason='Session revoked or expired')
+                        return
                     result = await _dispatch_command(db, session, command, payload)
                 await session.send_json(_command_result(command, request_id, payload=result))
             except json.JSONDecodeError:

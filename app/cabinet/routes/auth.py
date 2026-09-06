@@ -11,6 +11,12 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cabinet.auth.session_security import (
+    auth_version,
+    lock_auth_user,
+    revoke_password_sessions,
+    session_version_matches,
+)
 from app.config import settings
 from app.database.crud.campaign import (
     get_campaign_by_start_parameter,
@@ -129,6 +135,7 @@ def _user_to_response(user: User) -> UserResponse:
 
 async def _create_auth_response(user: User, db: AsyncSession) -> AuthResponse:
     """Create full auth response with tokens and RBAC permissions."""
+    credential_version = auth_version(user)
     # Idempotent Superadmin re-assignment for users in ADMIN_IDS / ADMIN_EMAILS.
     # Покрывает кейс: юзер был удалён через кабинет → пересоздан через /start
     # → у нового user.id нет роли, потому что RBAC bootstrap отрабатывает только
@@ -157,8 +164,9 @@ async def _create_auth_response(user: User, db: AsyncSession) -> AuthResponse:
         permissions=user_permissions,
         roles=user_role_names,
         role_level=user_role_level,
+        auth_version=credential_version,
     )
-    refresh_token = create_refresh_token(user.id)
+    refresh_token = create_refresh_token(user.id, auth_version=credential_version)
     expires_in = settings.get_cabinet_access_token_expire_minutes() * 60
 
     return AuthResponse(
@@ -179,6 +187,14 @@ async def _store_refresh_token(
     """Store refresh token hash in database using upsert to avoid duplicate key errors."""
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+    payload = get_token_payload(refresh_token, expected_type='refresh')
+    user = await lock_auth_user(db, user_id)
+    if not user or user.status != 'active' or not payload or not session_version_matches(payload, user):
+        await db.rollback()
+        raise HTTPException(status_code=401, detail='Session revoked; sign in again')
+    if payload.get('sub') != str(user_id):
+        await db.rollback()
+        raise HTTPException(status_code=401, detail='Invalid token owner')
     token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
     expires_at = get_refresh_token_expires_at()
 
@@ -188,14 +204,7 @@ async def _store_refresh_token(
         device_info=device_info,
         expires_at=expires_at,
     )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=['token_hash'],
-        set_={
-            'expires_at': expires_at,
-            'device_info': device_info,
-            'revoked_at': None,
-        },
-    )
+    stmt = stmt.on_conflict_do_nothing(index_elements=['token_hash'])
     await db.execute(stmt)
     await db.commit()
 
@@ -204,6 +213,8 @@ async def _rotate_refresh_token(
     db: AsyncSession,
     token_record: CabinetRefreshToken,
     user_id: int,
+    *,
+    credential_version: int = 0,
 ) -> str:
     """Replace a used refresh token and extend the authenticated session.
 
@@ -211,7 +222,7 @@ async def _rotate_refresh_token(
     token and inserting its replacement in one commit prevents token replay
     while making the refresh-token lifetime sliding for active sessions.
     """
-    new_refresh_token = create_refresh_token(user_id)
+    new_refresh_token = create_refresh_token(user_id, auth_version=credential_version)
     new_token_hash = hashlib.sha256(new_refresh_token.encode()).hexdigest()
     rotated_at = datetime.now(UTC)
 
@@ -1758,6 +1769,10 @@ async def refresh_token(
             detail='Invalid token payload',
         ) from e
 
+    user = await lock_auth_user(db, user_id)
+    if not user or user.status != 'active' or not session_version_matches(payload, user):
+        raise HTTPException(status_code=401, detail='Session revoked or user inactive')
+
     # Verify token exists in database and is not revoked
     token_hash = hashlib.sha256(request.refresh_token.encode()).hexdigest()
     result = await db.execute(
@@ -1788,14 +1803,6 @@ async def refresh_token(
             detail='Invalid token owner',
         )
 
-    user = await get_user_by_id(db, user_id)
-
-    if not user or user.status != 'active':
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail='User not found or inactive',
-        )
-
     user_permissions, user_role_names, user_role_level = await UserRoleCRUD.get_user_permissions(db, user.id)
     access_token = create_access_token(
         user.id,
@@ -1803,6 +1810,7 @@ async def refresh_token(
         permissions=user_permissions,
         roles=user_role_names,
         role_level=user_role_level,
+        auth_version=auth_version(user),
     )
     expires_in = settings.get_cabinet_access_token_expire_minutes() * 60
     # Rotation is capability-negotiated so older already-open cabinet bundles,
@@ -1810,7 +1818,9 @@ async def refresh_token(
     # during a rolling deployment. Current clients always send this header.
     rotation_supported = raw_request.headers.get('X-Refresh-Token-Rotation') == '1'
     new_refresh_token = (
-        await _rotate_refresh_token(db, token_record, user.id) if rotation_supported else request.refresh_token
+        await _rotate_refresh_token(db, token_record, user.id, credential_version=auth_version(user))
+        if rotation_supported
+        else request.refresh_token
     )
 
     return TokenResponse(
@@ -1874,7 +1884,7 @@ async def auto_login(
         ) from e
 
     user = await get_user_by_id(db, user_id)
-    if not user:
+    if not user or not session_version_matches(payload, user):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='User not found',
@@ -2002,7 +2012,12 @@ async def reset_password(
             detail='Too many requests',
             headers={'Retry-After': '60'},
         )
-    result = await db.execute(select(User).where(User.password_reset_token == request.token))
+    result = await db.execute(
+        select(User)
+        .where(User.password_reset_token == request.token)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     user = result.scalar_one_or_none()
 
     if not user:
@@ -2017,12 +2032,15 @@ async def reset_password(
             detail='Reset token has expired',
         )
 
-    # Update password
-    user.password_hash = hash_password(request.password)
-    user.password_reset_token = None
-    user.password_reset_expires = None
-
-    await db.commit()
+    try:
+        user.password_hash = hash_password(request.password)
+        user.password_reset_token = None
+        user.password_reset_expires = None
+        await revoke_password_sessions(db, user)
+        await db.commit()
+    except (Exception, asyncio.CancelledError):
+        await db.rollback()
+        raise
 
     return {'message': 'Password reset successfully'}
 
