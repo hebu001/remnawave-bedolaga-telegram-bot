@@ -1,0 +1,11 @@
+# Apply after the existing production compose files.
+# Uses built-in handlers; no diagnostic code mounts or client event collector.
+services:
+  bot:
+    environment:
+      LOG_LEVEL: WARNING
+      LOG_ROTATION_ENABLED: "true"
+      LOG_ROTATION_TIME: "00:00"
+      LOG_ROTATION_KEEP_DAYS: "7"
+      LOG_ROTATION_COMPRESS: "true"
+      LOG_ROTATION_SEND_TO_TELEGRAM: "false"
