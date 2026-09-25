@@ -12,7 +12,7 @@ application code or change the image.
 - Existing administrative audit records remain in the database.
 - Files are written under `logs/current`; the built-in rotation creates a
   compressed daily archive at 00:00 in the configured application timezone and
-  retains seven days. Telegram log delivery is disabled.
+  retains 30 days. Telegram log delivery is disabled.
 - Keep Docker log limits from the base configuration. Existing historical logs
   outside `logs/current` are preserved and are not deleted by this overlay.
 
