@@ -3194,6 +3194,21 @@ class MonitoringLog(Base):
     created_at = Column(AwareDateTime(), default=func.now())
 
 
+class TrafficNotificationState(Base):
+    """Durable high-water mark for one subscription's traffic allowance."""
+
+    __tablename__ = 'traffic_notification_states'
+
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), primary_key=True)
+    cycle_key = Column(String(64), nullable=False)
+    generation = Column(Integer, nullable=False, default=0)
+    highest_threshold = Column(Integer, nullable=False, default=0)
+    used_bytes = Column(BigInteger, nullable=False, default=0)
+    observed_at = Column(AwareDateTime(), nullable=False)
+    delivery_status = Column(String(20), nullable=False, default='observed')
+    next_attempt_at = Column(AwareDateTime(), nullable=True)
+
+
 class SentNotification(Base):
     __tablename__ = 'sent_notifications'
     __table_args__ = (

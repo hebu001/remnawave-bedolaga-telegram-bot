@@ -59,7 +59,7 @@ def _get_notification_settings(user: User) -> dict[str, Any]:
         'subscription_expiry_enabled': settings_data.get('subscription_expiry_enabled', True),
         'subscription_expiry_days': settings_data.get('subscription_expiry_days', 3),
         'traffic_warning_enabled': settings_data.get('traffic_warning_enabled', True),
-        'traffic_warning_percent': settings_data.get('traffic_warning_percent', 80),
+        'traffic_warning_percent': 80,  # Compatibility: fixed stages are 80/90/100.
         'balance_low_enabled': settings_data.get('balance_low_enabled', False),
         'balance_low_threshold': settings_data.get('balance_low_threshold', 100),
         'news_enabled': settings_data.get('news_enabled', True),
@@ -72,7 +72,7 @@ def _update_notification_settings(user: User, updates: dict[str, Any]) -> dict[s
     current_settings = _get_notification_settings(user)
 
     for key, value in updates.items():
-        if value is not None:
+        if value is not None and key != 'traffic_warning_percent':
             current_settings[key] = value
 
     return current_settings

@@ -1167,9 +1167,9 @@ class RemnaWaveWebhookService:
             source='webhook',
         )
 
-        await self._notify_user(
-            user, 'WEBHOOK_SUB_LIMITED', reply_markup=self._get_traffic_keyboard(user), subscription=subscription
-        )
+        from app.services.traffic_notification_service import TrafficNotificationService
+
+        await TrafficNotificationService(self.bot).check_subscription(subscription.id)
 
     async def _handle_user_traffic_reset(
         self, db: AsyncSession, user: User, subscription: Subscription | None, data: dict
@@ -1701,31 +1701,11 @@ class RemnaWaveWebhookService:
     async def _handle_bandwidth_threshold(
         self, db: AsyncSession, user: User, subscription: Subscription | None, data: dict
     ) -> None:
-        # Respect user notification preferences
-        from app.utils.notification_prefs import is_traffic_warning_enabled
+        # Polling and webhook retries share the same persisted thresholds.
+        if subscription:
+            from app.services.traffic_notification_service import TrafficNotificationService
 
-        if not is_traffic_warning_enabled(user):
-            logger.debug('Traffic warning disabled by user prefs', user_id=user.id)
-            return
-
-        # Extract threshold percentage from meta or data
-        percent = data.get('thresholdPercent') or data.get('threshold', '')
-        if not percent:
-            # Envelope-meta живёт в data['_meta'] (ресивер), не в 'meta'.
-            meta = data.get('_meta', {})
-            if isinstance(meta, dict):
-                percent = meta.get('thresholdPercent', '80')
-
-        # Sanitize to numeric value only (prevent format string injection)
-        percent_str = re.sub(r'[^\d.]', '', str(percent)) or '80'
-
-        await self._notify_user(
-            user,
-            'WEBHOOK_SUB_BANDWIDTH_THRESHOLD',
-            reply_markup=self._get_traffic_keyboard(user),
-            format_kwargs={'percent': percent_str},
-            subscription=subscription,
-        )
+            await TrafficNotificationService(self.bot).check_subscription(subscription.id)
 
     async def _handle_user_not_connected(
         self, db: AsyncSession, user: User, subscription: Subscription | None, data: dict

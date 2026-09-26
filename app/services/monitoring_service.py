@@ -2420,95 +2420,12 @@ class MonitoringService:
             logger.error('Error retrying stuck PENDING_ACTIVATION guest purchases', exc_info=True)
 
     async def _check_traffic_warnings(self, db: AsyncSession):
-        """Check subscriptions approaching traffic limit and notify users."""
+        """Use fresh panel counters and the same durable gate as webhooks."""
         if not self.bot:
             return
+        from app.services.traffic_notification_service import TrafficNotificationService
 
-        try:
-            from sqlalchemy import select
-            from sqlalchemy.orm import selectinload
-
-            from app.database.models import Subscription
-            from app.utils.notification_prefs import get_traffic_warning_percent, is_traffic_warning_enabled
-
-            # Get active subscriptions with traffic limits (not unlimited)
-            result = await db.execute(
-                select(Subscription)
-                .options(selectinload(Subscription.user))
-                .where(
-                    Subscription.status.in_(['active', 'trial']),
-                    Subscription.traffic_limit_gb > 0,
-                )
-            )
-            subscriptions = result.scalars().all()
-
-            sent_count = 0
-            for subscription in subscriptions:
-                user = subscription.user
-                if not user or not user.telegram_id:
-                    continue
-
-                if not is_traffic_warning_enabled(user):
-                    continue
-
-                traffic_limit = subscription.traffic_limit_gb or 0
-                traffic_used = subscription.traffic_used_gb or 0.0
-
-                if traffic_limit <= 0:
-                    continue
-
-                current_percent = (traffic_used / traffic_limit) * 100
-                user_threshold = get_traffic_warning_percent(user)
-
-                if current_percent < user_threshold:
-                    continue
-
-                # Rate-limit: 1 notification per subscription per 24 hours
-                cache_key_str = f'traffic_warn:{subscription.id}'
-                try:
-                    already_sent = await cache.get(cache_key_str)
-                    if already_sent:
-                        continue
-                except Exception:
-                    pass
-
-                try:
-                    language = getattr(user, 'language', 'ru') or 'ru'
-                    texts = get_texts(language)
-                    message = texts.get(
-                        'TRAFFIC_WARNING_ALERT',
-                        '⚠️ <b>Предупреждение о трафике</b>\n\n'
-                        'Использовано: {used:.1f} / {limit} ГБ ({percent:.0f}%)\n\n'
-                        'Ваш лимит трафика почти исчерпан.',
-                    )
-                    message = message.format(
-                        used=traffic_used,
-                        limit=traffic_limit,
-                        percent=current_percent,
-                    )
-                    await self.bot.send_message(
-                        user.telegram_id,
-                        message,
-                        parse_mode='HTML',
-                    )
-                    try:
-                        await cache.set(cache_key_str, '1', expire=86400)
-                    except Exception:
-                        pass
-                    sent_count += 1
-                except Exception as send_error:
-                    logger.debug(
-                        'Failed to send traffic warning',
-                        user_id=user.id,
-                        subscription_id=subscription.id,
-                        error=send_error,
-                    )
-
-            if sent_count > 0:
-                logger.info('Traffic warnings sent', sent_count=sent_count)
-
-        except Exception as error:
-            logger.error('Error checking traffic warnings', error=error)
+        await TrafficNotificationService(self.bot).check_all()
 
     async def _check_low_balance_alerts(self, db: AsyncSession):
         """Check users with autopay enabled who have low balance and notify them.
