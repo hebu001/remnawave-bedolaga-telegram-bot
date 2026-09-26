@@ -19,3 +19,5 @@ Configure the receiver using `REMNAWAVE_WEBHOOK_ENABLED=true`, `/remnawave-webho
 Remnawave 2.8.1 allows bandwidth percentages only between 25 and 95, so configure `[80,90]` and use `user.limited` for exhaustion. For this rollout, enable webhook delivery for `user.bandwidth_usage_threshold_reached`, `user.limited` and `user.traffic_reset`. Preserve the panel's existing Telegram event settings.
 
 Verify signature rejection, signed delivery of an inert unknown event, configured thresholds, migrations and container health. Do not generate artificial customer usage or send test messages to real users.
+
+Remnawave 2.8.1 ships webhook workers with concurrency 100. Keep the existing backend admission limit; set the BullMQ `NTFY_WEBHOOK_QUEUE` global concurrency to 8 (the panel default Redis DB is 1). This persists in panel Redis and must be reapplied after flushing/replacing Redis. Apply it before enabling bulk threshold notifications. Retry only failed deliveries to the configured receiver; durable backend reservations suppress repeated stages.
