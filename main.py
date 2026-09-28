@@ -13,7 +13,8 @@ sys.path.append(str(Path(__file__).parent))
 from app.bot import setup_bot
 from app.config import settings
 from app.database.database import sync_postgres_sequences
-from app.database.migrations import run_alembic_upgrade
+from app.database.fork_revision_bridge import ForkRevisionError
+from app.database.migrations import assert_migration_safe, run_alembic_upgrade
 from app.database.models import PaymentMethod
 from app.localization.loader import ensure_locale_templates
 from app.logging_config import _resolve_log_level, setup_logging
@@ -184,6 +185,7 @@ async def main():
     summary_logged = False
 
     try:
+        await assert_migration_safe()
         skip_migration = os.getenv('SKIP_MIGRATION', 'false').lower() == 'true'
 
         if not skip_migration:
@@ -195,6 +197,8 @@ async def main():
                 try:
                     await run_alembic_upgrade()
                     stage.success('Миграция завершена успешно')
+                except ForkRevisionError:
+                    raise
                 except Exception as migration_error:
                     allow_failure = os.getenv('ALLOW_MIGRATION_FAILURE', 'false').lower() == 'true'
                     logger.error('Ошибка выполнения миграции', migration_error=migration_error)

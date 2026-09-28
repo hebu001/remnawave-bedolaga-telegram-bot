@@ -13,6 +13,8 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from app.database.models import Base
 from app.config import settings
+from app.database.fork_revision_bridge import ForkRevisionError, migration_lock, migration_preflight
+from alembic.script import ScriptDirectory
 
 config = context.config
 
@@ -28,31 +30,30 @@ target_metadata = Base.metadata
 
 # URL also set in app/database/migrations.py for programmatic usage;
 # this line is needed for CLI invocation (make migrate, make migration).
-config.set_main_option('sqlalchemy.url', settings.get_database_url())
+if not config.attributes.get('connection'):
+    config.set_main_option('sqlalchemy.url', settings.get_database_url())
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option('sqlalchemy.url')
-    context.configure(
-        url=url,
-        target_metadata=target_metadata,
-        literal_binds=True,
-        dialect_opts={'paramstyle': 'named'},
-    )
-
-    with context.begin_transaction():
-        context.run_migrations()
+    raise ForkRevisionError('Offline migration SQL cannot verify fork history; use an online dry-run bridge first')
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(
-        connection=connection,
-        target_metadata=target_metadata,
-        transaction_per_migration=True,
-    )
-
-    with context.begin_transaction():
-        context.run_migrations()
+    schema = config.attributes.get('schema', 'public')
+    known = {revision.revision for revision in ScriptDirectory.from_config(config).walk_revisions()}
+    with migration_lock(connection, schema):
+        bootstrap = config.attributes.get('verified_fresh_bootstrap', False)
+        migration_preflight(connection, schema, allow_bootstrap=bootstrap, known_revisions=known)
+        if not bootstrap:
+            connection.rollback()  # End only the preflight read transaction.
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            transaction_per_migration=True,
+            version_table_schema=schema if connection.dialect.name == 'postgresql' else None,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
 
 
 async def run_async_migrations() -> None:
@@ -73,7 +74,11 @@ def run_migrations_online() -> None:
     # run_alembic_upgrade(), this runs inside run_in_executor() which
     # creates a separate thread with no event loop, so asyncio.run()
     # can create a fresh loop without conflict.
-    asyncio.run(run_async_migrations())
+    supplied = config.attributes.get('connection')
+    if supplied is not None:
+        do_run_migrations(supplied)
+    else:
+        asyncio.run(run_async_migrations())
 
 
 if context.is_offline_mode():

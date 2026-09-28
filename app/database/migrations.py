@@ -7,6 +7,8 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect, text
 
+from app.database.fork_revision_bridge import migration_lock, migration_preflight
+
 
 logger = structlog.get_logger(__name__)
 
@@ -23,43 +25,55 @@ def _get_alembic_config() -> Config:
     return cfg
 
 
-async def _detect_db_state() -> str:
-    """Detect database state: 'fresh', 'legacy', or 'managed'.
-
-    - fresh: no tables at all — brand new database
-    - legacy: has tables but no alembic_version (transition from universal_migration)
-    - managed: has alembic_version — already managed by Alembic
-    """
-    from app.database.database import engine
-
-    async with engine.connect() as conn:
-        has_alembic = await conn.run_sync(lambda sync_conn: inspect(sync_conn).has_table('alembic_version'))
-        if has_alembic:
-            return 'managed'
-        has_users = await conn.run_sync(lambda sync_conn: inspect(sync_conn).has_table('users'))
-        return 'legacy' if has_users else 'fresh'
-
-
-_INITIAL_REVISION = '0001'
-
-
-async def _bootstrap_fresh_db() -> None:
-    """Bootstrap a fresh database: create all tables from models and stamp at head.
-
-    On a fresh DB, running all migrations sequentially would fail because
-    migration 0001 uses Base.metadata.create_all() which creates ALL tables
-    from the current models.py (including columns/constraints/indexes added
-    by later migrations), and then those later migrations try to re-create
-    the same objects.  Instead, we create the full schema directly and stamp
-    the migration history at HEAD so Alembic considers all migrations applied.
-    """
-    from app.database.database import engine
-    from app.database.models import Base
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    logger.info('Свежая БД: все таблицы созданы из моделей')
+def _install_runtime_schema_guards(conn) -> None:
+    """Install the existing deletion guard on the migration connection."""
+    dialect = conn.dialect.name
+    if dialect == 'postgresql':
+        conn.execute(
+            text(
+                "\n                    CREATE OR REPLACE FUNCTION guard_open_grace_subscription_delete()\n                    RETURNS trigger AS $$\n                    BEGIN\n                        IF EXISTS (\n                            SELECT 1 FROM grace_access_sessions\n                            WHERE subscription_id = OLD.id\n                              AND state IN ('pending', 'active', 'restoring')\n                        ) THEN\n                            RAISE EXCEPTION 'subscription has an open grace-access session'\n                                USING ERRCODE = '23503';\n                        END IF;\n                        RETURN OLD;\n                    END;\n                    $$ LANGUAGE plpgsql\n                    "
+            )
+        )
+        # CREATE TRIGGER берёт ACCESS EXCLUSIVE на subscriptions — на каждом
+        # старте это лишний lock-риск (боот может зависнуть об чужую
+        # транзакцию). Создаём только при отсутствии; тело логики живёт в
+        # функции выше, которую CREATE OR REPLACE обновляет без такого лока.
+        trigger_exists = (
+            conn.execute(
+                text(
+                    """
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname = 'trg_guard_open_grace_subscription_delete'
+                      AND tgrelid = 'subscriptions'::regclass
+                      AND NOT tgisinternal
+                    """
+                )
+            )
+        ).scalar() is not None
+        if not trigger_exists:
+            conn.execute(
+                text(
+                    '\n                        CREATE TRIGGER trg_guard_open_grace_subscription_delete\n                        BEFORE DELETE ON subscriptions\n                        FOR EACH ROW EXECUTE FUNCTION guard_open_grace_subscription_delete()\n                        '
+                )
+            )
+    elif dialect == 'sqlite':
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_guard_open_grace_subscription_delete
+                BEFORE DELETE ON subscriptions
+                FOR EACH ROW
+                WHEN EXISTS (
+                    SELECT 1 FROM grace_access_sessions
+                    WHERE subscription_id = OLD.id
+                      AND state IN ('pending', 'active', 'restoring')
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'subscription has an open grace-access session');
+                END
+                """
+            )
+        )
 
 
 async def _ensure_runtime_schema_guards() -> None:
@@ -67,99 +81,55 @@ async def _ensure_runtime_schema_guards() -> None:
     from app.database.database import engine
 
     async with engine.begin() as conn:
-        dialect = conn.dialect.name
-        if dialect == 'postgresql':
-            await conn.execute(
-                text(
-                    """
-                    CREATE OR REPLACE FUNCTION guard_open_grace_subscription_delete()
-                    RETURNS trigger AS $$
-                    BEGIN
-                        IF EXISTS (
-                            SELECT 1 FROM grace_access_sessions
-                            WHERE subscription_id = OLD.id
-                              AND state IN ('pending', 'active', 'restoring')
-                        ) THEN
-                            RAISE EXCEPTION 'subscription has an open grace-access session'
-                                USING ERRCODE = '23503';
-                        END IF;
-                        RETURN OLD;
-                    END;
-                    $$ LANGUAGE plpgsql
-                    """
-                )
-            )
-            # CREATE TRIGGER берёт ACCESS EXCLUSIVE на subscriptions — на каждом
-            # старте это лишний lock-риск (боот может зависнуть об чужую
-            # транзакцию). Создаём только при отсутствии; тело логики живёт в
-            # функции выше, которую CREATE OR REPLACE обновляет без такого лока.
-            trigger_exists = (
-                await conn.execute(
-                    text(
-                        """
-                        SELECT 1 FROM pg_trigger
-                        WHERE tgname = 'trg_guard_open_grace_subscription_delete'
-                          AND tgrelid = 'subscriptions'::regclass
-                          AND NOT tgisinternal
-                        """
-                    )
-                )
-            ).scalar() is not None
-            if not trigger_exists:
-                await conn.execute(
-                    text(
-                        """
-                        CREATE TRIGGER trg_guard_open_grace_subscription_delete
-                        BEFORE DELETE ON subscriptions
-                        FOR EACH ROW EXECUTE FUNCTION guard_open_grace_subscription_delete()
-                        """
-                    )
-                )
-        elif dialect == 'sqlite':
-            await conn.execute(
-                text(
-                    """
-                    CREATE TRIGGER IF NOT EXISTS trg_guard_open_grace_subscription_delete
-                    BEFORE DELETE ON subscriptions
-                    FOR EACH ROW
-                    WHEN EXISTS (
-                        SELECT 1 FROM grace_access_sessions
-                        WHERE subscription_id = OLD.id
-                          AND state IN ('pending', 'active', 'restoring')
-                    )
-                    BEGIN
-                        SELECT RAISE(ABORT, 'subscription has an open grace-access session');
-                    END
-                    """
-                )
-            )
+        await conn.run_sync(_install_runtime_schema_guards)
+
+
+async def assert_migration_safe() -> None:
+    """Fatal preflight also runs when migration/ordinary failure flags are enabled."""
+    from app.database.database import engine
+
+    async with engine.connect() as conn:
+        await conn.run_sync(migration_preflight)
+
+
+def _upgrade_on_connection(connection, cfg) -> None:
+    from app.database.models import Base
+
+    schema = cfg.attributes.get('schema', 'public')
+    with migration_lock(connection, schema):
+        migration_preflight(connection, schema)
+        fresh = not inspect(connection).has_table(
+            'alembic_version', schema=schema if connection.dialect.name == 'postgresql' else None
+        )
+        connection.rollback()
+        cfg.attributes['connection'] = connection
+        if fresh:
+            # The preflight proved the entire schema empty. Creation, guards and
+            # stamp are one transaction, with the same session lock as upgrades.
+            with connection.begin():
+                Base.metadata.create_all(connection)
+                _install_runtime_schema_guards(connection)
+                cfg.attributes['verified_fresh_bootstrap'] = True
+                try:
+                    command.stamp(cfg, 'head')
+                finally:
+                    cfg.attributes.pop('verified_fresh_bootstrap', None)
+        else:
+            command.upgrade(cfg, 'head')
+            # At head, Alembic may leave its version-table SELECT transaction.
+            if connection.in_transaction():
+                connection.rollback()
+            with connection.begin():
+                _install_runtime_schema_guards(connection)
 
 
 async def run_alembic_upgrade() -> None:
-    """Run ``alembic upgrade head``, handling fresh and legacy databases."""
-    import asyncio
-
-    db_state = await _detect_db_state()
-
-    if db_state == 'fresh':
-        logger.warning('Обнаружена пустая БД — создание схемы из моделей + stamp head')
-        await _bootstrap_fresh_db()
-        await _ensure_runtime_schema_guards()
-        await _stamp_alembic_revision('head')
-        return
-
-    if db_state == 'legacy':
-        logger.warning(
-            'Обнаружена существующая БД без alembic_version — автоматический stamp 0001 (переход с universal_migration)'
-        )
-        await _stamp_alembic_revision(_INITIAL_REVISION)
+    """Upgrade only a verified managed or completely empty schema."""
+    from app.database.database import engine
 
     cfg = _get_alembic_config()
-    loop = asyncio.get_running_loop()
-    # run_in_executor offloads to a thread where env.py can safely
-    # call asyncio.run() to create its own event loop.
-    await loop.run_in_executor(None, command.upgrade, cfg, 'head')
-    await _ensure_runtime_schema_guards()
+    async with engine.connect() as connection:
+        await connection.run_sync(_upgrade_on_connection, cfg)
     logger.info('Alembic миграции применены')
 
 

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "fork_commit": "4b06edcdce26850c03ca474e8d195ef94ddb347e",
+  "upstream_commit": "877690a7039d1326b2c00eda3e297879b80c0678",
+  "scope": "Local bridge + pinned upstream DDL only; no integrated models/release or live DB proof",
+  "groups": {
+    "bridge": [
+      "tests/integration/test_fork_revision_bridge.py",
+      "tests/integration/test_fork_upstream_migration_path.py",
+      "tests/integration/test_fork_migration_sqlite.py"
+    ],
+    "renamed_migrations": [
+      "tests/integration/test_payment_recovery_migration.py",
+      "tests/integration/test_cabinet_auth_migration.py",
+      "tests/integration/test_notification_lookup.py",
+      "tests/integration/test_traffic_threshold_notifications.py"
+    ]
+  }
+}

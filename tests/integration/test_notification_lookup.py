@@ -27,7 +27,7 @@ pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(not os.getenv('TEST_POSTGRES_URL'), reason='needs local PostgreSQL'),
 ]
-path = Path(__file__).resolve().parents[2] / 'migrations/alembic/versions/0105_sent_notification_lookup.py'
+path = Path(__file__).resolve().parents[2] / 'migrations/alembic/versions/evo_0105_sent_notification_lookup.py'
 spec = importlib.util.spec_from_file_location('notification_lookup_migration', path)
 migration = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(migration)

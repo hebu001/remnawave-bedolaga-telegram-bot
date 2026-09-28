@@ -34,6 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--pg-bin', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--suite', choices=['custom', 'migration'], default='custom')
     parser.add_argument('--keep-postgres', action='store_true', help='Retain this new cluster for follow-up checks')
     args = parser.parse_args()
     if (ROOT / '.env').exists():
@@ -46,7 +47,8 @@ def main():
             parser.error(f'Missing PostgreSQL binary: {pg_bin / executable}')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    manifest = json.loads(MANIFEST.read_text())
+    manifest_path = MANIFEST if args.suite == 'custom' else MANIFEST.with_name('migration-contracts.json')
+    manifest = json.loads(manifest_path.read_text())
     paths = [path for group in manifest['groups'].values() for path in group]
     if len(paths) != len(set(paths)) or not all((ROOT / path).is_file() for path in paths):
         parser.error('Manifest contains duplicates or missing tests')
@@ -66,6 +68,7 @@ def main():
         DATABASE_URL=url,
         TEST_POSTGRES_URL=url,
         BACKUP_LOCATION=str(cluster / 'backups'),
+        BRIDGE_EVIDENCE_DIR=str(output),
     )
     source_paths = (
         subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd=ROOT)
@@ -79,8 +82,8 @@ def main():
             if path
             and (ROOT / path).is_file()
             and (
-                path.startswith(('app/', 'migrations/'))
-                or (path.startswith('tests/') and Path(path).suffix in {'.py', '.json'})
+                path.startswith(('app/', 'migrations/', 'scripts/'))
+                or (path.startswith('tests/') and Path(path).suffix in {'.py', '.json', '.sql'})
                 or path in {'pyproject.toml', 'uv.lock', 'alembic.ini', 'main.py'}
             )
             and '.env' not in Path(path).parts

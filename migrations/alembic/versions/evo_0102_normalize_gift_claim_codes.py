@@ -1,7 +1,7 @@
 """normalize gift claim codes to 12 characters
 
-Revision ID: 0102
-Revises: 0101
+Revision ID: evo_0102
+Revises: evo_0101
 """
 
 import secrets
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = '0102'
-down_revision = '0101'
+revision = 'evo_0102'
+down_revision = 'evo_0101'
 branch_labels = None
 depends_on = None
 

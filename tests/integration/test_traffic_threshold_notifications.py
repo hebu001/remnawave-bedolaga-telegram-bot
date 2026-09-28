@@ -226,7 +226,7 @@ async def test_poll_fetches_panel_data_and_never_sends_stale_db_usage(sessions, 
 
 
 async def test_migration_upgrade_and_downgrade(sessions):
-    path = Path(__file__).resolve().parents[2] / 'migrations/alembic/versions/0106_traffic_notification_states.py'
+    path = Path(__file__).resolve().parents[2] / 'migrations/alembic/versions/evo_0106_traffic_notification_states.py'
     spec = importlib.util.spec_from_file_location('traffic_migration', path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)

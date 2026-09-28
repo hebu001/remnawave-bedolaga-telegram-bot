@@ -22,7 +22,8 @@ pytestmark = [
 ]
 
 _path = (
-    Path(__file__).resolve().parents[2] / 'migrations/alembic/versions/0103_durable_subpage_orders_and_renewal_sync.py'
+    Path(__file__).resolve().parents[2]
+    / 'migrations/alembic/versions/evo_0103_durable_subpage_orders_and_renewal_sync.py'
 )
 _spec = importlib.util.spec_from_file_location('payment_recovery_migration', _path)
 migration = importlib.util.module_from_spec(_spec)

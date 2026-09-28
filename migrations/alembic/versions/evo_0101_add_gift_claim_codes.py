@@ -1,6 +1,6 @@
 """add short exact-match claim codes for gifts
 
-Revision ID: 0101
+Revision ID: evo_0101
 Revises: 0100
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = '0101'
+revision = 'evo_0101'
 down_revision = '0100'
 branch_labels = None
 depends_on = None

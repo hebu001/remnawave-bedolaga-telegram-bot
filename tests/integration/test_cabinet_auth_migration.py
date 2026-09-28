@@ -19,7 +19,7 @@ pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(not os.getenv('TEST_POSTGRES_URL'), reason='needs local PostgreSQL'),
 ]
-path = Path(__file__).resolve().parents[2] / 'migrations/alembic/versions/0104_cabinet_auth_version.py'
+path = Path(__file__).resolve().parents[2] / 'migrations/alembic/versions/evo_0104_cabinet_auth_version.py'
 spec = importlib.util.spec_from_file_location('cabinet_auth_migration', path)
 migration = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(migration)
