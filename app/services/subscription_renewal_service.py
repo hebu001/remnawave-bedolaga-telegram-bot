@@ -29,6 +29,7 @@ from app.services.renewal_sync_service import (
     process_renewal_sync,
     schedule_renewal_sync,
 )
+from app.utils.pricing_utils import calculate_price_per_month
 
 
 logger = structlog.get_logger(__name__)
@@ -104,8 +105,8 @@ class SubscriptionRenewalPricing:
 
         # per_month
         per_month = int(payload.get('per_month', 0) or 0)
-        if not per_month and months > 0:
-            per_month = final_total // months
+        if not per_month and period_days > 0:
+            per_month = calculate_price_per_month(final_total, period_days)
 
         # server_ids: legacy at top level, RenewalPricing in breakdown
         server_ids = list(payload.get('server_ids') or breakdown.get('server_ids') or [])

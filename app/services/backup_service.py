@@ -20,7 +20,7 @@ import aiofiles
 import pyzipper
 import structlog
 from aiogram.types import FSInputFile
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, null, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -34,6 +34,7 @@ from app.database.models import (
     AdminRole,
     AdvertisingCampaign,
     AdvertisingCampaignRegistration,
+    AntilopayPayment,
     AppleIAPAbuseEvent,
     AppleIAPAccount,
     AppleNotification,
@@ -42,21 +43,33 @@ from app.database.models import (
     BroadcastHistory,
     ButtonClickLog,
     CabinetRefreshToken,
+    CabinetWsTicket,
+    CisPayPayment,
     CloudPaymentsPayment,
     ContestAttempt,
     ContestRound,
     ContestTemplate,
+    Coupon,
+    CouponBatch,
     CryptoBotPayment,
     DiscountOffer,
+    DonutPayment,
+    EmailQueueItem,
     EmailTemplate,
+    EtoplatezhiPayment,
     FaqPage,
     FaqSetting,
     FreekassaPayment,
+    GraceAccessSessionModel,
     GuestPurchase,
     HeleketPayment,
     InfoPage,
+    JupiterPayment,
     KassaAiPayment,
     LandingPage,
+    LavaPayment,
+    LavaSubscription,
+    LegalConsent,
     MainMenuButton,
     MenuLayoutHistory,
     MonitoringLog,
@@ -66,11 +79,13 @@ from app.database.models import (
     NewsTag,
     OverpayPayment,
     Pal24Payment,
+    ParityPayPayment,
     PartnerApplication,
     PaymentMethodConfig,
     PayPearPayment,
     PinnedMessage,
     PlategaPayment,
+    PlategaSubscription,
     Poll,
     PollAnswer,
     PollOption,
@@ -83,11 +98,17 @@ from app.database.models import (
     PromoOfferLog,
     PromoOfferTemplate,
     PublicOffer,
+    ReachabilityBatch,
+    ReachabilityJob,
+    ReachabilityLeg,
+    ReachabilityTargetPref,
     RecurrentPayments,
     ReferralContest,
     ReferralContestEvent,
     ReferralContestVirtualParticipant,
     ReferralEarning,
+    ReferralRewardLevel,
+    RenewalSyncTask,
     RequiredChannel,
     RioPayPayment,
     RollyPayPayment,
@@ -97,23 +118,30 @@ from app.database.models import (
     ServiceRule,
     SeverPayPayment,
     Squad,
+    SubpageInvoice,
     Subscription,
     SubscriptionConversion,
     SubscriptionEvent,
     SubscriptionServer,
     SubscriptionTemporaryAccess,
     SupportAuditLog,
+    SystemErrorEvent,
     SystemSetting,
+    TabPayPayment,
     Tariff,
     Ticket,
     TicketMessage,
     TicketNotification,
+    TrafficNotificationState,
     TrafficPurchase,
     Transaction,
     User,
     UserChannelSubscription,
+    UserDeviceAlias,
     UserMessage,
     UserPromoGroup,
+    UserReminder,
+    UserReminderState,
     UserRole,
     WataPayment,
     WebApiToken,
@@ -131,9 +159,16 @@ from app.database.models import (
     tariff_promo_groups,
 )
 from app.services.backup_io import BackupIOBusy, backup_io
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
+
+
+def _is_unique_violation(error: IntegrityError) -> bool:
+    """Only a proven duplicate may use the existing partial-merge policy."""
+    original = error.orig
+    return getattr(original, 'sqlstate', None) == '23505' or getattr(original, 'sqlite_errorcode', None) in {1555, 2067}
 
 
 async def _terminate_competing_backends(conn) -> int:
@@ -230,11 +265,17 @@ class BackupService:
             MulenPayPayment,
             Pal24Payment,
             PromoCodeUse,
+            # Правила уровней — конфигурация, а не история, и без них восстановленный
+            # бот встаёт с включённой схемой 'levels' (она лежит в SystemSetting и
+            # переживает восстановление) и пустой таблицей правил: цепочка не находит
+            # ни одного уровня и молча не платит НИЧЕГО, без ошибки в логах.
+            # Идёт после Tariff: ссылается на него через referrer/referee_tariff_id.
+            ReferralRewardLevel,
+            AdvertisingCampaign,  # Parent of ReferralEarning.campaign_id.
             ReferralEarning,
             SentNotification,
             DiscountOffer,
             BroadcastHistory,
-            AdvertisingCampaign,
             AdvertisingCampaignRegistration,
             Ticket,
             TicketMessage,
@@ -253,6 +294,14 @@ class BackupService:
             RollyPayPayment,
             OverpayPayment,
             AuraPayPayment,
+            AntilopayPayment,
+            EtoplatezhiPayment,
+            JupiterPayment,
+            DonutPayment,
+            LavaPayment,
+            CisPayPayment,
+            TabPayPayment,
+            ParityPayPayment,
             AppleIAPAccount,
             AppleTransaction,
             AppleNotification,
@@ -320,6 +369,26 @@ class BackupService:
             UserChannelSubscription,
             PartnerApplication,
             CabinetRefreshToken,
+            # Durable custom and upstream state must survive ORM backup/restore too.
+            PlategaSubscription,
+            LavaSubscription,
+            GraceAccessSessionModel,
+            SubpageInvoice,
+            RenewalSyncTask,
+            CouponBatch,
+            Coupon,
+            LegalConsent,
+            TrafficNotificationState,
+            CabinetWsTicket,
+            UserDeviceAlias,
+            SystemErrorEvent,
+            EmailQueueItem,
+            ReachabilityBatch,
+            ReachabilityJob,
+            ReachabilityLeg,
+            ReachabilityTargetPref,
+            UserReminder,
+            UserReminderState,
         ]
 
         self.backup_models_ordered = self._base_backup_models.copy()
@@ -629,6 +698,19 @@ class BackupService:
 
             return False, error_msg, None
 
+    @staticmethod
+    def _invalidate_restored_caches() -> None:
+        """Сбросить кэши, читающие восстановленные таблицы.
+
+        Восстановление пишет строки НАПРЯМУЮ, минуя crud, а сброс кэша уровней
+        живёт именно в crud. Без этого бот продолжал бы начислять по правилам,
+        которые только что заменили: экран показывает восстановленную лестницу,
+        а платит доресторная — до перезапуска.
+        """
+        from app.services.referral_reward_service import ReferralRewardLevelService
+
+        ReferralRewardLevelService.invalidate_cache()
+
     async def restore_backup(self, backup_file_path: str, clear_existing: bool = False) -> tuple[bool, str]:
         try:
             logger.info('📄 Начинаем восстановление из файла', backup_file_path=backup_file_path)
@@ -831,14 +913,15 @@ class BackupService:
                         result = await db.execute(query)
                         records = result.scalars().all()
                     except Exception as table_exc:
-                        logger.warning(
-                            '⚠️ Ошибка экспорта таблицы, пропускаем',
+                        logger.error(
+                            'Экспорт таблицы не завершён; публикация бекапа отменена',
                             table_name=table_name,
-                            error=str(table_exc),
+                            error_type=type(table_exc).__name__,
                         )
                         await db.rollback()
-                        backup_data[table_name] = []
-                        continue
+                        # An unreadable ledger is not an empty ledger. The caller
+                        # must leave previous archives intact and publish nothing.
+                        raise RuntimeError(f'Incomplete backup: cannot read table {table_name}') from None
 
                     table_data: list[dict[str, Any]] = []
                     for record in records:
@@ -993,6 +1076,8 @@ class BackupService:
 
             if files_info:
                 await self._restore_files(files_info, temp_path)
+
+            self._invalidate_restored_caches()
 
             message = (
                 f'✅ Восстановление завершено!\n'
@@ -1302,6 +1387,8 @@ class BackupService:
             if restored_files:
                 logger.info('📁 Восстановлено файлов конфигурации', restored_files=restored_files)
 
+        self._invalidate_restored_caches()
+
         message = (
             f'✅ Восстановление завершено!\n'
             f'📊 Таблиц: {restored_tables}\n'
@@ -1335,9 +1422,11 @@ class BackupService:
                             async with db.begin_nested():
                                 for key, value in processed_data.items():
                                     if key != 'id':
-                                        setattr(existing, key, value)
+                                        setattr(existing, key, null() if value is None else value)
                                 await db.flush()
-                        except IntegrityError:
+                        except IntegrityError as integrity_error:
+                            if not _is_unique_violation(integrity_error):
+                                raise
                             db.expire(existing)
                             logger.warning(
                                 'Конфликт уникального ключа при обновлении пользователя, пропускаем',
@@ -1346,12 +1435,16 @@ class BackupService:
                             )
                             continue
                     else:
-                        instance = User(**processed_data)
+                        instance = User(
+                            **{key: null() if value is None else value for key, value in processed_data.items()}
+                        )
                         try:
                             async with db.begin_nested():
                                 db.add(instance)
                                 await db.flush()
-                        except IntegrityError:
+                        except IntegrityError as integrity_error:
+                            if not _is_unique_violation(integrity_error):
+                                raise
                             logger.warning(
                                 'Дубликат пользователя, пропускаем',
                                 processed_data=processed_data.get('id'),
@@ -1359,12 +1452,16 @@ class BackupService:
                             )
                             continue
                 else:
-                    instance = User(**processed_data)
+                    instance = User(
+                        **{key: null() if value is None else value for key, value in processed_data.items()}
+                    )
                     try:
                         async with db.begin_nested():
                             db.add(instance)
                             await db.flush()
-                    except IntegrityError:
+                    except IntegrityError as integrity_error:
+                        if not _is_unique_violation(integrity_error):
+                            raise
                         logger.warning(
                             'Дубликат пользователя, пропускаем',
                             processed_data=processed_data.get('telegram_id'),
@@ -1379,6 +1476,8 @@ class BackupService:
             async with db.begin_nested():
                 await db.flush()
         except IntegrityError as e:
+            if not _is_unique_violation(e):
+                raise
             logger.warning('IntegrityError при flush пользователей, savepoint откачен', e=e)
         logger.info('✅ Пользователи без реферальных связей восстановлены')
 
@@ -1498,8 +1597,14 @@ class BackupService:
                 rows = result.mappings().all()
                 association_data[table_name] = [dict(row) for row in rows]
                 logger.info('✅ Экспортировано связей из таблицы', rows_count=len(rows), table_name=table_name)
-            except Exception as e:
-                logger.error('Ошибка экспорта таблицы связей', table_name=table_name, error=e)
+            except Exception as error:
+                logger.error(
+                    'Экспорт таблицы связей не завершён; публикация бекапа отменена',
+                    table_name=table_name,
+                    error_type=type(error).__name__,
+                )
+                await db.rollback()
+                raise RuntimeError(f'Incomplete backup: cannot read table {table_name}') from None
 
         return association_data
 
@@ -1565,7 +1670,9 @@ class BackupService:
                     async with db.begin_nested():
                         await db.execute(table_obj.insert().values(**values))
                     restored += 1
-                except IntegrityError:
+                except IntegrityError as integrity_error:
+                    if not _is_unique_violation(integrity_error):
+                        raise
                     logger.warning('Пропускаем связь (FK или дубликат)', table_name=table_name, values=values)
                     continue
             except Exception as e:
@@ -1617,9 +1724,11 @@ class BackupService:
                             async with db.begin_nested():
                                 for key, value in processed_data.items():
                                     if key not in pk_cols:
-                                        setattr(existing, key, value)
+                                        setattr(existing, key, null() if value is None else value)
                                 await db.flush()
-                        except IntegrityError:
+                        except IntegrityError as integrity_error:
+                            if not _is_unique_violation(integrity_error):
+                                raise
                             db.expire(existing)
                             logger.warning(
                                 'Конфликт уникального ключа при обновлении записи, пропускаем',
@@ -1628,12 +1737,16 @@ class BackupService:
                             )
                             continue
                     else:
-                        instance = model(**processed_data)
+                        instance = model(
+                            **{key: null() if value is None else value for key, value in processed_data.items()}
+                        )
                         try:
                             async with db.begin_nested():
                                 db.add(instance)
                                 await db.flush()
-                        except IntegrityError:
+                        except IntegrityError as integrity_error:
+                            if not _is_unique_violation(integrity_error):
+                                raise
                             # Unique constraint conflict — record exists with different PK
                             logger.warning(
                                 'Дубликат по уникальному ключу в %s (PK=%s), пропускаем',
@@ -1642,7 +1755,9 @@ class BackupService:
                             )
                             continue
                 else:
-                    instance = model(**processed_data)
+                    instance = model(
+                        **{key: null() if value is None else value for key, value in processed_data.items()}
+                    )
                     db.add(instance)
 
                 restored_count += 1
@@ -1710,6 +1825,12 @@ class BackupService:
             'aurapay_payments',
             'etoplatezhi_payments',
             'antilopay_payments',
+            'tabpay_payments',
+            'paritypay_payments',
+            'cispay_payments',
+            'donut_payments',
+            'jupiter_payments',
+            'lava_payments',
             'apple_transactions',
             'saved_payment_methods',
             # --- Content/config ---
@@ -1749,6 +1870,10 @@ class BackupService:
             'broadcast_history',
             'subscription_conversions',
             'referral_earnings',
+            # Правила уровней — тоже часть восстанавливаемого состояния. Без
+            # очистки восстановление «с заменой» оставило бы правила приёмника,
+            # и программа платила бы по чужой конфигурации при своей истории.
+            'referral_reward_levels',
             'promocode_uses',
             'yookassa_payments',
             'cryptobot_payments',
@@ -1778,6 +1903,10 @@ class BackupService:
             'web_api_tokens',
             'monitoring_logs',
         ]
+
+        # The explicit legacy order predates newer queues and custom durable state.
+        # Include every registered model so standalone tables are also replaced.
+        all_tables = list(dict.fromkeys([*all_tables, *(m.__tablename__ for m in self._get_models_for_backup(True))]))
 
         # Таблицы, которые не нужно очищать если в бекапе нет данных для них
         # (чтобы сохранить существующие настройки)
@@ -2255,7 +2384,7 @@ class BackupService:
             if file_path:
                 notification_text += f'\n📁 <code>{Path(file_path).name}</code>'
 
-            notification_text += f'\n\n⏰ <i>{datetime.now(UTC).strftime("%d.%m.%Y %H:%M:%S")}</i>'
+            notification_text += f'\n\n⏰ <i>{format_local_datetime(datetime.now(UTC), "%d.%m.%Y %H:%M:%S")}</i>'
 
             try:
                 from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
@@ -2291,7 +2420,7 @@ class BackupService:
             caption = '📦 <b>Резервная копия</b>\n\n'
             if temp_zip_path:
                 caption += '🔐 <b>Архив защищён паролем</b>\n\n'
-            caption += f'⏰ <i>{datetime.now(UTC).strftime("%d.%m.%Y %H:%M:%S")}</i>'
+            caption += f'⏰ <i>{format_local_datetime(datetime.now(UTC), "%d.%m.%Y %H:%M:%S")}</i>'
 
             send_kwargs = {
                 'chat_id': chat_id,

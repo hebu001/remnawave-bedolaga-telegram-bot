@@ -35,6 +35,17 @@ class SubscriptionStates(StatesGroup):
     renaming_device = State()
 
 
+class GiftPurchaseStates(StatesGroup):
+    selecting_tariff = State()
+    selecting_period = State()
+    confirming_purchase = State()
+    cart_saved_for_topup = State()
+
+
+class GiftActivationStates(StatesGroup):
+    waiting_for_code = State()
+
+
 class BalanceStates(StatesGroup):
     waiting_for_amount = State()
     waiting_for_pal24_method = State()
@@ -73,6 +84,7 @@ class AdminStates(StatesGroup):
     creating_coupon_batch_name = State()
     creating_coupon_batch_price = State()
     creating_coupon_batch_expiry = State()
+    creating_coupon_batch_per_user = State()
 
     creating_campaign_name = State()
     creating_campaign_start = State()
@@ -146,6 +158,11 @@ class AdminStates(StatesGroup):
     # Тестовое начисление реферального дохода
     test_referral_earning_input = State()
 
+    # Редактор уровней реферальных наград: одно состояние на всё числовое поле,
+    # какое именно правится — хранится в data FSM (как в редакторе мониторинга).
+    referral_level_value_input = State()
+    referral_depth_input = State()
+
     # Диагностика рефералов
     referral_diagnostics_period = State()
     waiting_for_log_file = State()
@@ -217,7 +234,17 @@ class AdminStates(StatesGroup):
     editing_tariff_promo_groups = State()
     editing_tariff_traffic_topup_packages = State()
     editing_tariff_max_topup_traffic = State()
+    editing_tariff_custom_traffic_price = State()
+    editing_tariff_custom_traffic_min = State()
+    editing_tariff_custom_traffic_max = State()
     editing_tariff_daily_price = State()
+    editing_tariff_panel_tag = State()
+    editing_tariff_lava_product = State()
+    editing_tariff_display_order = State()
+    editing_tariff_custom_days_price = State()
+    editing_tariff_custom_days_min = State()
+    editing_tariff_custom_days_max = State()
+    editing_tariff_server_limit = State()
 
 
 class SupportStates(StatesGroup):

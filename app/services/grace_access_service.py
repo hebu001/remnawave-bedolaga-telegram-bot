@@ -7,8 +7,9 @@ points.
 
 The billing subscription always remains the source of truth.  Grace is a
 temporary overlay in Remnawave and is recorded as a separate session.  In
-particular, this service never resets used traffic and never extends the billing
-subscription itself.
+particular, this service never extends the billing subscription itself and by
+default never resets used traffic; the one opt-in exception is described in
+``should_reset_used_traffic``.
 """
 
 from __future__ import annotations
@@ -81,6 +82,14 @@ class GraceRestoreOutcome(StrEnum):
     CONFLICT = 'conflict'
 
 
+class GracePanelTransitionPending(Exception):
+    """Signal that Remnawave is still deriving a server-owned panel status."""
+
+
+class GracePanelTransitionConflict(Exception):
+    """Signal that a derived-status transition hit an unrelated panel state."""
+
+
 class GraceStartDecision(StrEnum):
     STARTED = 'started'
     RETRIED = 'retried'
@@ -104,6 +113,8 @@ class GraceAccessPolicy:
     daily_enabled: bool = False
     free_enabled: bool = False
     reconcile_batch_size: int = 200
+    external_squad_uuid: str | None = None
+    reset_traffic_on_start: bool = False
 
     def __post_init__(self) -> None:
         if self.duration <= timedelta(0):
@@ -125,7 +136,8 @@ class GraceBillingState:
     """Canonical subscription data owned by the bot billing database."""
 
     subscription_id: int
-    remnawave_uuid: str | None
+    # Remnawave 3.0.0 identifies a panel user by its numeric ``id`` only.
+    remnawave_id: int | None
     status: str
     end_at: datetime | None
     traffic_limit_bytes: int
@@ -148,7 +160,7 @@ class GracePanelSnapshot:
     must never be restored: traffic consumed during grace is real traffic.
     """
 
-    remnawave_uuid: str
+    remnawave_id: int
     status: str
     expire_at: datetime | None
     traffic_limit_bytes: int
@@ -168,6 +180,8 @@ class GracePanelOverlay:
     traffic_limit_bytes: int
     squad_uuids: tuple[str, ...]
     external_squad_uuid: str | None = None
+    # Счётчик расхода обнуляется при выдаче, а лимит равен самой квоте grace.
+    reset_used_traffic: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +190,7 @@ class GraceAccessSession:
 
     id: str
     subscription_id: int
-    remnawave_uuid: str
+    remnawave_id: int
     reason: GraceReason
     incident_key: str
     state: GraceSessionState
@@ -215,38 +229,61 @@ class GraceReconcileResult:
 class GraceSessionStore(Protocol):
     """Persistence adapter implemented in the next integration step."""
 
-    async def get_open(self, subscription_id: int) -> GraceAccessSession | None: ...
+    async def get_open(self, subscription_id: int) -> GraceAccessSession | None:
+        pass
 
-    async def get_by_incident(self, subscription_id: int, incident_key: str) -> GraceAccessSession | None: ...
+    async def get_by_incident(self, subscription_id: int, incident_key: str) -> GraceAccessSession | None:
+        pass
 
-    async def create(self, session: GraceAccessSession) -> GraceAccessSession: ...
+    async def create(self, session: GraceAccessSession) -> GraceAccessSession:
+        pass
 
-    async def save(self, session: GraceAccessSession) -> GraceAccessSession: ...
+    async def save(self, session: GraceAccessSession) -> GraceAccessSession:
+        pass
 
-    async def list_open(self, *, limit: int) -> Sequence[GraceAccessSession]: ...
+    async def list_open(self, *, limit: int) -> Sequence[GraceAccessSession]:
+        pass
 
 
 class GracePanelGateway(Protocol):
     """Remnawave adapter implemented in the next integration step."""
 
-    async def read_snapshot(self, remnawave_uuid: str) -> GracePanelSnapshot | None: ...
+    async def read_snapshot(self, remnawave_id: int) -> GracePanelSnapshot | None:
+        pass
 
-    async def apply_overlay(self, remnawave_uuid: str, overlay: GracePanelOverlay) -> None: ...
+    async def apply_overlay(self, remnawave_id: int, overlay: GracePanelOverlay) -> None:
+        pass
 
     async def restore_snapshot(
         self,
-        remnawave_uuid: str,
+        remnawave_id: int,
         snapshot: GracePanelSnapshot,
         expected_overlay: GracePanelOverlay,
-    ) -> GraceRestoreOutcome: ...
+    ) -> GraceRestoreOutcome:
+        """Roll the panel back to ``snapshot``, but only if it still carries our overlay.
 
-    async def apply_billing_state(self, billing: GraceBillingState) -> None: ...
+        ``expected_overlay`` is the guard: someone else may have changed the panel
+        since the overlay was applied, and blindly restoring an old snapshot would
+        undo their change.
+        """
+
+    async def apply_billing_state(
+        self,
+        billing: GraceBillingState,
+        *,
+        expected_overlay: GracePanelOverlay,
+    ) -> None:
+        """Push the bot's canonical values onto the panel, replacing our overlay.
+
+        Guarded by ``expected_overlay`` for the same reason as ``restore_snapshot``.
+        """
 
 
 class GraceBillingGateway(Protocol):
     """Read-only adapter for the bot's canonical subscription state."""
 
-    async def get_subscription(self, subscription_id: int) -> GraceBillingState | None: ...
+    async def get_subscription(self, subscription_id: int) -> GraceBillingState | None:
+        pass
 
 
 class GraceAccessService:
@@ -275,7 +312,7 @@ class GraceAccessService:
         """Create and apply one grace session for one billing incident."""
         if not billing_is_eligible(billing, reason, self._policy):
             return GraceStartResult(GraceStartDecision.NOT_ELIGIBLE)
-        if not billing.remnawave_uuid:
+        if not billing.remnawave_id:
             return GraceStartResult(GraceStartDecision.PANEL_USER_NOT_FOUND)
 
         open_session = await self._store.get_open(billing.subscription_id)
@@ -290,7 +327,7 @@ class GraceAccessService:
                 return GraceStartResult(decision, active_session)
             return GraceStartResult(GraceStartDecision.ALREADY_ACTIVE, open_session)
 
-        panel_snapshot = await self._panel.read_snapshot(billing.remnawave_uuid)
+        panel_snapshot = await self._panel.read_snapshot(billing.remnawave_id)
         if not panel_snapshot:
             return GraceStartResult(GraceStartDecision.PANEL_USER_NOT_FOUND)
         if not panel_status_matches_reason(panel_snapshot.status, reason):
@@ -317,11 +354,17 @@ class GraceAccessService:
                 panel_snapshot,
                 used_traffic_bytes=billing.used_traffic_bytes,
             )
-        overlay = build_panel_overlay(panel_snapshot, reason, self._policy, now=now)
+        overlay = build_panel_overlay(
+            panel_snapshot,
+            reason,
+            self._policy,
+            now=now,
+            reset_used_traffic=should_reset_used_traffic(billing, panel_snapshot, reason, self._policy),
+        )
         pending_session = GraceAccessSession(
             id=str(uuid4()),
             subscription_id=billing.subscription_id,
-            remnawave_uuid=billing.remnawave_uuid,
+            remnawave_id=billing.remnawave_id,
             reason=reason,
             incident_key=incident_key,
             state=GraceSessionState.PENDING,
@@ -381,7 +424,10 @@ class GraceAccessService:
             return False
 
         if apply_billing_state:
-            await self._panel.apply_billing_state(billing)
+            await self._panel.apply_billing_state(
+                billing,
+                expected_overlay=session.overlay,
+            )
         await self._complete(session, GraceCompletionReason.PAID)
         return True
 
@@ -424,6 +470,22 @@ class GraceAccessService:
                     activate_pending=activate_pending,
                     force_restore=force_restore,
                 )
+            except GracePanelTransitionConflict as error:
+                latest_session = await self._store.get_open(session.subscription_id)
+                if latest_session is None:
+                    result = replace(result, unchanged=result.unchanged + 1)
+                    continue
+                await self._complete(
+                    latest_session,
+                    GraceCompletionReason.CONFLICT,
+                    last_error=_error_text(error),
+                )
+                result = replace(result, conflicts=result.conflicts + 1)
+                continue
+            except GracePanelTransitionPending:
+                await self._clear_error(session.subscription_id)
+                result = replace(result, unchanged=result.unchanged + 1)
+                continue
             except Exception as error:
                 await self._remember_error(session.subscription_id, error)
                 logger.exception(
@@ -490,7 +552,10 @@ class GraceAccessService:
         latest_billing = await self._billing.get_subscription(session.subscription_id)
 
         if latest_billing and billing_has_recovered(session, latest_billing):
-            await self._panel.apply_billing_state(latest_billing)
+            await self._panel.apply_billing_state(
+                latest_billing,
+                expected_overlay=session.overlay,
+            )
             return await self._complete(session, GraceCompletionReason.PAID)
 
         if latest_billing is None or billing_is_revoked(latest_billing):
@@ -506,7 +571,7 @@ class GraceAccessService:
             action = await self._restore_and_complete(session, GraceCompletionReason.CONFLICT)
             return action[1]
 
-        current_panel = await self._panel.read_snapshot(session.remnawave_uuid)
+        current_panel = await self._panel.read_snapshot(session.remnawave_id)
         if current_panel is None:
             return await self._complete(
                 session,
@@ -519,6 +584,12 @@ class GraceAccessService:
             session.overlay,
             now=now,
         )
+        # Оверлей уже в панели, но обнуление счётчика после него не прошло:
+        # без повтора человек получил бы лимит в квоту при старом расходе, то
+        # есть ноль доступного трафика.
+        traffic_reset_is_pending = session.overlay.reset_used_traffic and (
+            current_panel.used_traffic_bytes >= session.overlay.traffic_limit_bytes
+        )
         if not overlay_is_already_applied and not panel_is_safe_pending_source(
             current_panel,
             session.panel_before,
@@ -529,7 +600,12 @@ class GraceAccessService:
             # squad preflight.  Any other state may be a manual/emergency
             # revocation. Canonical billing is fail-closed and must win.
             try:
-                await self._panel.apply_billing_state(latest_billing)
+                await self._panel.apply_billing_state(
+                    latest_billing,
+                    expected_overlay=session.overlay,
+                )
+            except (GracePanelTransitionConflict, GracePanelTransitionPending):
+                raise
             except Exception as error:
                 failed_session = replace(
                     session,
@@ -544,9 +620,9 @@ class GraceAccessService:
                 last_error='Remnawave changed while grace was pending; overlay was not re-applied',
             )
 
-        if not overlay_is_already_applied:
+        if not overlay_is_already_applied or traffic_reset_is_pending:
             try:
-                await self._panel.apply_overlay(session.remnawave_uuid, session.overlay)
+                await self._panel.apply_overlay(session.remnawave_id, session.overlay)
             except Exception as error:
                 failed_session = replace(
                     session,
@@ -558,11 +634,17 @@ class GraceAccessService:
 
         latest_billing = await self._billing.get_subscription(session.subscription_id)
         if latest_billing and billing_has_recovered(session, latest_billing):
-            await self._panel.apply_billing_state(latest_billing)
+            await self._panel.apply_billing_state(
+                latest_billing,
+                expected_overlay=session.overlay,
+            )
             return await self._complete(session, GraceCompletionReason.PAID)
         if latest_billing is None or billing_is_revoked(latest_billing):
             if latest_billing is not None:
-                await self._panel.apply_billing_state(latest_billing)
+                await self._panel.apply_billing_state(
+                    latest_billing,
+                    expected_overlay=session.overlay,
+                )
                 return await self._complete(session, GraceCompletionReason.REVOKED)
             _, completed = await self._restore_and_complete(session, GraceCompletionReason.REVOKED)
             return completed
@@ -589,16 +671,25 @@ class GraceAccessService:
     ) -> str:
         billing = await self._billing.get_subscription(session.subscription_id)
         if billing and billing_has_recovered(session, billing):
-            await self._panel.apply_billing_state(billing)
+            await self._panel.apply_billing_state(
+                billing,
+                expected_overlay=session.overlay,
+            )
             await self._complete(session, GraceCompletionReason.PAID)
             return GraceCompletionReason.PAID.value
 
         if billing is None or billing_is_revoked(billing):
             if billing is not None:
-                await self._panel.apply_billing_state(billing)
+                await self._panel.apply_billing_state(
+                    billing,
+                    expected_overlay=session.overlay,
+                )
                 latest_billing = await self._billing.get_subscription(session.subscription_id)
                 if latest_billing and billing_has_recovered(session, latest_billing):
-                    await self._panel.apply_billing_state(latest_billing)
+                    await self._panel.apply_billing_state(
+                        latest_billing,
+                        expected_overlay=session.overlay,
+                    )
                     await self._complete(session, GraceCompletionReason.PAID)
                     return GraceCompletionReason.PAID.value
                 await self._complete(session, GraceCompletionReason.REVOKED)
@@ -606,17 +697,32 @@ class GraceAccessService:
             action, _ = await self._restore_and_complete(session, GraceCompletionReason.REVOKED)
             return action
 
+        # Эхо оверлея в биллинге — не смена инцидента: дата грейса попала в бота
+        # импортом из панели. Не отправляем её в панель «каноническим» состоянием
+        # и не закрываем грейс — он доработает до конца и восстановит снимок.
+        if billing_echoes_overlay(session, billing):
+            logger.error(
+                'Биллинг повторяет оверлей грейса — импорт перенёс его в бота; грейс продолжается',
+                grace_session_id=session.id,
+                subscription_id=session.subscription_id,
+            )
         # The recipient or canonical incident changed while grace was open
-        # (admin cancellation/shortening, tariff change, UUID replacement,
-        # squads/device/limit change).  Never continue an overlay based on a
-        # stale snapshot.  When the same panel user still belongs to billing,
-        # canonical billing wins immediately; otherwise restore the old user by
-        # compare-and-set and leave unrelated panel changes untouched.
-        if not billing_incident_is_eligible(billing, session.reason) or not billing_still_matches_session(
-            session, billing
+        # (admin cancellation/shortening, tariff change, panel identity
+        # replacement, squads/device/limit change).  Never continue an overlay
+        # based on a stale snapshot.  When the same panel user still belongs to
+        # billing, canonical billing wins immediately; otherwise restore the old
+        # user by compare-and-set and leave unrelated panel changes untouched.
+        # ``session.remnawave_id`` is always a positive int, so a subscription
+        # that lost its panel link (``None``) can never match it by accident.
+        if not billing_echoes_overlay(session, billing) and (
+            not billing_incident_is_eligible(billing, session.reason)
+            or not billing_still_matches_session(session, billing)
         ):
-            if billing.remnawave_uuid == session.remnawave_uuid:
-                await self._panel.apply_billing_state(billing)
+            if billing.remnawave_id == session.remnawave_id:
+                await self._panel.apply_billing_state(
+                    billing,
+                    expected_overlay=session.overlay,
+                )
                 await self._complete(session, GraceCompletionReason.CONFLICT)
                 return GraceCompletionReason.CONFLICT.value
             action, _ = await self._restore_and_complete(session, GraceCompletionReason.CONFLICT)
@@ -639,7 +745,7 @@ class GraceAccessService:
             return action
 
         if session.state is GraceSessionState.ACTIVE and not force_restore and now < _as_utc(session.grace_until):
-            current_panel = await self._panel.read_snapshot(session.remnawave_uuid)
+            current_panel = await self._panel.read_snapshot(session.remnawave_id)
             if current_panel is None:
                 await self._complete(session, GraceCompletionReason.CONFLICT)
                 return GraceCompletionReason.CONFLICT.value
@@ -652,7 +758,10 @@ class GraceAccessService:
             # grant unrestricted access after a crashed/stale renewal PATCH, so
             # fail closed to the current canonical billing state.
             if _normalize_status(current_panel.status) == 'active':
-                await self._panel.apply_billing_state(billing)
+                await self._panel.apply_billing_state(
+                    billing,
+                    expected_overlay=session.overlay,
+                )
                 await self._complete(
                     session,
                     GraceCompletionReason.CONFLICT,
@@ -692,12 +801,15 @@ class GraceAccessService:
 
         latest_billing = await self._billing.get_subscription(session.subscription_id)
         if latest_billing and billing_has_recovered(restoring_session, latest_billing):
-            await self._panel.apply_billing_state(latest_billing)
+            await self._panel.apply_billing_state(
+                latest_billing,
+                expected_overlay=restoring_session.overlay,
+            )
             completed = await self._complete(restoring_session, GraceCompletionReason.PAID)
             return GraceCompletionReason.PAID.value, completed
 
         outcome = await self._panel.restore_snapshot(
-            restoring_session.remnawave_uuid,
+            restoring_session.remnawave_id,
             restoring_session.panel_before,
             restoring_session.overlay,
         )
@@ -706,7 +818,10 @@ class GraceAccessService:
         # over an old snapshot, even if the restore PATCH has already succeeded.
         latest_billing = await self._billing.get_subscription(session.subscription_id)
         if latest_billing and billing_has_recovered(restoring_session, latest_billing):
-            await self._panel.apply_billing_state(latest_billing)
+            await self._panel.apply_billing_state(
+                latest_billing,
+                expected_overlay=restoring_session.overlay,
+            )
             completed = await self._complete(restoring_session, GraceCompletionReason.PAID)
             return GraceCompletionReason.PAID.value, completed
 
@@ -751,6 +866,18 @@ class GraceAccessService:
             )
         )
 
+    async def _clear_error(self, subscription_id: int) -> None:
+        session = await self._store.get_open(subscription_id)
+        if not session or session.last_error is None:
+            return
+        await self._store.save(
+            replace(
+                session,
+                updated_at=_as_utc(self._clock()),
+                last_error=None,
+            )
+        )
+
 
 def build_incident_key(
     billing: GraceBillingState,
@@ -772,7 +899,7 @@ def billing_still_matches_session(
 ) -> bool:
     """Compare canonical fields that identify the incident without panel metadata."""
     before = session.billing_before
-    if current.remnawave_uuid != session.remnawave_uuid:
+    if current.remnawave_id != session.remnawave_id:
         return False
     if _normalize_status(current.status) != session.reason.value:
         return False
@@ -845,36 +972,210 @@ def panel_status_matches_reason(status: str, reason: GraceReason) -> bool:
     return normalized == 'limited'
 
 
+# Просьба «оставить как есть»: без неё настройка знала бы только «отцепить» и
+# «подставить конкретный», а сохранить уже назначенный сквад было бы нельзя.
+GRACE_EXTERNAL_SQUAD_KEEP = 'keep'
+
+
+def _resolve_grace_external_squad(configured: str | None, snapshot: GracePanelSnapshot) -> str | None:
+    """Какой внешний сквад назначить на время grace.
+
+    Пусто — отцепить, как было всегда. ``keep`` — оставить текущий из снимка.
+    Иначе — назначить указанный. Без разбора ``keep`` эта строка уходила бы в
+    панель как UUID, то есть настройка, описанная в .env.example, назначала бы
+    несуществующий сквад.
+    """
+    value = (configured or '').strip()
+    if not value:
+        return None
+    if value.lower() == GRACE_EXTERNAL_SQUAD_KEEP:
+        return snapshot.external_squad_uuid or None
+    return value
+
+
+def should_reset_used_traffic(
+    billing: GraceBillingState,
+    snapshot: GracePanelSnapshot,
+    reason: GraceReason,
+    policy: GraceAccessPolicy,
+) -> bool:
+    """Обнулять ли счётчик расхода при выдаче grace (GRACE_ACCESS_RESET_TRAFFIC_ON_START).
+
+    Без обнуления лимит grace — «расход + квота», и панель с клиентом показывают
+    «64.76 из 65.76 GiB, 98%», хотя доступен ровно гигабайт. Обнуление делает
+    режим читаемым, но стирает расход, поэтому разрешено только там, где терять
+    нечего: истёкшая подписка с безлимитом и в биллинге, и в панели. По лимиту
+    трафика (LIMITED) обнулять нельзя никогда — обнулённый счётчик снова открыл бы
+    исчерпанную квоту тарифа, а сброс расхода там означает конец инцидента.
+    """
+    return (
+        policy.reset_traffic_on_start
+        and reason is GraceReason.EXPIRED
+        and billing.traffic_limit_bytes == 0
+        and snapshot.traffic_limit_bytes == 0
+    )
+
+
 def build_panel_overlay(
     snapshot: GracePanelSnapshot,
     reason: GraceReason,
     policy: GraceAccessPolicy,
     *,
     now: datetime,
+    reset_used_traffic: bool = False,
 ) -> GracePanelOverlay:
-    """Calculate temporary panel values without resetting consumed traffic."""
+    """Calculate temporary panel values; consumed traffic is reset only on request."""
     if not snapshot.traffic_is_known:
         raise ValueError(f'Remnawave did not return traffic usage for a {reason.value.upper()} user')
 
     # Remnawave compares its cumulative usage counter with trafficLimitBytes.
     # Keeping the counter and adding the configured grant therefore gives the
     # user exactly ``traffic_bytes`` of usable grace traffic, regardless of the
-    # old remaining limit or an old unlimited (zero) limit.
-    temporary_limit = snapshot.used_traffic_bytes + policy.traffic_bytes
+    # old remaining limit or an old unlimited (zero) limit. When the counter is
+    # reset on start (see should_reset_used_traffic) the grant itself is the limit.
+    if reset_used_traffic:
+        temporary_limit = policy.traffic_bytes
+    else:
+        temporary_limit = snapshot.used_traffic_bytes + policy.traffic_bytes
+
+    # Внешний сквад даёт доступ независимо от внутреннего telegram-only сквада,
+    # поэтому grace по умолчанию его отцепляет: иначе ограничение обходится мимо
+    # всей схемы. Значение задаётся админом осознанно — 'keep' сохраняет текущий
+    # (например, со шаблонами под блокировки), UUID подставляет аварийный.
+    external_squad_uuid = _resolve_grace_external_squad(policy.external_squad_uuid, snapshot)
 
     return GracePanelOverlay(
         status='ACTIVE',
         expire_at=_as_utc(now) + policy.duration,
         traffic_limit_bytes=temporary_limit,
         squad_uuids=(policy.squad_for(reason),),
-        # External squads can provide unrestricted access independently of the
-        # internal Telegram-only squad, so grace must temporarily detach them.
-        external_squad_uuid=None,
+        external_squad_uuid=external_squad_uuid,
+        reset_used_traffic=reset_used_traffic,
     )
+
+
+_GIB = 1024**3
+
+#: Панель хранит миллисекунды — эхо её даты в боте может отличаться на доли секунды.
+_OVERLAY_ECHO_TOLERANCE = timedelta(seconds=2)
+
+
+def billing_echoes_overlay(session: GraceAccessSession, current: GraceBillingState) -> bool:
+    """В биллинге стоит дата, которую грейс сам выставил в панели.
+
+    Так выглядит оверлей, перенесённый импортом «панель — истина» в бота. Это не
+    продление и не правка извне: 2026-09-15 такое эхо закрывало грейс «человек
+    продлил» и отправляло в панель сквад грейса как обычный тариф. Настоящее
+    продление уводит дату от ``grace_until`` — оно всегда отличается.
+    """
+    if current.end_at is None:
+        return False
+    return abs(_as_utc(current.end_at) - _as_utc(session.overlay.expire_at)) <= _OVERLAY_ECHO_TOLERANCE
+
+
+@dataclass(frozen=True, slots=True)
+class GraceEchoRepair:
+    """Что вернуть в подписку, где осел оверлей грейса. ``None`` — поле не трогать."""
+
+    squad_uuids: tuple[str, ...]
+    traffic_limit_bytes: int | None
+    end_at: datetime | None
+
+
+def plan_grace_echo_repair(
+    *,
+    squad_uuids: Sequence[str],
+    traffic_limit_gb: int,
+    end_at: datetime | None,
+    sessions: Sequence[GraceAccessSession],
+    sellable_squads: frozenset[str],
+) -> GraceEchoRepair | None:
+    """Вернуть подписке то, что грейс-оверлей в ней затёр.
+
+    v4.10–4.11: мониторинг принимал оверлей за продление панели и записывал его
+    в подписку — дату конца грейса, сквад грейса, лимит «расход + квота». Настоящие
+    значения лежат в ``billing_before`` сессии.
+
+    Опорных признаков два, и каждый даёт только грейс:
+
+    * дата окончания подписки равна дате оверлея какой-то сессии — «сейчас + срок
+      грейса» с точностью до миллисекунд, ни продление, ни админ такую не дают.
+      Поэтому зовут это ДО расчёта нового срока, пока дата ещё на месте;
+    * серверы подписки — ровно сквады оверлея, и ни один из них нигде не продаётся
+      (``sellable_squads``: доступные к покупке и пробные серверы, сквады тарифов), а
+      грейс хоть раз закрылся «оплатой». Это жалоба №2: человек заплатил ещё на
+      старом коде, дата ушла от конца грейса, а сквад грейса остался. Дату тогда не
+      трогаем — её сдвинула оплата.
+
+    Одного совпадения сквада мало: сквад грейса может быть и обычным продаваемым
+    сервером, а «расход + квота» — совпасть случайно.
+
+    Если человек не продлил сразу, у «даты грейса» ему выдавался второй грейс, и
+    его снимок уже с оверлеем, — источник — последний снимок, который сам не оверлей.
+    Лимит сравнивается в целых гигабайтах: в подписку он приходил из панели
+    округлённым вниз, а «расход + квота» почти никогда не делится нацело.
+    """
+    if not sessions:
+        return None
+    overlay_dates = [_as_utc(session.overlay.expire_at) for session in sessions]
+
+    def date_is_overlay(value: datetime | None) -> bool:
+        return value is not None and any(
+            abs(_as_utc(value) - date) <= _OVERLAY_ECHO_TOLERANCE for date in overlay_dates
+        )
+
+    date_echoed = date_is_overlay(end_at)
+    if not date_echoed and not squads_are_only_grace_echo(squad_uuids, sessions, sellable_squads=sellable_squads):
+        return None
+    grace_squads = {squad for session in sessions for squad in session.overlay.squad_uuids}
+    newest_first = sorted(sessions, key=lambda session: _as_utc(session.started_at), reverse=True)
+    source = next(
+        (
+            session.billing_before
+            for session in newest_first
+            if not date_is_overlay(session.billing_before.end_at)
+            and not grace_squads.intersection(session.billing_before.squad_uuids)
+        ),
+        None,
+    )
+    if source is None:
+        return None
+    current = tuple(squad_uuids)
+    if grace_squads.intersection(current):
+        # Сквад грейса уходит, свои серверы возвращаются; добавленное покупкой — остаётся.
+        kept = tuple(squad for squad in current if squad not in grace_squads)
+        squads = tuple(dict.fromkeys((*source.squad_uuids, *kept)))
+    else:
+        squads = current
+    overlay_limits_gb = {session.overlay.traffic_limit_bytes // _GIB for session in sessions}
+    limit_echoed = traffic_limit_gb in overlay_limits_gb and traffic_limit_gb > 0
+    return GraceEchoRepair(
+        squad_uuids=squads,
+        traffic_limit_bytes=source.traffic_limit_bytes if limit_echoed else None,
+        end_at=source.end_at if date_echoed else None,
+    )
+
+
+def squads_are_only_grace_echo(
+    squad_uuids: Sequence[str], sessions: Sequence[GraceAccessSession], *, sellable_squads: frozenset[str]
+) -> bool:
+    """Серверы подписки мог дать только грейс: ровно сквады оверлея, нигде не продаются.
+
+    Плюс грейс хоть раз закрылся «оплатой» — так v4.10–4.11 закрывали сессию, приняв
+    оверлей за продление. Список серверов, где рядом есть что-то ещё, — уже не эхо.
+    """
+    current = frozenset(squad_uuids)
+    if not current or current & sellable_squads:
+        return False
+    if not any(frozenset(session.overlay.squad_uuids) == current for session in sessions):
+        return False
+    return any(session.completion_reason == GraceCompletionReason.PAID for session in sessions)
 
 
 def billing_has_recovered(session: GraceAccessSession, current: GraceBillingState) -> bool:
     """Detect a real renewal or traffic purchase in the canonical billing state."""
+    if billing_echoes_overlay(session, current):
+        return False
     if _normalize_status(current.user_status) != 'active':
         return False
     if _normalize_status(current.status) not in {'active', 'trial'}:
@@ -888,6 +1189,40 @@ def billing_has_recovered(session: GraceAccessSession, current: GraceBillingStat
     if before.traffic_limit_bytes > 0 and current.traffic_limit_bytes > before.traffic_limit_bytes:
         return True
     return session.reason is GraceReason.LIMITED and current.used_traffic_bytes < before.used_traffic_bytes
+
+
+def traffic_reset_ended_limited_incident(
+    session: GraceAccessSession,
+    current: GraceBillingState,
+    *,
+    now: datetime,
+) -> bool:
+    """Трафик сбросился, пока шёл грейс по лимиту, — инцидент закончился сам.
+
+    Пока грейс открыт, статус из панели в бота не переносится (он принадлежит
+    грейсу), а ``user.enabled`` гасится как эхо оверлея. Расход при этом
+    синхронизируется. Итог: панель после периодического сброса снова ACTIVE, в
+    боте расход ноль, а статус так и остался LIMITED — ``billing_has_recovered``
+    требует active и не срабатывает никогда, человек сидит в сквад грейса с
+    оплаченной подпиской. Признак сброса — расход упал ниже зафиксированного при
+    выдаче и ниже лимита; сам по себе расход в панели только растёт.
+    """
+    if session.reason is not GraceReason.LIMITED:
+        return False
+    if _normalize_status(current.status) != 'limited':
+        return False
+    if _normalize_status(current.user_status) != 'active':
+        return False
+    if current.end_at is None or _as_utc(current.end_at) <= _as_utc(now):
+        return False
+    if billing_echoes_overlay(session, current):
+        return False
+    before = session.billing_before
+    if current.traffic_limit_bytes != before.traffic_limit_bytes:
+        return False
+    if current.used_traffic_bytes >= before.used_traffic_bytes:
+        return False
+    return current.traffic_limit_bytes == 0 or current.used_traffic_bytes < current.traffic_limit_bytes
 
 
 def panel_matches_overlay(
@@ -926,7 +1261,7 @@ def panel_is_safe_pending_source(
     preflight PATCH.
     """
     unchanged_except_external = (
-        current.remnawave_uuid == before.remnawave_uuid
+        current.remnawave_id == before.remnawave_id
         and _normalize_status(current.status) == _normalize_status(before.status)
         and _datetimes_equal(current.expire_at, before.expire_at)
         and current.traffic_limit_bytes == before.traffic_limit_bytes

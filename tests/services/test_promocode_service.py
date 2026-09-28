@@ -3,7 +3,7 @@ Tests for PromoCodeService - focus on promo group integration
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.database.models import PromoCodeType
 from app.services.promocode_service import PromoCodeService
@@ -423,6 +423,7 @@ async def test_activate_trial_promocode_uses_all_available_squads_when_tariff_ha
         total_spent_kopeks=0,
     )
     mock_db_session = AsyncMock()
+    mock_db_session.begin_nested = MagicMock()
     mock_db_session.commit = AsyncMock()
     mock_db_session.rollback = AsyncMock()
     mock_db_session.refresh = AsyncMock()
@@ -515,6 +516,7 @@ async def test_subscription_days_promo_keeps_trial_a_trial(monkeypatch):
         total_spent_kopeks=0,
     )
     mock_db_session = AsyncMock()
+    mock_db_session.begin_nested = MagicMock()
     mock_db_session.commit = AsyncMock()
     mock_db_session.rollback = AsyncMock()
     mock_db_session.refresh = AsyncMock()
@@ -589,6 +591,7 @@ async def test_subscription_days_promo_revives_expired_sub_in_multi_tariff(monke
         total_spent_kopeks=0,
     )
     mock_db_session = AsyncMock()
+    mock_db_session.begin_nested = MagicMock()
 
     promocode = SimpleNamespace(
         id=12,
@@ -685,6 +688,7 @@ async def test_activation_aborts_when_usage_slot_cannot_be_claimed(monkeypatch):
     promocode = await _balance_promocode()
 
     mock_db_session = AsyncMock()
+    mock_db_session.begin_nested = MagicMock()
     # The only db.execute in the flow before effects is the slot-claim UPDATE.
     # Simulate "no slot left" -> rowcount 0.
     mock_db_session.execute = AsyncMock(return_value=SimpleNamespace(rowcount=0))
@@ -744,6 +748,7 @@ async def test_trial_promo_refunds_instead_of_fake_success_when_subscription_exi
     existing_sub = SimpleNamespace(id=5, is_trial=False, status='active', tariff=None, tariff_id=99, days_left=10)
 
     mock_db_session = AsyncMock()
+    mock_db_session.begin_nested = MagicMock()
     mock_db_session.execute = AsyncMock(return_value=SimpleNamespace(rowcount=1))  # slot claimed OK
 
     monkeypatch.setattr('app.services.promocode_service.RemnaWaveService', lambda: SimpleNamespace())

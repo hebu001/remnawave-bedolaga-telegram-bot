@@ -6,8 +6,10 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from fastapi import HTTPException, status
 
 from app.config import settings
+from app.utils.legacy_subscription import is_legacy_subscription
 
 
 if TYPE_CHECKING:
@@ -63,7 +65,13 @@ async def resolve_subscription(
         return None
 
     await db.refresh(user, ['subscriptions'])
-    return user.subscription
+    subscription = user.subscription
+    if subscription is not None and subscription.tariff_id is not None:
+        # Связь с тарифом ленивая, а маршруты читают subscription.tariff напрямую: в async это
+        # падает или даёт None — и «Продлить» показывало «Нет вариантов продления» при истёкшей
+        # подписке на обычном тарифе. Мульти-ветка грузит тариф через selectinload — выравниваем.
+        await db.refresh(subscription, ['tariff'])
+    return subscription
 
 
 def _get_addon_discount_percent(
@@ -99,6 +107,21 @@ def _apply_addon_discount(
         'discount': discount_value,
         'percent': percent,
     }
+
+
+def ensure_subscription_has_tariff(subscription: Any) -> None:
+    """Докупки старой подписке не продаются — сперва переход на тариф.
+
+    Старая подписка (платная, без тарифа при включённых тарифах) считала бы
+    докупку устройств и трафика по классическим настройкам. Кабинет такие
+    кнопки прячет, а здесь отказ до списания — для старого кабинета и прямых
+    запросов. ``None`` пропускаем: «подписки нет» отвечает сам маршрут.
+    """
+    if is_legacy_subscription(subscription):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={'code': 'tariff_required', 'message': 'Subscription has no tariff. Choose a tariff first.'},
+        )
 
 
 def _subscription_to_response(
@@ -169,18 +192,12 @@ def _subscription_to_response(
     traffic_reset_mode = None
     if tariff_id and hasattr(subscription, 'tariff') and subscription.tariff:
         daily_price_kopeks = getattr(subscription.tariff, 'daily_price_kopeks', None)
-        # Применяем скидку промогруппы + promo-offer для отображения
+        # Ровно то, что списывается каждый день: только скидка группы. Промокод —
+        # разовый, при покупке; вкладывать его в «цену за день» было бы обманом.
         if daily_price_kopeks and daily_price_kopeks > 0 and user:
             from app.services.pricing_engine import PricingEngine
-            from app.utils.promo_offer import get_user_active_promo_discount_percent
 
-            _promo_group = user.get_primary_promo_group() if hasattr(user, 'get_primary_promo_group') else None
-            _group_pct = _promo_group.get_discount_percent('period', 1) if _promo_group else 0
-            _offer_pct = get_user_active_promo_discount_percent(user)
-            if _group_pct > 0 or _offer_pct > 0:
-                daily_price_kopeks, _, _ = PricingEngine.apply_stacked_discounts(
-                    daily_price_kopeks, _group_pct, _offer_pct
-                )
+            daily_price_kopeks, _ = PricingEngine.daily_group_price(daily_price_kopeks, user)
         if not tariff_name:  # Only set if not passed as parameter
             tariff_name = getattr(subscription.tariff, 'name', None)
         traffic_reset_mode = (
@@ -200,10 +217,15 @@ def _subscription_to_response(
     # Проверяем настройку скрытия ссылки (скрывается только текст, кнопки работают)
     hide_link = settings.should_hide_subscription_link()
 
+    is_trial_subscription = bool(subscription.is_trial or actual_status == 'trial')
+    # Старая подписка: продлить нельзя — кабинет ведёт на выбор тарифа и не
+    # показывает автоплатёж (правило одно на бота и кабинет).
+    requires_tariff_selection = is_legacy_subscription(subscription)
+
     return SubscriptionResponse(
         id=subscription.id,
         status=actual_status,  # Use actual_status instead of raw status
-        is_trial=subscription.is_trial or actual_status == 'trial',
+        is_trial=is_trial_subscription,
         start_date=subscription.start_date,
         end_date=subscription.end_date,
         days_left=days_left,
@@ -231,4 +253,5 @@ def _subscription_to_response(
         tariff_id=tariff_id,
         tariff_name=tariff_name,
         traffic_reset_mode=traffic_reset_mode,
+        requires_tariff_selection=requires_tariff_selection,
     )

@@ -19,17 +19,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.13-slim
 
-ARG VERSION="v3.66.0" # x-release-please-version
+ARG VERSION="v4.15.0" # x-release-please-version
 ARG BUILD_DATE
 ARG VCS_REF
 
 COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
-# pg_dump for fast, out-of-process DB backups (avoids the in-process ORM dump
-# that blocks the event loop and balloons memory). Client 17 dumps server 15+.
-RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client \
+# Keep system security updates and the fork's out-of-process PostgreSQL backup client.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends postgresql-client \
     && rm -rf /var/lib/apt/lists/*
+
+# The application uses .venv; unused system packaging tools are removed as upstream does.
+RUN /usr/local/bin/python -m pip uninstall -y setuptools pip
 
 RUN groupadd -g 1000 app && \
     useradd -u 1000 -g 1000 -m -s /bin/bash app

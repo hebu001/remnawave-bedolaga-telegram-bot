@@ -1,9 +1,17 @@
 """Schemas for RemnaWave management in cabinet admin panel."""
 
+import ipaddress
+import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.external.remnawave_api import (
+    INTERNAL_SQUAD_NAME_MAX_LENGTH,
+    INTERNAL_SQUAD_NAME_MIN_LENGTH,
+    INTERNAL_SQUAD_NAME_PATTERN,
+)
 
 
 # ============ Status & Connection ============
@@ -125,6 +133,9 @@ class NodeInfo(BaseModel):
     versions: dict[str, str] | None = None
     system: dict[str, Any] | None = None
     active_plugin_uuid: str | None = None
+    # [{ip, status}] — панель отдаёт адреса узла; кабинет предлагает их
+    # в GeoCheck как варианты исходного адреса.
+    ips: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class NodesListResponse(BaseModel):
@@ -172,6 +183,93 @@ class NodeActionResponse(BaseModel):
     success: bool
     message: str | None = None
     is_disabled: bool | None = None
+
+
+# ============ GeoCheck (Remnawave 3.3.0) ============
+
+# Имена сетевых интерфейсов в Linux — до 15 символов (IFNAMSIZ), но
+# VPN/bridge-обвязка иногда даёт длиннее, поэтому предел мягче. Набор
+# символов узкий намеренно: значение уходит в панель и дальше на узел.
+_INTERFACE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.@-]{0,31}$')
+
+
+class GeocheckRequest(BaseModel):
+    """С какого маршрута гонять проверку.
+
+    Пусто — маршрут узла по умолчанию. Иначе ровно одно из двух: исходный
+    IP-адрес либо сетевой интерфейс.
+    """
+
+    ip: str | None = None
+    interface: str | None = None
+
+    @field_validator('ip', 'interface', mode='before')
+    @classmethod
+    def _blank_means_default(cls, value: Any) -> Any:
+        """Пустая строка из формы — это «по умолчанию», а не значение."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator('ip')
+    @classmethod
+    def _must_be_ip_address(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError('ip must be a valid IPv4 or IPv6 address') from exc
+        return value
+
+    @field_validator('interface')
+    @classmethod
+    def _must_be_interface_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _INTERFACE_RE.match(value):
+            raise ValueError('interface must be a network interface name')
+        return value
+
+    @model_validator(mode='after')
+    def _one_route_at_most(self) -> Self:
+        if self.ip and self.interface:
+            raise ValueError('choose either ip or interface, not both')
+        return self
+
+
+class GeocheckStartResponse(BaseModel):
+    """Задача поставлена; результат забирается по job_id."""
+
+    job_id: str
+
+
+class GeocheckImage(BaseModel):
+    """SVG-отчёт в base64, готовый для data: URL."""
+
+    format: str
+    media_type: str
+    encoding: str
+    data: str
+
+
+class GeocheckResult(BaseModel):
+    """Готовый результат проверки."""
+
+    success: bool
+    node_uuid: str | None = None
+    image: GeocheckImage | None = None
+    raw_report: dict[str, Any] | None = None
+    message: str | None = None
+
+
+class GeocheckJobResponse(BaseModel):
+    """Статус задачи GeoCheck. Пока идёт проверка, result пуст."""
+
+    job_id: str
+    is_completed: bool
+    is_failed: bool
+    result: GeocheckResult | None = None
 
 
 # ============ Squads (Internal Squads) ============
@@ -238,16 +336,26 @@ class SquadDetailResponse(BaseModel):
 
 
 class SquadCreateRequest(BaseModel):
-    """Request to create a new squad."""
+    """Request to create a new squad. Имя — по правилам панели (2–30, латиница/цифры/пробел/-/_)."""
 
-    name: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(
+        ...,
+        min_length=INTERNAL_SQUAD_NAME_MIN_LENGTH,
+        max_length=INTERNAL_SQUAD_NAME_MAX_LENGTH,
+        pattern=INTERNAL_SQUAD_NAME_PATTERN,
+    )
     inbound_uuids: list[str] = Field(default_factory=list)
 
 
 class SquadUpdateRequest(BaseModel):
     """Request to update a squad."""
 
-    name: str | None = Field(None, min_length=1, max_length=255)
+    name: str | None = Field(
+        None,
+        min_length=INTERNAL_SQUAD_NAME_MIN_LENGTH,
+        max_length=INTERNAL_SQUAD_NAME_MAX_LENGTH,
+        pattern=INTERNAL_SQUAD_NAME_PATTERN,
+    )
     inbound_uuids: list[str] | None = None
 
 
@@ -255,7 +363,12 @@ class SquadActionRequest(BaseModel):
     """Request to perform squad action."""
 
     action: Literal['add_all_users', 'remove_all_users', 'delete', 'rename', 'update_inbounds']
-    name: str | None = None
+    name: str | None = Field(
+        None,
+        min_length=INTERNAL_SQUAD_NAME_MIN_LENGTH,
+        max_length=INTERNAL_SQUAD_NAME_MAX_LENGTH,
+        pattern=INTERNAL_SQUAD_NAME_PATTERN,
+    )
     inbound_uuids: list[str] | None = None
 
 

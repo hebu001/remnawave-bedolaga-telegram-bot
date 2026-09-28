@@ -23,8 +23,15 @@ from app.keyboards.inline import (
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.utils.cache import RateLimitCache, cache, cache_key
+from app.utils.formatters import format_username_link
 from app.utils.miniapp_buttons import build_admin_ticket_cabinet_button
-from app.utils.photo_message import edit_or_answer_photo
+from app.utils.photo_message import edit_or_answer_photo, safe_edit_or_resend
+from app.utils.ticket_text import (
+    TICKET_MESSAGE_MAX_LENGTH,
+    TICKET_PAGE_MAX_LEN,
+    build_ticket_pages,
+    preview_text,
+)
 from app.utils.timezone import format_local_datetime
 
 
@@ -55,7 +62,7 @@ async def show_ticket_priority_selection(
         else:
             await callback.answer(
                 texts.t('USER_BLOCKED_UNTIL', 'Вы заблокированы до {time}').format(
-                    time=blocked_until.strftime('%d.%m.%Y %H:%M')
+                    time=format_local_datetime(blocked_until, '%d.%m.%Y %H:%M')
                 ),
                 show_alert=True,
             )
@@ -128,7 +135,7 @@ async def handle_ticket_title_input(message: types.Message, state: FSMContext, d
         else:
             await message.answer(
                 texts.t('USER_BLOCKED_UNTIL', 'Вы заблокированы до {time}').format(
-                    time=blocked_until.strftime('%d.%m.%Y %H:%M')
+                    time=format_local_datetime(blocked_until, '%d.%m.%Y %H:%M')
                 )
             )
         await state.clear()
@@ -137,7 +144,9 @@ async def handle_ticket_title_input(message: types.Message, state: FSMContext, d
     await state.update_data(title=title)
 
     texts = get_texts(db_user.language)
-    text_val = texts.t('TICKET_MESSAGE_INPUT', 'Опишите проблему (до 500 символов) или отправьте фото с подписью:')
+    text_val = texts.t(
+        'TICKET_MESSAGE_INPUT', 'Опишите проблему (до {limit} символов) или отправьте фото с подписью:'
+    ).format(limit=TICKET_MESSAGE_MAX_LENGTH)
     await _edit_or_send(message, prompt_chat_id, prompt_message_id, text_val, db_user.language)
 
     await state.set_state(TicketStates.waiting_for_message)
@@ -164,8 +173,8 @@ async def handle_ticket_message_input(message: types.Message, state: FSMContext,
             # Удаляем лишние части длинного сообщения
             try:
                 asyncio.create_task(_try_delete_message_later(message.bot, message.chat.id, message.message_id, 2.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug('Антиспам тикетов: сообщение не поставлено на удаление', error=str(exc))
             return
     except Exception:
         pass
@@ -176,8 +185,8 @@ async def handle_ticket_message_input(message: types.Message, state: FSMContext,
         if last_ts and (now_ts - float(last_ts)) < 2:
             try:
                 asyncio.create_task(_try_delete_message_later(message.bot, message.chat.id, message.message_id, 2.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug('Антиспам тикетов: сообщение не поставлено на удаление', error=str(exc))
             return
         await state.update_data(rl_ts_create=now_ts)
     except Exception:
@@ -186,9 +195,6 @@ async def handle_ticket_message_input(message: types.Message, state: FSMContext,
     """Обработать ввод сообщения тикета и создать тикет"""
     # Поддержка фото: если прислали фото с подписью — берём caption, сохраняем file_id
     message_text = (message.text or message.caption or '').strip()
-    # Ограничим длину текста описания тикета, чтобы избежать проблем с caption/рендером
-    if len(message_text) > 500:
-        message_text = message_text[:500]
     media_type = None
     media_file_id = None
     media_caption = None
@@ -209,7 +215,7 @@ async def handle_ticket_message_input(message: types.Message, state: FSMContext,
             texts.t('USER_BLOCKED_FOREVER', 'Вы заблокированы для обращений в поддержку.')
             if blocked_until.year > 9999 - 1
             else texts.t('USER_BLOCKED_UNTIL', 'Вы заблокированы до {time}').format(
-                time=blocked_until.strftime('%d.%m.%Y %H:%M')
+                time=format_local_datetime(blocked_until, '%d.%m.%Y %H:%M')
             )
         )
         if prompt_chat_id and prompt_message_id:
@@ -233,6 +239,20 @@ async def handle_ticket_message_input(message: types.Message, state: FSMContext,
         err_text = texts.t(
             'TICKET_MESSAGE_TOO_SHORT', 'Сообщение слишком короткое. Опишите проблему подробнее или отправьте фото:'
         )
+        await _edit_or_send(message, prompt_chat_id, prompt_message_id, err_text, db_user.language)
+        return
+
+    # Раньше текст молча резался до 500 символов — пользователь и поддержка
+    # теряли остаток. Теперь просим сократить, ничего не отбрасывая втихую.
+    if len(message_text) > TICKET_MESSAGE_MAX_LENGTH:
+        texts = get_texts(db_user.language)
+        data_prompt = await state.get_data()
+        prompt_chat_id = data_prompt.get('prompt_chat_id')
+        prompt_message_id = data_prompt.get('prompt_message_id')
+        err_text = texts.t(
+            'TICKET_MESSAGE_TOO_LONG',
+            'Сообщение слишком длинное. Максимум {limit} символов. Сократите текст и отправьте еще раз:',
+        ).format(limit=TICKET_MESSAGE_MAX_LENGTH)
         await _edit_or_send(message, prompt_chat_id, prompt_message_id, err_text, db_user.language)
         return
 
@@ -452,68 +472,11 @@ async def show_my_tickets_closed(callback: types.CallbackQuery, db_user: User, d
     await callback.answer()
 
 
-def _split_long_block(block: str, max_len: int) -> list[str]:
-    """Разбивает слишком длинный блок на части."""
-    if len(block) <= max_len:
-        return [block]
-
-    parts = []
-    remaining = block
-    while remaining:
-        if len(remaining) <= max_len:
-            parts.append(remaining)
-            break
-        # Ищем место для разрыва (перенос строки или пробел)
-        cut_at = max_len
-        newline_pos = remaining.rfind('\n', 0, max_len)
-        space_pos = remaining.rfind(' ', 0, max_len)
-
-        if newline_pos > max_len // 2:
-            cut_at = newline_pos + 1
-        elif space_pos > max_len // 2:
-            cut_at = space_pos + 1
-
-        parts.append(remaining[:cut_at])
-        remaining = remaining[cut_at:]
-
-    return parts
-
-
-def _split_text_into_pages(header: str, message_blocks: list[str], max_len: int = 3500) -> list[str]:
-    """Разбивает текст на страницы с учётом лимита Telegram."""
-    pages: list[str] = []
-    current = header
-    header_len = len(header)
-    block_max_len = max_len - header_len - 50  # запас для безопасности
-
-    for block in message_blocks:
-        # Если блок сам по себе слишком длинный — разбиваем его
-        if len(block) > block_max_len:
-            block_parts = _split_long_block(block, block_max_len)
-            for part in block_parts:
-                if len(current) + len(part) > max_len:
-                    if current.strip() and current != header:
-                        pages.append(current)
-                    current = header + part
-                else:
-                    current += part
-        elif len(current) + len(block) > max_len:
-            if current.strip() and current != header:
-                pages.append(current)
-            current = header + block
-        else:
-            current += block
-
-    if current.strip():
-        pages.append(current)
-
-    return pages or [header]
-
-
 async def view_ticket(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Показать детали тикета с пагинацией"""
     data_str = callback.data
-    page = 1
+    # None — страница не задана: открываем последнюю, где лежат свежие сообщения
+    page = None
     ticket_id = None
     if data_str.startswith('ticket_view_page_'):
         # format: ticket_view_page_{ticket_id}_{page}
@@ -558,9 +521,9 @@ async def view_ticket(callback: types.CallbackQuery, db_user: User, db: AsyncSes
             if getattr(msg, 'has_media', False) and getattr(msg, 'media_type', None) == 'photo':
                 block += '📎 Вложение: фото\n\n'
             message_blocks.append(block)
-    pages = _split_text_into_pages(header, message_blocks, max_len=3500)
+    pages = build_ticket_pages(header, message_blocks, max_len=TICKET_PAGE_MAX_LEN)
     total_pages = len(pages)
-    page = min(page, total_pages)
+    page = total_pages if page is None else min(page, total_pages)
 
     keyboard = get_ticket_view_keyboard(
         ticket_id,
@@ -596,20 +559,11 @@ async def view_ticket(callback: types.CallbackQuery, db_user: User, db: AsyncSes
             nav_row.append(
                 types.InlineKeyboardButton(text='➡️', callback_data=f'ticket_view_page_{ticket_id}_{page + 1}')
             )
-        try:
+        if getattr(keyboard, 'inline_keyboard', None) is not None:
             keyboard.inline_keyboard.insert(0, nav_row)
-        except Exception:
-            pass
     # Показываем как текст (чтобы не упереться в caption лимит)
     page_text = pages[page - 1]
-    try:
-        await callback.message.edit_text(page_text, reply_markup=keyboard)
-    except Exception:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await callback.message.answer(page_text, reply_markup=keyboard)
+    await safe_edit_or_resend(callback.message, page_text, keyboard)
     await callback.answer()
 
 
@@ -762,8 +716,8 @@ async def handle_ticket_reply(message: types.Message, state: FSMContext, db_user
         if limited:
             try:
                 asyncio.create_task(_try_delete_message_later(message.bot, message.chat.id, message.message_id, 2.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug('Антиспам тикетов: сообщение не поставлено на удаление', error=str(exc))
             return
     except Exception:
         pass
@@ -774,20 +728,17 @@ async def handle_ticket_reply(message: types.Message, state: FSMContext, db_user
         if last_ts and (now_ts - float(last_ts)) < 2:
             try:
                 asyncio.create_task(_try_delete_message_later(message.bot, message.chat.id, message.message_id, 2.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug('Антиспам тикетов: сообщение не поставлено на удаление', error=str(exc))
             return
         await state.update_data(rl_ts_reply=now_ts)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Антиспам — вспомогательный механизм: без состояния ответ всё равно обрабатывается.
+        logger.debug('Антиспам ответа на тикет: состояние не обновлено', error=str(exc))
 
     """Обработать ответ на тикет"""
     # Поддержка фото для ответа пользователя
-    # Ограничение ответа пользователя 500 символов
     reply_text = (message.text or message.caption or '').strip()
-    # Строже режем до 400, чтобы учесть форматирование/смайлы
-    if len(reply_text) > 400:
-        reply_text = reply_text[:400]
     media_type = None
     media_file_id = None
     media_caption = None
@@ -800,6 +751,17 @@ async def handle_ticket_reply(message: types.Message, state: FSMContext, db_user
         texts = get_texts(db_user.language)
         await message.answer(
             texts.t('TICKET_REPLY_TOO_SHORT', 'Ответ должен содержать минимум 5 символов. Попробуйте еще раз:')
+        )
+        return
+
+    # Раньше ответ молча резался до 400 символов, и поддержка видела огрызок.
+    if len(reply_text) > TICKET_MESSAGE_MAX_LENGTH:
+        texts = get_texts(db_user.language)
+        await message.answer(
+            texts.t(
+                'TICKET_REPLY_TOO_LONG',
+                'Ответ слишком длинный. Максимум {limit} символов. Сократите текст и отправьте еще раз:',
+            ).format(limit=TICKET_MESSAGE_MAX_LENGTH)
         )
         return
 
@@ -996,19 +958,17 @@ async def close_ticket_notification(callback: types.CallbackQuery, db_user: User
     await callback.answer(texts.t('NOTIFICATION_CLOSED', 'Уведомление закрыто.'))
 
 
-def _build_ticket_notification_keyboard(service: AdminNotificationService, ticket: Ticket, user: User | None):
-    """Собирает клавиатуру действий для уведомления о тикете по роли получателя.
+def build_ticket_card_keyboard(ticket: Ticket, user: User | None, *, role: str):
+    """Клавиатура карточки тикета по роли получателя ('admin' / 'moderator' / 'group').
 
-    Возвращает None только для роли 'none' (посторонний в личке / строковый
-    chat_id). Для группового/супергруппа админ-чата ('group') показываем урезанный
-    набор без FSM-кнопок — «Ответить»/«Блок по времени» в общем чате не работают
-    из-за privacy mode бота, остаются надёжные URL/callback-кнопки.
+    Для группового/супергруппа админ-чата ('group') — урезанный набор без
+    FSM-кнопок: «Ответить»/«Блок по времени» в общем чате не работают из-за
+    privacy mode бота, остаются надёжные URL/callback-кнопки. Той же клавиатурой
+    карточка перерисовывается после действий в группе (закрыть, блок, разблок) —
+    иначе туда попадал экран личной админки с мёртвыми кнопками и «⬅️ Назад».
     """
     from app.config import settings
 
-    role = service.resolve_recipient_role()
-    if role == 'none':
-        return None
     # В cabinet-режиме добавляем кнопку «открыть тикет в кабинете»: web_app в личке,
     # t.me Mini App диплинк в группе (где web_app недоступен). None — если не
     # cabinet-режим / кабинет не настроен / в группе нет зарегистрированного Mini App.
@@ -1029,6 +989,15 @@ def _build_ticket_notification_keyboard(service: AdminNotificationService, ticke
         cabinet_button=cabinet_button,
         language=settings.DEFAULT_LANGUAGE,
     )
+
+
+def _build_ticket_notification_keyboard(service: AdminNotificationService, ticket: Ticket, user: User | None):
+    """Клавиатура уведомления о тикете; None только для роли 'none'
+    (посторонний в личке / строковый chat_id)."""
+    role = service.resolve_recipient_role()
+    if role == 'none':
+        return None
+    return build_ticket_card_keyboard(ticket, user, role=role)
 
 
 async def notify_admins_about_new_ticket(ticket: Ticket, db: AsyncSession):
@@ -1053,7 +1022,7 @@ async def notify_admins_about_new_ticket(ticket: Ticket, db: AsyncSession):
             user = None
         full_name = html.escape(user.full_name or '') if user else 'Unknown'
         telegram_id_display = (user.telegram_id or user.email or f'#{user.id}') if user else '—'
-        username_display = html.escape((user.username or 'отсутствует') if user else 'отсутствует')
+        username_display = format_username_link(user.username if user else None, 'отсутствует')
 
         # Загружаем первое сообщение для получения медиа и превью текста
         first_message = await TicketMessageCRUD.get_first_message(db, ticket.id)
@@ -1065,7 +1034,7 @@ async def notify_admins_about_new_ticket(ticket: Ticket, db: AsyncSession):
             media_type = first_message.media_type if first_message.has_media else None
             msg_text = (first_message.message_text or '').strip()
             if msg_text:
-                message_preview = msg_text[:200] + '...' if len(msg_text) > 200 else msg_text
+                message_preview = preview_text(msg_text)
 
         safe_title = html.escape(title) if title else '—'
 
@@ -1074,7 +1043,7 @@ async def notify_admins_about_new_ticket(ticket: Ticket, db: AsyncSession):
             f'🆔 <b>ID:</b> <code>{ticket.id}</code>\n'
             f'👤 <b>Пользователь:</b> {full_name}\n'
             f'🆔 <b>ID:</b> <code>{telegram_id_display}</code>\n'
-            f'📱 <b>Username:</b> @{username_display}\n'
+            f'📱 <b>Username:</b> {username_display}\n'
             f'📝 <b>Заголовок:</b> {safe_title}\n'
         )
 
@@ -1130,9 +1099,9 @@ async def notify_admins_about_ticket_reply(
             user = None
         full_name = html.escape(user.full_name or '') if user else 'Unknown'
         telegram_id_display = (user.telegram_id or user.email or f'#{user.id}') if user else '—'
-        username_display = html.escape((user.username or 'отсутствует') if user else 'отсутствует')
+        username_display = format_username_link(user.username if user else None, 'отсутствует')
 
-        reply_preview = reply_text[:200] + '...' if len(reply_text) > 200 else reply_text
+        reply_preview = preview_text(reply_text)
         safe_title = html.escape(title) if title else '—'
 
         notification_text = (
@@ -1141,7 +1110,7 @@ async def notify_admins_about_ticket_reply(
             f'📝 <b>Заголовок:</b> {safe_title}\n'
             f'👤 <b>Пользователь:</b> {full_name}\n'
             f'🆔 <b>ID:</b> <code>{telegram_id_display}</code>\n'
-            f'📱 <b>Username:</b> @{username_display}\n\n'
+            f'📱 <b>Username:</b> {username_display}\n\n'
             f'📩 <b>Сообщение:</b>\n{html.escape(reply_preview)}\n'
         )
 

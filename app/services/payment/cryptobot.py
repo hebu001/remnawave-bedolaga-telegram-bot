@@ -260,9 +260,7 @@ class CryptoBotPaymentMixin:
                         conversion_rate=conversion_rate,
                     )
                 except Exception as error:
-                    logger.warning(
-                        'Ошибка конвертации валют для платежа , используем курс 1:1', invoice_id=invoice_id, error=error
-                    )
+                    logger.warning('Ошибка конвертации валют — используем курс 1:1', invoice_id=invoice_id, error=error)
                     amount_rubles = amount_usd
                     amount_rubles_rounded = math.ceil(amount_rubles)
                     amount_kopeks = int(amount_rubles_rounded * 100)
@@ -371,14 +369,15 @@ class CryptoBotPaymentMixin:
                             f'🆔 Транзакция: {invoice_id[:8]}...\n\n'
                             'Баланс пополнен автоматически!'
                         )
-                        user_notification = _UserNotificationPayload(
-                            telegram_id=user.telegram_id,
-                            text=message_text,
-                            parse_mode='HTML',
-                            reply_markup=keyboard,
-                            amount_rubles=amount_rubles_rounded,
-                            asset=updated_payment.asset,
-                        )
+                        if settings.is_notifications_enabled():
+                            user_notification = _UserNotificationPayload(
+                                telegram_id=user.telegram_id,
+                                text=message_text,
+                                parse_mode='HTML',
+                                reply_markup=keyboard,
+                                amount_rubles=amount_rubles_rounded,
+                                asset=updated_payment.asset,
+                            )
                     except Exception as error:
                         logger.error('Ошибка подготовки уведомления о пополнении CryptoBot', error=error)
 
@@ -527,7 +526,7 @@ class CryptoBotPaymentMixin:
         current_balance = getattr(user, 'balance_kopeks', 0)
         if current_balance < required_balance:
             logger.warning(
-                'Недостаточно средств на балансе пользователя для завершения продления: нужно , доступно',
+                'Недостаточно средств на балансе для завершения продления',
                 user_id=user.id,
                 required_balance=required_balance,
                 current_balance=current_balance,
@@ -579,7 +578,7 @@ class CryptoBotPaymentMixin:
         balance_amount_label = settings.format_price(required_balance)
 
         logger.info(
-            'Подписка продлена через CryptoBot invoice (внешний платеж , списано с баланса)',
+            'Подписка продлена через CryptoBot invoice',
             subscription_id=subscription.id,
             invoice_id=payment.invoice_id,
             external_amount_label=external_amount_label,
@@ -636,6 +635,9 @@ class CryptoBotPaymentMixin:
                 logger.error('Ошибка отправки админ-уведомления о пополнении CryptoBot', error=error, exc_info=True)
 
     async def _deliver_user_topup_notification(self, payload: _UserNotificationPayload) -> None:
+        if not settings.is_notifications_enabled():
+            return
+
         bot_instance = getattr(self, 'bot', None)
         if not bot_instance:
             return

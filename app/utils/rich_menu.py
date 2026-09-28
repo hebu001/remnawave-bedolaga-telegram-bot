@@ -18,7 +18,7 @@ telegram-bot-api) модуль запоминает недоступность �
 
 import html
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -43,7 +43,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import User
+from app.utils.formatters import format_username_link
+from app.utils.logo_fingerprint import logo_version
 from app.utils.miniapp_buttons import build_miniapp_startapp_url
+from app.utils.rich_buttons import render_keyboard_as_rich_html
+from app.utils.subscription_time import local_days_until
 from app.utils.subscription_utils import get_happ_cryptolink_redirect_link
 from app.utils.timezone import format_local_datetime
 from app.utils.validators import sanitize_html
@@ -101,9 +105,17 @@ def _reset_rich_menu_availability() -> None:
 def _resolve_rich_logo_url() -> str:
     """Публичный URL логотипа для шапки rich-меню ('' — без логотипа).
 
-    Явный MAIN_MENU_RICH_LOGO_URL приоритетнее. Иначе, если задан WEBHOOK_URL
-    (публичный origin нашего FastAPI) и файл LOGO_FILE существует, логотип
-    отдаётся собственным эндпоинтом /cabinet/branding/bot-logo.
+    Явный MAIN_MENU_RICH_LOGO_URL приоритетнее. Значение из _LOGO_DISABLED_VALUES
+    (none/off/no/false/disabled/-) выключает логотип совсем: пустая строка занята
+    под авто-режим, поэтому при существующем LOGO_FILE шапку иначе было не убрать,
+    а «подставлю ссылку не на картинку» роняло весь rich в классику. Значение,
+    не похожее на http(s)-ссылку, трактуем так же — скачать его Telegram всё
+    равно не сможет, а меню важнее логотипа.
+
+    Иначе, если задан WEBHOOK_URL (публичный origin нашего FastAPI) и файл
+    LOGO_FILE существует, логотип отдаётся собственным эндпоинтом
+    /cabinet/branding/bot-logo?v=<отпечаток файла>. Telegram кэширует картинку
+    по адресу: без версии заменённый файл показывался старым до ручного ``?v=``.
     """
     if _logo_unavailable:
         return ''
@@ -118,7 +130,10 @@ def _resolve_rich_logo_url() -> str:
     parsed = urlparse(webhook_url)
     if not parsed.scheme or not parsed.netloc:
         return ''
-    return f'{parsed.scheme}://{parsed.netloc}/cabinet/branding/bot-logo'
+    version = logo_version(Path(settings.LOGO_FILE))
+    if version is None:
+        return ''
+    return f'{parsed.scheme}://{parsed.netloc}/cabinet/branding/bot-logo?v={version}'
 
 
 def _is_media_fetch_error(error: Exception) -> bool:
@@ -162,16 +177,27 @@ def _looks_like_unsupported(error: Exception) -> bool:
     return 'unknown method' in text or 'method not found' in text or 'text is empty' in text
 
 
-# Telegram хранит даты 32-битным unix time: tg-time со значением вне диапазона
-# сервер отклоняет ошибкой RICH_MESSAGE_DATE_INVALID и меню не отправляется.
-# Реальный кейс — «вечные» подписки, импортированные из панели с датой окончания
-# после 19.01.2038; такие даты показываем fallback-текстом без tg-time.
-_TG_TIME_MAX_UNIX = 2**31 - 1
+# Telegram принимает дату сущности только в диапазоне [0, сейчас + 1098 дней]
+# (core.telegram.org/api/entities, messageEntityFormattedDate: «time()+1098*86400»).
+# Дата за границей отклоняется ошибкой RICH_MESSAGE_DATE_INVALID, и сервер роняет
+# ВСЁ rich-сообщение, а не одну ячейку — меню целиком уходит в классический вид.
+#
+# Раньше здесь стоял предел 32-битного unix time (19.01.2038). Он ловил только
+# «вечные» подписки из панели, а лимит Telegram почти на десятилетие ближе: любая
+# подписка дальше ~3 лет вперёд ломала меню. Считаем границу от текущего момента,
+# с суточным запасом на расхождение часов с серверами Telegram.
+_TG_TIME_MAX_AHEAD = timedelta(days=1097)
 
 
 def _tg_time(moment: datetime, time_format: str, fallback: str) -> str:
-    unix_time = int(moment.timestamp())
-    if not 0 < unix_time <= _TG_TIME_MAX_UNIX:
+    try:
+        unix_time = int(moment.timestamp())
+        max_unix = int((datetime.now(UTC) + _TG_TIME_MAX_AHEAD).timestamp())
+    except (OverflowError, OSError, ValueError):
+        # datetime.max и прочие сентинелы: timestamp() на них падает на части платформ.
+        return html.escape(fallback)
+
+    if not 0 < unix_time <= max_unix:
         return html.escape(fallback)
     return f'<tg-time unix="{unix_time}" format="{time_format}">{html.escape(fallback)}</tg-time>'
 
@@ -319,7 +345,7 @@ def _build_subscriptions_table(subscriptions, texts) -> str:
         end_date = getattr(subscription, 'end_date', None)
         end_date_text = format_local_datetime(end_date, '%d.%m.%Y') if end_date else ''
         if end_date and end_date > current_time and actual_status in {'active', 'trial', 'limited'}:
-            days_left = (end_date - current_time).days
+            days_left = local_days_until(end_date, current_time)
             days_text = texts.t('MAIN_MENU_RICH_DAYS_LEFT', 'осталось {days} дн.').replace('{days}', str(days_left))
             until_cell = f'{_tg_time(end_date, "d", end_date_text)} ({html.escape(days_text)})'
         elif end_date:
@@ -451,10 +477,15 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     if logo_url:
         blocks.append(f'<img src="{html.escape(logo_url, quote=True)}"/>')
 
+    # Имя остаётся в кастомном профиле; username без имени делаем кликабельным.
+    username = getattr(user, 'username', None)
+    has_name = bool(getattr(user, 'first_name', None) or getattr(user, 'last_name', None))
+    user_name = format_username_link(username) if username and not has_name else html.escape(user.full_name or '')
+
     # Профиль (заголовок — операторский шаблон с анимированным эмодзи; имя — данные)
     profile = [
         _rich_text(texts.t('MAIN_MENU_RICH_PROFILE_HEADER', f'<b>━ {_ANIM_PROFILE} Ваш профиль ━</b>')),
-        f'<b>{html.escape(user.full_name or "")}</b>',
+        f'<b>{user_name}</b>',
     ]
     telegram_id = getattr(user, 'telegram_id', '') or ''
     if telegram_id:
@@ -502,12 +533,58 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     return ''.join(blocks)
 
 
+_TG_TIME_TAG_RE = re.compile(r'<tg-time\b[^>]*>(.*?)</tg-time>', re.DOTALL | re.IGNORECASE)
+
+
+def _is_rich_date_error(error: Exception) -> bool:
+    return 'rich_message_date_invalid' in str(error).lower()
+
+
+def _strip_tg_time(rich_html: str) -> str:
+    """Убирает теги tg-time, оставляя их текст.
+
+    Страховка от RICH_MESSAGE_DATE_INVALID: одна дата вне допустимого диапазона
+    отвергает ВСЁ rich-сообщение, а не свою ячейку. Границу мы держим сами
+    (см. _tg_time), но Telegram уже дважды оказывался строже, чем мы считали, —
+    пусть в таком случае меню теряет форматирование дат, а не уезжает в классику.
+    """
+    return _TG_TIME_TAG_RE.sub(r'\1', rich_html)
+
+
 def _input_rich_message(rich_html: str, language: str | None) -> InputRichMessage:
     return InputRichMessage(
         html=rich_html,
         is_rtl=True if (language or '').lower() in _RTL_LANGUAGES else None,
         skip_entity_detection=True,
     )
+
+
+def _apply_inline_buttons(
+    rich_html: str,
+    keyboard: InlineKeyboardMarkup,
+    *,
+    for_edit: bool = False,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Переносит клавиатуру внутрь полотна, если это включено настройкой.
+
+    Возвращает пару (html, reply_markup). При переносе клавиатуры под сообщением
+    не остаётся: дублировать кнопки незачем. Для РЕДАКТИРОВАНИЯ отдаётся пустая
+    клавиатура, а не None: у editMessageText отсутствующий reply_markup означает
+    «не трогать», и прежние кнопки остались бы висеть рядом с новыми.
+
+    Если хотя бы одну кнопку перенести нельзя, клавиатура остаётся снаружи
+    целиком — половина кнопок внутри означала бы потерянные кнопки.
+    """
+    if not settings.MAIN_MENU_RICH_INLINE_BUTTONS:
+        return rich_html, keyboard
+
+    # Главное меню всегда уходит в личный чат, поэтому Mini App здесь допустим.
+    buttons_html = render_keyboard_as_rich_html(keyboard, allow_web_app=True)
+    if buttons_html is None:
+        return rich_html, keyboard
+
+    empty = InlineKeyboardMarkup(inline_keyboard=[]) if for_edit else None
+    return rich_html + buttons_html, empty
 
 
 async def _send_rich_menu(
@@ -519,6 +596,7 @@ async def _send_rich_menu(
 ) -> None:
     global _effect_unavailable
 
+    rich_html, keyboard = _apply_inline_buttons(rich_html, keyboard)
     effect_id = (settings.MAIN_MENU_RICH_EFFECT_ID or '').strip() or None
     if _effect_unavailable:
         effect_id = None
@@ -531,6 +609,19 @@ async def _send_rich_menu(
             message_effect_id=effect_id,
         )
     except TelegramBadRequest as error:
+        if _is_rich_date_error(error):
+            logger.warning(
+                'Сервер отклонил дату в rich-меню — повтор без tg-time',
+                error=str(error),
+                chat_id=chat_id,
+            )
+            await bot.send_rich_message(
+                chat_id=chat_id,
+                rich_message=_input_rich_message(_strip_tg_time(rich_html), language),
+                reply_markup=keyboard,
+                message_effect_id=effect_id,
+            )
+            return
         # Невалидный/отключённый эффект не должен ронять rich-меню в классику —
         # повторяем без эффекта и больше его не шлём до рестарта.
         if effect_id and 'effect' in str(error).lower():
@@ -586,6 +677,15 @@ async def try_send_rich_main_menu(
     except TelegramNetworkError as error:
         logger.warning('Сетевая ошибка при отправке rich-меню', error=str(error), chat_id=chat_id)
         return False
+    except Exception:
+        # Всё, что не является ошибкой Telegram API, тоже не должно ронять хендлер.
+        # Свежий сервер может вернуть тип rich-блока, которого установленная aiogram
+        # ещё не знает: строгий discriminated union RichBlock отвергает его, aiogram
+        # оборачивает это в ClientDecodeError, а он наследуется от AiogramError, а НЕ
+        # от TelegramAPIError — то есть пролетает мимо всех except выше. Сообщение при
+        # этом уже доставлено, но пользователь не увидел бы ни rich, ни классики.
+        logger.exception('Непредвиденная ошибка rich-меню, фоллбек на классику', chat_id=chat_id)
+        return False
 
 
 async def try_answer_rich_main_menu(
@@ -626,6 +726,7 @@ async def try_edit_rich_main_menu(
 
     chat_id = message.chat.id
     language = db_user.language
+    rich_html, keyboard = _apply_inline_buttons(rich_html, keyboard, for_edit=True)
 
     is_editable_as_rich = (
         not isinstance(message, InaccessibleMessage)
@@ -674,6 +775,24 @@ async def try_edit_rich_main_menu(
     except (TelegramNotFound, TelegramBadRequest) as error:
         if 'message is not modified' in str(error).lower():
             return True
+        if _is_rich_date_error(error) and is_editable_as_rich:
+            # Та же страховка, что и в _send_rich_menu: дата вне диапазона роняет
+            # всё сообщение, поэтому повторяем один раз без tg-time.
+            logger.warning('Сервер отклонил дату в rich-меню — правка без tg-time', error=str(error))
+            try:
+                await bot(
+                    EditMessageText(
+                        chat_id=chat_id,
+                        message_id=message.message_id,
+                        rich_message=_input_rich_message(_strip_tg_time(rich_html), language),
+                        reply_markup=keyboard,
+                        parse_mode=None,
+                    )
+                )
+                return True
+            except TelegramBadRequest as retry_error:
+                logger.warning('Повтор rich-меню без tg-time не удался', error=str(retry_error))
+                return False
         if _looks_like_unsupported(error):
             _mark_rich_unavailable(error)
         elif _is_media_fetch_error(error) and _mark_logo_unavailable_once(error):
@@ -688,4 +807,13 @@ async def try_edit_rich_main_menu(
         return False
     except TelegramNetworkError as error:
         logger.warning('Сетевая ошибка при показе rich-меню', error=str(error), chat_id=chat_id)
+        return False
+    except Exception:
+        # Всё, что не является ошибкой Telegram API, тоже не должно ронять хендлер.
+        # Свежий сервер может вернуть тип rich-блока, которого установленная aiogram
+        # ещё не знает: строгий discriminated union RichBlock отвергает его, aiogram
+        # оборачивает это в ClientDecodeError, а он наследуется от AiogramError, а НЕ
+        # от TelegramAPIError — то есть пролетает мимо всех except выше. Сообщение при
+        # этом уже доставлено, но пользователь не увидел бы ни rich, ни классики.
+        logger.exception('Непредвиденная ошибка rich-меню, фоллбек на классику', chat_id=chat_id)
         return False

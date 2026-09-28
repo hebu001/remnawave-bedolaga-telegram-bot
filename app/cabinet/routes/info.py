@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.rules import get_current_rules_content, get_rules_by_language
 from app.database.models import User
+from app.services import legal_consent_service
 from app.services.faq_service import FaqService
 from app.services.privacy_policy_service import PrivacyPolicyService
 from app.services.public_offer_service import PublicOfferService
@@ -112,6 +113,14 @@ class InfoVisibilityResponse(BaseModel):
     privacy: bool
     offer: bool
     recurrent: bool
+
+
+class LegalConsentConfigResponse(BaseModel):
+    """Что показать на экране первой авторизации нового пользователя."""
+
+    required: bool
+    prechecked: bool
+    documents: list[str]
 
 
 # ============ Routes ============
@@ -289,14 +298,31 @@ async def get_recurrent_payments(
 
 
 @router.get('/service', response_model=ServiceInfoResponse)
-async def get_service_info():
-    """Get general service information."""
+async def get_service_info(
+    language: str = Query('ru', min_length=2, max_length=10),
+):
+    """Get general service information.
+
+    Название и описание берём из брендинга (MINIAPP_SERVICE_NAME_*/
+    MINIAPP_SERVICE_DESCRIPTION_*) — того же источника, что и мини-апп, чтобы
+    сервис не назывался в двух местах по-разному. Раньше здесь читались
+    SERVICE_NAME / SERVICE_DESCRIPTION / WEBSITE_URL, которых в Settings нет,
+    поэтому любой инстанс отдавал «VPN Service» с пустыми контактами.
+    """
+    requested_lang = _normalize_language_code(language)
+    branding = settings.get_miniapp_branding()
+    name = branding['service_name'].get(requested_lang) or branding['service_name']['default']
+    description = branding['service_description'].get(requested_lang) or branding['service_description']['default']
+
+    # Незаполненный контакт — это null, а не пустая строка: так отвечала прежняя
+    # версия ручки (`getattr(...) or getattr(...)`), так же поступает соседний
+    # /support-config, и только так работает клиентская проверка «контакт задан».
     return ServiceInfoResponse(
-        name=getattr(settings, 'SERVICE_NAME', None) or getattr(settings, 'BOT_NAME', 'VPN Service'),
-        description=getattr(settings, 'SERVICE_DESCRIPTION', None),
-        support_email=getattr(settings, 'SUPPORT_EMAIL', None),
-        support_telegram=getattr(settings, 'SUPPORT_USERNAME', None) or getattr(settings, 'SUPPORT_TELEGRAM', None),
-        website=getattr(settings, 'WEBSITE_URL', None),
+        name=name,
+        description=description,
+        support_email=(settings.SUPPORT_EMAIL or '').strip() or None,
+        support_telegram=(settings.SUPPORT_USERNAME or '').strip() or None,
+        website=(settings.SERVICE_WEBSITE_URL or '').strip() or None,
     )
 
 
@@ -389,6 +415,24 @@ async def get_support_config():
         # без схемы и клиент склеил бы из него битую t.me-ссылку.
         support_username=settings.get_support_contact_display() or None,
         contact_is_telegram=contact_is_telegram,
+    )
+
+
+@router.get('/legal-consent', response_model=LegalConsentConfigResponse)
+async def get_legal_consent_config(
+    language: str = Query('ru', min_length=2, max_length=10),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Нужны ли новому пользователю галочки «ознакомлен» и с чем именно.
+
+    Публичный: экран логина запрашивает это ДО авторизации. Возвращает только ключи
+    документов — тексты и ссылки на них у кабинета свои.
+    """
+    requirement = await legal_consent_service.get_requirement(db, language)
+    return LegalConsentConfigResponse(
+        required=requirement.required,
+        prechecked=requirement.prechecked,
+        documents=requirement.documents,
     )
 
 

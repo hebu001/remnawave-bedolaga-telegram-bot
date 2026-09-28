@@ -182,8 +182,8 @@ async def test_reset_intent_survives_until_all_requested_steps_succeed(
     await sync.process_renewal_sync(sub_id, session_factory=sessions, force=True)
     kwargs = context.panel.update_remnawave_user.await_args.kwargs
     assert kwargs['reset_traffic'] is False and kwargs['sync_squads'] is True
-    device_api.reset_user_traffic.assert_awaited_once_with('test-panel-user')
-    device_api.reset_user_devices.assert_awaited_once_with('test-panel-user')
+    device_api.reset_user_traffic.assert_awaited_once_with(101)
+    device_api.reset_user_devices.assert_awaited_once_with(101, strict=True)
     state = await task_state(sessions, sub_id)
     assert state['status'] == ('done' if reset_result else 'pending')
     if not reset_result:
@@ -222,3 +222,59 @@ async def test_traffic_reset_must_be_acknowledged_before_completing_intent(
         await sync.process_renewal_sync(sub_id, session_factory=sessions, force=True)
         assert (await task_state(sessions, sub_id))['status'] == 'done'
     assert await snapshot(sessions) == before
+
+
+@pytest.mark.parametrize('status', ['active', 'expired'])
+@pytest.mark.parametrize('reset_enabled', [False, True])
+async def test_paid_renewal_records_selected_reset_policy_for_active_and_expired(
+    sessions,
+    context,
+    monkeypatch,
+    status,
+    reset_enabled,
+):
+    sub_id, _ = await seed_subscription(sessions, context, status=status)
+    monkeypatch.setattr(settings, 'RESET_TRAFFIC_ON_PAYMENT', reset_enabled)
+    await queue_without_inline(sessions, context, sub_id, monkeypatch)
+    state = await task_state(sessions, sub_id)
+    assert state['reset_traffic'] is reset_enabled and state['status'] == 'pending'
+    assert len((await snapshot(sessions))['ledger']) == 1
+
+
+async def test_paid_renewal_heals_grace_echo_and_queues_reset_in_same_transaction(sessions, context, monkeypatch):
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+
+    from app.database.models import ServerSquad, Subscription
+    from app.services.grace_access_runtime import _session_to_model
+    from tests.crud.test_renewal_heals_grace_overlay_echo import _billing, _session
+
+    sub_id, _ = await seed_subscription(sessions, context)
+    now = datetime.now(UTC)
+    real_end = now - timedelta(hours=1)
+    billing = replace(
+        _billing(end_at=real_end, squads=('test-squad',), limit_gb=100), subscription_id=sub_id, remnawave_id=101
+    )
+    grace = replace(
+        _session(started_at=real_end + timedelta(seconds=30), billing_before=billing),
+        subscription_id=sub_id,
+        remnawave_id=101,
+    )
+    async with sessions() as db:
+        sub = await db.get(Subscription, sub_id)
+        sub.end_date = grace.grace_until
+        sub.connected_squads = list(grace.overlay.squad_uuids)
+        sub.traffic_limit_gb = 8
+        db.add(ServerSquad(squad_uuid='test-squad', display_name='Paid squad', is_available=True, price_kopeks=0))
+        db.add(_session_to_model(grace))
+        await db.commit()
+    monkeypatch.setattr(settings, 'RESET_TRAFFIC_ON_PAYMENT', True)
+    await queue_without_inline(sessions, context, sub_id, monkeypatch)
+    async with sessions() as db:
+        sub = await db.get(Subscription, sub_id)
+        assert sub.connected_squads == ['test-squad']
+        assert sub.traffic_limit_gb == 100
+        assert abs((sub.end_date - (now + timedelta(days=30))).total_seconds()) < 120
+    state = await task_state(sessions, sub_id)
+    assert state['status'] == 'pending' and state['reset_traffic'] is True
+    assert len((await snapshot(sessions))['ledger']) == 1

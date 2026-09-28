@@ -15,8 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import User
 from app.keyboards.inline import get_referral_keyboard
+from app.keyboards.withdrawal import get_withdrawal_request_keyboard
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
+from app.services.referral_reward_service import format_reward_total
 from app.services.referral_withdrawal_service import referral_withdrawal_service
 from app.states import ReferralWithdrawalStates
 from app.utils.photo_message import edit_or_answer_photo
@@ -59,30 +61,61 @@ async def _build_referral_info(db_user: User, db: AsyncSession, bot: Bot) -> tup
         ),
     ]
 
-    new_user_reward_template = texts.t(
-        'REFERRAL_REWARD_NEW_USER',
-        '• Бонус новому пользователю +{bonus}',
-    )
-    minimum_is_in_reward_template = '{minimum}' in new_user_reward_template
+    if settings.is_referral_levels_scheme():
+        from app.services.referral_reward_service import (
+            describe_active_levels,
+            describe_referee_bonus,
+            format_tier_progress,
+            resolve_tier_progress,
+        )
 
-    if settings.REFERRAL_MINIMUM_TOPUP_KOPEKS > 0 and not minimum_is_in_reward_template:
-        lines.append(texts.t('REFERRAL_MINIMUM_TOPUP', '• Мин пополнение от {minimum}').format(minimum=minimum_topup))
-
-    if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
-        lines.append(
-            new_user_reward_template.format(
-                bonus=new_user_bonus,
-                minimum=minimum_topup,
+        tariff_names = await _reward_tariff_names(db)
+        lines.extend(
+            f'• {line}'
+            for line in await describe_active_levels(
+                db, tariff_names=tariff_names, language=db_user.language, viewer=db_user
             )
         )
-
-    if settings.REFERRAL_INVITER_BONUS_KOPEKS > 0:
-        lines.append(
-            texts.t(
-                'REFERRAL_REWARD_INVITER',
-                '• Бонус пригласившему +{bonus}',
-            ).format(bonus=inviter_bonus)
+        referee_bonus = await describe_referee_bonus(
+            db, tariff_names=tariff_names, language=db_user.language, referrer=db_user
         )
+        if referee_bonus:
+            lines.append(
+                texts.t(
+                    'REFERRAL_REWARD_NEW_USER_LEVELS',
+                    '• Новый пользователь получает: <b>{bonus}</b>',
+                ).format(bonus=referee_bonus)
+            )
+        progress_lines = format_tier_progress(await resolve_tier_progress(db, db_user), db_user.language)
+        if progress_lines:
+            lines.extend(['', *progress_lines])
+    else:
+        new_user_reward_template = texts.t(
+            'REFERRAL_REWARD_NEW_USER',
+            '• Бонус новому пользователю +{bonus}',
+        )
+        minimum_is_in_reward_template = '{minimum}' in new_user_reward_template
+
+        if settings.REFERRAL_MINIMUM_TOPUP_KOPEKS > 0 and not minimum_is_in_reward_template:
+            lines.append(
+                texts.t('REFERRAL_MINIMUM_TOPUP', '• Мин пополнение от {minimum}').format(minimum=minimum_topup)
+            )
+
+        if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
+            lines.append(
+                new_user_reward_template.format(
+                    bonus=new_user_bonus,
+                    minimum=minimum_topup,
+                )
+            )
+
+        if settings.REFERRAL_INVITER_BONUS_KOPEKS > 0:
+            lines.append(
+                texts.t(
+                    'REFERRAL_REWARD_INVITER',
+                    '• Бонус пригласившему +{bonus}',
+                ).format(bonus=inviter_bonus)
+            )
 
     stats_text = '\n'.join(
         (
@@ -139,6 +172,27 @@ async def show_referral_info_message(message: types.Message, db_user: User, db: 
 
     referral_text, keyboard = await _build_referral_info(db_user, db, message.bot)
     await message.answer(referral_text, reply_markup=keyboard, parse_mode='HTML')
+
+
+async def _reward_tariff_names(db) -> dict[int, str]:
+    """Названия тарифов, на которые ссылаются уровни наград.
+
+    Без них описание обещает «7 дн. подписки», умалчивая, в какой тариф они лягут,
+    — а это ровно то, что настраивает админ.
+    """
+    from sqlalchemy import select
+
+    from app.database.models import Tariff
+    from app.services.referral_reward_service import ReferralRewardLevelService
+
+    configs = await ReferralRewardLevelService.get_all(db)
+    ids = {cfg.referrer_tariff_id for cfg in configs.values() if cfg.referrer_tariff_id}
+    ids |= {cfg.referee_tariff_id for cfg in configs.values() if cfg.referee_tariff_id}
+    if not ids:
+        return {}
+
+    result = await db.execute(select(Tariff.id, Tariff.name).where(Tariff.id.in_(ids)))
+    return {row.id: row.name for row in result.all()}
 
 
 async def show_referral_info(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
@@ -274,7 +328,11 @@ async def show_detailed_referral_list(callback: types.CallbackQuery, db_user: Us
             texts.t(
                 'REFERRAL_LIST_ITEM_EARNED',
                 '   💎 Заработано с него: {amount}',
-            ).format(amount=texts.format_price(referral['total_earned_kopeks']))
+            ).format(
+                amount=format_reward_total(
+                    referral['total_earned_kopeks'], referral.get('days_earned', 0), db_user.language
+                )
+            )
             + '\n'
         )
         text += (
@@ -352,28 +410,52 @@ async def show_referral_analytics(callback: types.CallbackQuery, db_user: User, 
         texts.t(
             'REFERRAL_ANALYTICS_EARNINGS_TODAY',
             '• Сегодня: {amount}',
-        ).format(amount=texts.format_price(analytics['earnings_by_period']['today']))
+        ).format(
+            amount=format_reward_total(
+                analytics['earnings_by_period']['today'],
+                (analytics.get('days_by_period') or {}).get('today', 0),
+                db_user.language,
+            )
+        )
         + '\n'
     )
     text += (
         texts.t(
             'REFERRAL_ANALYTICS_EARNINGS_WEEK',
             '• За неделю: {amount}',
-        ).format(amount=texts.format_price(analytics['earnings_by_period']['week']))
+        ).format(
+            amount=format_reward_total(
+                analytics['earnings_by_period']['week'],
+                (analytics.get('days_by_period') or {}).get('week', 0),
+                db_user.language,
+            )
+        )
         + '\n'
     )
     text += (
         texts.t(
             'REFERRAL_ANALYTICS_EARNINGS_MONTH',
             '• За месяц: {amount}',
-        ).format(amount=texts.format_price(analytics['earnings_by_period']['month']))
+        ).format(
+            amount=format_reward_total(
+                analytics['earnings_by_period']['month'],
+                (analytics.get('days_by_period') or {}).get('month', 0),
+                db_user.language,
+            )
+        )
         + '\n'
     )
     text += (
         texts.t(
             'REFERRAL_ANALYTICS_EARNINGS_QUARTER',
             '• За квартал: {amount}',
-        ).format(amount=texts.format_price(analytics['earnings_by_period']['quarter']))
+        ).format(
+            amount=format_reward_total(
+                analytics['earnings_by_period']['quarter'],
+                (analytics.get('days_by_period') or {}).get('quarter', 0),
+                db_user.language,
+            )
+        )
         + '\n\n'
     )
 
@@ -393,7 +475,9 @@ async def show_referral_analytics(callback: types.CallbackQuery, db_user: User, 
                 ).format(
                     index=i,
                     name=html_escape(str(ref['referral_name'] or '')),
-                    amount=texts.format_price(ref['total_earned_kopeks']),
+                    amount=format_reward_total(
+                        ref['total_earned_kopeks'], ref.get('total_earned_days', 0), db_user.language
+                    ),
                     count=ref['earnings_count'],
                 )
                 + '\n'
@@ -415,7 +499,7 @@ async def show_referral_analytics(callback: types.CallbackQuery, db_user: User, 
     await callback.answer()
 
 
-async def create_invite_message(callback: types.CallbackQuery, db_user: User):
+async def create_invite_message(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     texts = get_texts(db_user.language)
 
     if not db_user.referral_code:
@@ -426,8 +510,24 @@ async def create_invite_message(callback: types.CallbackQuery, db_user: User):
     bot_referral_link = settings.get_bot_referral_link(db_user.referral_code, bot_username)
     cabinet_referral_link = settings.get_cabinet_referral_link(db_user.referral_code)
 
+    # Обещание в приглашении обязано совпадать с тем, что реально начислят.
+    # В многоуровневой схеме бонус приглашённому задаётся уровнем, а легаси-ключ
+    # ничем не управляет — пообещать по нему значит отправить другу неправду.
     bonus_block = ''
-    if settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
+    if settings.is_referral_levels_scheme():
+        from app.services.referral_reward_service import describe_referee_bonus
+
+        # Текст пересылают другу, и обещание в нём — про бонус ЭТОГО приглашающего:
+        # в режиме рангов сумма зависит от его ранга, а не от стартового.
+        referee_bonus = await describe_referee_bonus(
+            db, tariff_names=await _reward_tariff_names(db), language=db_user.language, referrer=db_user
+        )
+        if referee_bonus:
+            bonus_block = '\n\n' + texts.t(
+                'REFERRAL_INVITE_BONUS_LEVELS',
+                '💎 Твой бонус за регистрацию по ссылке: {bonus}',
+            ).format(bonus=referee_bonus)
+    elif settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS > 0:
         bonus_block = '\n\n' + texts.t(
             'REFERRAL_INVITE_BONUS',
             '💎 При первом пополнении от {minimum} ты получишь {bonus} бонусом на баланс!',
@@ -768,25 +868,14 @@ async def confirm_withdrawal_request(callback: types.CallbackQuery, db_user: Use
 {referral_withdrawal_service.format_analysis_for_admin(analysis)}
 """
 
-    # Формируем клавиатуру - кнопка профиля только для Telegram-пользователей
-    keyboard_rows = [
-        [
-            types.InlineKeyboardButton(text='✅ Одобрить', callback_data=f'admin_withdrawal_approve_{request.id}'),
-            types.InlineKeyboardButton(text='❌ Отклонить', callback_data=f'admin_withdrawal_reject_{request.id}'),
-        ]
-    ]
-    if db_user.telegram_id:
-        keyboard_rows.append(
-            [
-                types.InlineKeyboardButton(
-                    text='👤 Профиль пользователя', callback_data=f'admin_user_{db_user.telegram_id}'
-                )
-            ]
-        )
-    admin_keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    # Кнопки — по роли получателя: в группе только действия, в личке админа ещё
+    # профиль (по id из базы: у callback admin_user_<telegram_id> обработчика нет).
+    notification_service = AdminNotificationService(callback.bot)
+    admin_keyboard = get_withdrawal_request_keyboard(
+        request.id, request.status, user_db_id=db_user.id, role=notification_service.resolve_recipient_role()
+    )
 
     try:
-        notification_service = AdminNotificationService(callback.bot)
         await notification_service.send_admin_notification(
             admin_text, reply_markup=admin_keyboard, category=NotificationCategory.PARTNERS
         )
@@ -795,7 +884,12 @@ async def confirm_withdrawal_request(callback: types.CallbackQuery, db_user: Use
 
     # Уведомление в топик, если настроено
     topic_id = settings.REFERRAL_WITHDRAWAL_NOTIFICATIONS_TOPIC_ID
-    if topic_id and settings.ADMIN_NOTIFICATIONS_CHAT_ID:
+    if (
+        topic_id
+        and settings.ADMIN_NOTIFICATIONS_CHAT_ID
+        and settings.ADMIN_NOTIFICATIONS_ENABLED
+        and settings.ADMIN_NOTIFICATIONS_PARTNERS_ENABLED
+    ):
         try:
             await callback.bot.send_message(
                 chat_id=settings.ADMIN_NOTIFICATIONS_CHAT_ID,

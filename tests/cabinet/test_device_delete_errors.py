@@ -25,23 +25,21 @@ def panel(monkeypatch):
 
     monkeypatch.setattr(RemnaWaveService, 'get_api_client', client)
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda _: True)
-    subscription = SimpleNamespace(id=42, user_id=7, remnawave_uuid='selected-subscription-uuid')
+    subscription = SimpleNamespace(id=42, user_id=7, remnawave_id=42)
     resolver = AsyncMock(return_value=subscription)
     monkeypatch.setattr(subscription_crud, 'get_subscription_by_id_for_user', resolver)
-    return SimpleNamespace(
-        api=api, user=SimpleNamespace(id=7, remnawave_uuid='other-subscription-uuid'), resolver=resolver
-    )
+    return SimpleNamespace(api=api, user=SimpleNamespace(id=7, remnawave_id=7), resolver=resolver)
 
 
 async def delete(panel):
     return await devices.delete_device('TARGET', subscription_id=42, user=panel.user, db=AsyncMock())
 
 
-async def test_delete_uses_selected_subscription_uuid_and_owner(panel):
+async def test_delete_uses_selected_subscription_id_and_owner(panel):
     assert (await delete(panel))['success'] is True
     assert panel.resolver.await_args.args[1:] == (42, 7)
     panel.api._make_request.assert_awaited_once_with(
-        'POST', '/api/hwid/devices/delete', data={'userUuid': 'selected-subscription-uuid', 'hwid': 'TARGET'}
+        'POST', '/api/hwid/devices/delete', data={'userId': 42, 'hwid': 'TARGET'}
     )
 
 
@@ -53,8 +51,8 @@ async def test_foreign_subscription_never_reaches_panel(panel):
     panel.api._make_request.assert_not_awaited()
 
 
-async def test_missing_multi_tariff_uuid_does_not_fall_back_to_another_tariff(panel):
-    panel.resolver.return_value.remnawave_uuid = None
+async def test_missing_multi_tariff_id_does_not_fall_back_to_another_tariff(panel):
+    panel.resolver.return_value.remnawave_id = None
     with pytest.raises(HTTPException) as error:
         await delete(panel)
     assert error.value.status_code == 400
@@ -114,7 +112,7 @@ async def test_legacy_ack_requires_a_successful_read_confirmation(panel):
         {'response': {'total': 1, 'devices': [{'hwid': 'OTHER'}]}},
     ]
     assert (await delete(panel))['success'] is True
-    assert panel.api._make_request.await_args.args == ('GET', '/api/hwid/devices/selected-subscription-uuid')
+    assert panel.api._make_request.await_args.args == ('GET', '/api/hwid/devices/42')
 
 
 async def test_legacy_ack_verification_failure_does_not_return_success(panel):
@@ -124,20 +122,39 @@ async def test_legacy_ack_verification_failure_does_not_return_success(panel):
     assert error.value.status_code == 502
 
 
-@pytest.mark.parametrize('target_on_last_page', [False, True])
-async def test_paginated_confirmation_checks_last_page(panel, target_on_last_page):
+@pytest.mark.parametrize('target_in_list', [False, True])
+async def test_complete_large_confirmation_is_not_paginated(panel, target_in_list):
     panel.api._make_request.side_effect = [
         {'response': {}},
-        {'response': {'total': 1001, 'devices': [{'hwid': f'OTHER-{i}'} for i in range(1000)]}},
-        {'response': {'total': 1001, 'devices': [{'hwid': 'TARGET' if target_on_last_page else 'LAST'}]}},
+        {
+            'response': {
+                'total': 1001,
+                'devices': [
+                    *[{'hwid': f'OTHER-{i}'} for i in range(1000)],
+                    {'hwid': 'TARGET' if target_in_list else 'LAST'},
+                ],
+            }
+        },
     ]
-    if target_on_last_page:
+    if target_in_list:
         with pytest.raises(HTTPException) as error:
             await delete(panel)
         assert error.value.status_code == 502
     else:
         assert (await delete(panel))['success'] is True
-    assert panel.api._make_request.await_args.kwargs == {'params': {'start': 1000, 'size': 1000}}
+    panel.api._make_request.assert_awaited_with('GET', '/api/hwid/devices/42')
+    assert panel.api._make_request.await_count == 2
+
+
+async def test_incomplete_per_user_list_is_not_guessed_complete(panel):
+    panel.api._make_request.side_effect = [
+        {'response': {}},
+        {'response': {'total': 1001, 'devices': [{'hwid': f'OTHER-{i}'} for i in range(1000)]}},
+    ]
+    with pytest.raises(HTTPException) as error:
+        await delete(panel)
+    assert error.value.status_code == 502
+    assert panel.api._make_request.await_count == 2
 
 
 async def test_ack_followed_by_404_confirms_absence(panel):

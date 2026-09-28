@@ -4,7 +4,7 @@ Fixtures for promocode and promo group testing
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -137,7 +137,7 @@ def mock_db_session():
     db.refresh = AsyncMock()
     db.get = AsyncMock()
     db.execute = AsyncMock()
-    db.add = AsyncMock()
+    db.add = MagicMock()
     return db
 
 

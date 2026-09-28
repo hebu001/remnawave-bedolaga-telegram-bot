@@ -47,13 +47,17 @@ def _client_decode(link):
     [
         (
             None,
-            'incy://crypt1/AAECAwQFBgcICQoLNyIQL3rDwRZqnyoD8pGKSKPC6cwYYSGTUS2WdprHS29w'
-            '--pBBBFIhIpSLvvwHXDaBqJue4eaWWshTVAUaBuP',
+            (
+                'incy://crypt1/AAECAwQFBgcICQoLNyIQL3rDwRZqnyoD8pGKSKPC6cwYYSGTUS2WdprHS29w'
+                '--pBBBFIhIpSLvvwHXDaBqJue4eaWWshTVAUaBuP'
+            ),
         ),
         (
             'EvoVPN ✨',
-            'incy://crypt1/AAECAwQFBgcICQoLNyILfyzDvkJtvQ49oUk5z-SWqtQaYWaHByCRdsXHBCJw'
-            '__BDWFMXw4gEPaq-A37UQaed-C2RO_IJIO6vVTWRqXF5ZN_tWHFgFF7vLXrp-Zg',
+            (
+                'incy://crypt1/AAECAwQFBgcICQoLNyILfyzDvkJtvQ49oUk5z-SWqtQaYWaHByCRdsXHBCJw'
+                '__BDWFMXw4gEPaq-A37UQaed-C2RO_IJIO6vVTWRqXF5ZN_tWHFgFF7vLXrp-Zg'
+            ),
         ),
     ],
     ids=['without-brand', 'unicode-brand'],

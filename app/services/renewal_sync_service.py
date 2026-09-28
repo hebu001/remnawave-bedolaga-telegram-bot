@@ -110,7 +110,7 @@ async def process_renewal_sync(subscription_id: int, *, session_factory=None, fo
                 service = SubscriptionService()
                 async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
                     should_create = (
-                        not sub.remnawave_uuid if settings.is_multi_tariff_enabled() else not sub.user.remnawave_uuid
+                        not sub.remnawave_id if settings.is_multi_tariff_enabled() else not sub.user.remnawave_id
                     )
                     if should_create:
                         result = await service.create_remnawave_user(
@@ -134,18 +134,18 @@ async def process_renewal_sync(subscription_id: int, *, session_factory=None, fo
 
                         await db.refresh(sub)
                         await db.refresh(sub, ['user'])
-                        panel_uuid = (
-                            sub.remnawave_uuid if settings.is_multi_tariff_enabled() else sub.user.remnawave_uuid
+                        panel_user_id = (
+                            sub.remnawave_id if settings.is_multi_tariff_enabled() else sub.user.remnawave_id
                         )
-                        if not panel_uuid:
-                            raise RenewalSyncUnavailable('panel_uuid_missing')
+                        if not panel_user_id:
+                            raise RenewalSyncUnavailable('panel_user_id_missing')
                         async with RemnaWaveService().get_api_client() as api:
                             # SubscriptionService's reset helper is best effort
                             # and swallows failures. Durable intents require an
                             # explicit acknowledgement for every requested step.
-                            if reset_traffic and not await api.reset_user_traffic(panel_uuid):
+                            if reset_traffic and not await api.reset_user_traffic(panel_user_id):
                                 raise RenewalSyncUnavailable('traffic_reset_failed')
-                            if reset_devices and not await api.reset_user_devices(panel_uuid):
+                            if reset_devices and not await api.reset_user_devices(panel_user_id, strict=True):
                                 raise RenewalSyncUnavailable('device_reset_failed')
             except asyncio.CancelledError:
                 await db.rollback()

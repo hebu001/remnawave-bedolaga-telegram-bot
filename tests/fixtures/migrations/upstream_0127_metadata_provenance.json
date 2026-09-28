@@ -1,0 +1,10 @@
+{
+  "commit": "877690a7039d1326b2c00eda3e297879b80c0678",
+  "model_path": "app/database/models.py",
+  "models_sha256": "7fb15b68a0f1470adfae89b4c4305d34c7c05a169045ebf9359fdbd8029a4811",
+  "runner_path": "app/database/migrations.py",
+  "runner_sha256": "06709d7f26f17d2531a49b5560f4e9038a5203d6b6c61f432798b90ef321c1ea",
+  "sql_sha256": "40311d8710689db714a16566f3ad4d141f3441c2d4014e6badee11e5d2b97e91",
+  "generator": "Pinned module Base.metadata.create_all on SQLAlchemy 2.0.52 create_mock_engine(postgresql), plus exact pinned PostgreSQL runtime guard and fresh stamp0127. No built-in reminder seed: upstream bootstrap skips historical DDL.",
+  "table_count": 124
+}

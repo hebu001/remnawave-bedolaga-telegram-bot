@@ -1,6 +1,7 @@
 """Frozen synthetic fork fixtures; never import application models to build history."""
 
 import ast
+import asyncio
 import hashlib
 import json
 import os
@@ -52,7 +53,7 @@ async def database(profile='fresh', seed=True):
     url = make_url(os.environ['TEST_POSTGRES_URL'])
     socket = Path(url.query.get('host', ''))
     assert url.host == '127.0.0.1' and url.username == 'bot_custom_baseline'
-    assert str(socket).startswith('/private/tmp/bot-custom-pg-') and socket.is_dir()
+    assert str(socket).startswith('/private/tmp/bot-custom-pg-') and await asyncio.to_thread(socket.is_dir)
     schema = 'bridge_' + uuid4().hex
     admin = create_async_engine(url, poolclass=NullPool)
     async with admin.begin() as connection:
@@ -114,6 +115,14 @@ def combined_graph(tmp_path):
     upstream = FIXTURES / 'upstream_4_15_0'
     provenance = json.loads((upstream / 'provenance.json').read_text())
     assert provenance['commit'] == UPSTREAM
+    # Keep the phase-2 proof graph frozen even after runtime integration adds
+    # descendants. Its merge is intentionally a no-op DDL proof, not current head.
+    allowed = set(provenance['common_ast_sha256']) | {
+        path.name for path in (graph / 'versions').glob('evo_010[1-6]_*.py')
+    }
+    for path in (graph / 'versions').glob('*.py'):
+        if path.name not in allowed:
+            path.unlink()
     for name, expected in provenance['common_ast_sha256'].items():
         assert (
             hashlib.sha256(ast.dump(ast.parse((graph / 'versions' / name).read_bytes())).encode()).hexdigest()

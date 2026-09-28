@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import secrets
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.models import GuestPurchase
+from app.database.models import GuestPurchase, GuestPurchaseStatus
+from app.utils.gift_links import InvalidGiftTokenError, parse_gift_claim_input
+
+
+logger = structlog.get_logger(__name__)
 
 
 GIFT_CLAIM_CODE_BYTES = 9
@@ -94,17 +99,21 @@ async def get_gift_by_claim_identifier(
     perform an exact indexed lookup. Token-prefix matching exists only for
     already issued legacy links.
     """
-    identifier = identifier.strip()
+    try:
+        identifier = parse_gift_claim_input(identifier, allow_claim_code=True)
+    except InvalidGiftTokenError:
+        return None
     if not is_supported_gift_claim_identifier(identifier):
         return None
 
     if len(identifier) == GIFT_CLAIM_CODE_LENGTH:
-        # Prefer the exact public code. If it does not exist, fall back to links
-        # created before claim_code was introduced; those exposed the first 12
-        # characters of the internal token.
+        # Exact public codes win. Only explicitly migrated aliases may use an
+        # old 12-character payment-token prefix; new gifts never acquire one.
         exact_statement = (
             select(GuestPurchase)
-            .options(selectinload(GuestPurchase.tariff))
+            .options(
+                selectinload(GuestPurchase.tariff), selectinload(GuestPurchase.buyer), selectinload(GuestPurchase.user)
+            )
             .where(GuestPurchase.claim_code == identifier, GuestPurchase.is_gift.is_(True))
             .limit(1)
         )
@@ -114,15 +123,17 @@ async def get_gift_by_claim_identifier(
         exact_match = exact_result.scalar_one_or_none()
         if exact_match is not None:
             return exact_match
-        token_filter = GuestPurchase.token.startswith(identifier)
+        token_filter = GuestPurchase.legacy_claim_prefix == identifier
     elif len(identifier) >= 64:
         token_filter = GuestPurchase.token == identifier
     else:
-        token_filter = GuestPurchase.token.startswith(identifier)
+        token_filter = GuestPurchase.token.startswith(identifier, autoescape=True)
 
     statement = (
         select(GuestPurchase)
-        .options(selectinload(GuestPurchase.tariff))
+        .options(
+            selectinload(GuestPurchase.tariff), selectinload(GuestPurchase.buyer), selectinload(GuestPurchase.user)
+        )
         .where(token_filter, GuestPurchase.is_gift.is_(True))
         .limit(2)
     )
@@ -134,3 +145,180 @@ async def get_gift_by_claim_identifier(
     if len(matches) != 1:
         return None
     return matches[0]
+
+
+class GiftClaimError(Exception):
+    """Base exception for domain-level gift claim errors."""
+
+
+class GiftClaimNotFoundError(GiftClaimError, ValueError):
+    """Raised when a gift cannot be found by token/code, or input is malformed/short."""
+
+
+class GiftClaimSelfActivationError(GiftClaimError, ValueError):
+    """Raised when the buyer attempts to activate their own gift."""
+
+
+class GiftClaimAlreadyOwnedError(GiftClaimError, ValueError):
+    """Raised when a gift is already claimed by or bound to another user."""
+
+
+class GiftClaimNotActivatableError(GiftClaimError, ValueError):
+    """Raised when a gift is in an unclaimable status (e.g. FAILED, PENDING, REFUNDED)."""
+
+
+async def claim_gift_for_user(
+    db: AsyncSession,
+    claimant_user_id: int,
+    claim_input: str,
+    *,
+    allow_legacy_short: bool = False,
+) -> GuestPurchase:
+    """Claim and activate a gift subscription for an authenticated user.
+
+    Args:
+        db: AsyncSession database session.
+        claimant_user_id: Internal ID of the claiming User (recipient).
+        claim_input: Raw code, URL, deep link, or token provided by claimant.
+        allow_legacy_short: Retained for caller compatibility. Only exact 12-character
+            claim codes, recorded legacy aliases, or >=48-character token forms resolve.
+
+    Returns:
+        The activated GuestPurchase in DELIVERED status.
+
+    Raises:
+        GiftClaimNotFoundError: If input is invalid, malformed, or purchase does not exist.
+        GiftClaimSelfActivationError: If the buyer attempts to activate their own gift.
+        GiftClaimAlreadyOwnedError: If the gift is already bound to or claimed by someone else.
+        GiftClaimNotActivatableError: If the gift is in a non-activatable status.
+        GuestPurchaseError: If underlying subscription provisioning fails.
+    """
+    # Parsing permits exact claim codes independently of the legacy token
+    # threshold. The resolver never performs a short prefix search on new gifts.
+    purchase = await get_gift_by_claim_identifier(db, claim_input, for_update=True)
+
+    if purchase is None or not purchase.is_gift:
+        raise GiftClaimNotFoundError('Gift not found')
+
+    # Buyer self-activation guard
+    if purchase.buyer_user_id is not None and purchase.buyer_user_id == claimant_user_id:
+        raise GiftClaimSelfActivationError('Buyer cannot claim their own gift')
+
+    # Ownership guard: already bound/owned by a different user
+    if purchase.user_id is not None and purchase.user_id != claimant_user_id:
+        raise GiftClaimAlreadyOwnedError('Gift already claimed by another user')
+
+    # Idempotent return if already delivered to the same user
+    if purchase.status == GuestPurchaseStatus.DELIVERED.value:
+        return purchase
+
+    # Validate activatable status
+    activatable_statuses = {
+        GuestPurchaseStatus.PENDING_ACTIVATION.value,
+        GuestPurchaseStatus.PAID.value,
+    }
+    if purchase.status not in activatable_statuses:
+        raise GiftClaimNotActivatableError('Gift is not in activatable status')
+
+    # Bind unowned gift to claimant
+    if purchase.user_id is None:
+        purchase.user_id = claimant_user_id
+
+    # Transition PAID -> PENDING_ACTIVATION
+    if purchase.status == GuestPurchaseStatus.PAID.value:
+        purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
+
+    await db.flush()
+
+    logger.info(
+        'Claiming gift for user',
+        purchase_id=purchase.id,
+        claimant_user_id=claimant_user_id,
+    )
+
+    from app.services import guest_purchase_service
+
+    activated_purchase = await guest_purchase_service.activate_purchase(db, purchase.token, skip_notification=True)
+    if isinstance(activated_purchase, GuestPurchase):
+        return activated_purchase
+    return purchase
+
+
+async def claim_bound_gift_for_user(
+    db: AsyncSession,
+    claimant_user_id: int,
+    purchase_id: int,
+) -> GuestPurchase:
+    """Activate an already bound gift subscription by purchase ID (directed callback).
+
+    Args:
+        db: AsyncSession database session.
+        claimant_user_id: Internal ID of the claiming User.
+        purchase_id: Primary key of the GuestPurchase row.
+
+    Returns:
+        The activated GuestPurchase in DELIVERED status.
+
+    Raises:
+        GiftClaimNotFoundError: If purchase does not exist.
+        GiftClaimSelfActivationError: If the buyer attempts to activate their own gift.
+        GiftClaimAlreadyOwnedError: If the gift is not bound to claimant_user_id.
+        GiftClaimNotActivatableError: If the gift is in a non-activatable status.
+        GuestPurchaseError: If underlying subscription provisioning fails.
+    """
+    result = await db.execute(
+        select(GuestPurchase)
+        .options(
+            selectinload(GuestPurchase.tariff),
+            selectinload(GuestPurchase.buyer),
+            selectinload(GuestPurchase.user),
+        )
+        .where(
+            GuestPurchase.id == purchase_id,
+            GuestPurchase.is_gift.is_(True),
+        )
+        .with_for_update()
+    )
+    purchase = result.scalars().first()
+
+    if purchase is None or not purchase.is_gift:
+        raise GiftClaimNotFoundError('Gift not found')
+
+    # Buyer self-activation guard
+    if purchase.buyer_user_id is not None and purchase.buyer_user_id == claimant_user_id:
+        raise GiftClaimSelfActivationError('Buyer cannot claim their own gift')
+
+    # Must be bound to claimant
+    if purchase.user_id is None or purchase.user_id != claimant_user_id:
+        raise GiftClaimAlreadyOwnedError('Gift is not bound to this user')
+
+    # Idempotent return if already delivered to the same user
+    if purchase.status == GuestPurchaseStatus.DELIVERED.value:
+        return purchase
+
+    # Validate activatable status
+    activatable_statuses = {
+        GuestPurchaseStatus.PENDING_ACTIVATION.value,
+        GuestPurchaseStatus.PAID.value,
+    }
+    if purchase.status not in activatable_statuses:
+        raise GiftClaimNotActivatableError('Gift is not in activatable status')
+
+    # Transition PAID -> PENDING_ACTIVATION if needed
+    if purchase.status == GuestPurchaseStatus.PAID.value:
+        purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
+
+    await db.flush()
+
+    logger.info(
+        'Claiming directed bound gift for user',
+        purchase_id=purchase.id,
+        claimant_user_id=claimant_user_id,
+    )
+
+    from app.services import guest_purchase_service
+
+    activated_purchase = await guest_purchase_service.activate_purchase(db, purchase.token, skip_notification=True)
+    if isinstance(activated_purchase, GuestPurchase):
+        return activated_purchase
+    return purchase

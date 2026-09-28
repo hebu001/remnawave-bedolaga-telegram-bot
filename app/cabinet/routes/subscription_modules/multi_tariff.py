@@ -13,11 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.crud.subscription import (
-    decrement_subscription_server_counts,
     get_all_subscriptions_by_user_id,
     get_subscription_by_id_for_user,
 )
 from app.database.models import SubscriptionStatus, User
+from app.utils.legacy_subscription import is_legacy_subscription
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 
@@ -43,6 +43,9 @@ class SubscriptionListItem(BaseModel):
     is_daily_paused: bool = False
     autopay_enabled: bool = False
     connected_squads: list[str] | None = None
+    # Старая подписка (платная, без тарифа при включённых тарифах): продления
+    # и автоплатежа нет, карточка ведёт на выбор тарифа.
+    requires_tariff_selection: bool = False
 
 
 class SubscriptionsListResponse(BaseModel):
@@ -70,6 +73,7 @@ def _subscription_to_list_item(sub) -> SubscriptionListItem:
         is_daily=bool(sub.tariff and getattr(sub.tariff, 'is_daily', False)),
         is_daily_paused=bool(getattr(sub, 'is_daily_paused', False)),
         autopay_enabled=sub.autopay_enabled or False,
+        requires_tariff_selection=is_legacy_subscription(sub),
         connected_squads=sub.connected_squads,
     )
 
@@ -129,65 +133,15 @@ async def delete_subscription(
             detail='Only expired or disabled subscriptions can be deleted',
         )
 
-    from app.services.grace_access_runtime import (
-        GraceAccessDeletionBlocked,
-        ensure_no_open_grace_for_subscriptions,
-    )
+    from app.services.grace_access_runtime import GraceAccessDeletionBlocked
+    from app.services.subscription_deletion_service import delete_subscription_record
 
     try:
-        await ensure_no_open_grace_for_subscriptions(db, (subscription.id,))
+        await delete_subscription_record(db, subscription, deleted_by='user')
     except GraceAccessDeletionBlocked as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail='Temporary renewal access is still active. Finish or restore grace access before deletion.',
         ) from error
-
-    # Best-effort: stop Platega SBP autopay before the row disappears — the
-    # platega_subscriptions record CASCADE-deletes with it, so cancelling
-    # after the delete would find nothing to cancel on Platega's side.
-    # NOTE: this commits its own transaction internally, which releases the
-    # grace-guard's Postgres advisory lock acquired just above. It therefore
-    # runs BEFORE any irreversible panel/DB step, and the guard is
-    # re-acquired immediately below — closing that window before anything
-    # that can't be undone happens.
-    from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
-
-    await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
-
-    try:
-        await ensure_no_open_grace_for_subscriptions(db, (subscription.id,))
-    except GraceAccessDeletionBlocked as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail='Temporary renewal access is still active. Finish or restore grace access before deletion.',
-        ) from error
-
-    # Delete from RemnaWave panel (stops webhooks / phantom notifications)
-    if subscription.remnawave_uuid:
-        try:
-            from app.services.remnawave_webhook_service import RemnaWaveWebhookService
-            from app.services.subscription_service import SubscriptionService
-
-            # Suppress the self-inflicted user.deleted webhook so its sibling-expiry
-            # sweep never touches the user's other (still-active) subscriptions.
-            RemnaWaveWebhookService.mark_intentional_panel_deletion(panel_uuids=[subscription.remnawave_uuid])
-            service = SubscriptionService()
-            await service.delete_remnawave_user(subscription.remnawave_uuid)
-        except Exception as e:
-            logger.warning('Failed to delete RemnaWave user on subscription delete', error=e)
-
-    # Decrement server counts
-    await decrement_subscription_server_counts(db, subscription)
-
-    # Delete the subscription
-    await db.delete(subscription)
-    await db.commit()
-
-    logger.info(
-        'Subscription deleted by user',
-        subscription_id=subscription_id,
-        user_id=user.id,
-        tariff_id=subscription.tariff_id,
-    )
 
     return {'message': 'Subscription deleted'}

@@ -17,7 +17,7 @@ Route function is called directly (no HTTP client), mirroring
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.cabinet.routes.subscription_modules import autopay as route
 from app.cabinet.schemas.subscription import AutopayUpdateRequest
@@ -44,6 +44,9 @@ def _subscription(**overrides) -> SimpleNamespace:
 async def test_enable_autopay_cancels_active_sbp_recurring(monkeypatch):
     subscription = _subscription()
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
 
     async def fake_resolve(resolve_db, u, subscription_id):
         assert resolve_db is db
@@ -75,6 +78,9 @@ async def test_disable_autopay_does_not_cancel_sbp(monkeypatch):
     triggers the reverse mutual-exclusion cancel."""
     subscription = _subscription(autopay_enabled=True)
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
 
     async def fake_resolve(resolve_db, u, subscription_id):
         return subscription
@@ -107,6 +113,9 @@ async def test_enable_autopay_rejected_for_trial_does_not_cancel_sbp(monkeypatch
 
     subscription = _subscription(is_trial=True)
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
 
     async def fake_resolve(resolve_db, u, subscription_id):
         return subscription

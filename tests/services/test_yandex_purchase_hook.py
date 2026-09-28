@@ -32,7 +32,7 @@ async def test_passes_cid_through_to_store_and_fires_purchase() -> None:
     with (
         patch.object(yandex_conv, '_is_enabled', return_value=True),
         patch.object(yandex_conv, 'store_cid', AsyncMock(return_value=True)) as store_mock,
-        patch.object(yandex_conv, 'spawn_bg') as spawn_mock,
+        patch.object(yandex_conv, 'spawn_bg', side_effect=lambda coroutine: coroutine.close()) as spawn_mock,
         patch.object(yandex_conv, 'fire_purchase_bg') as fire_mock,
         patch.object(yandex_conv, 'AsyncSessionLocal') as session_local,
     ):
@@ -58,7 +58,7 @@ async def test_no_cid_still_fires_purchase_event() -> None:
     with (
         patch.object(yandex_conv, '_is_enabled', return_value=True),
         patch.object(yandex_conv, 'store_cid', AsyncMock(return_value=True)) as store_mock,
-        patch.object(yandex_conv, 'spawn_bg') as spawn_mock,
+        patch.object(yandex_conv, 'spawn_bg', side_effect=lambda coroutine: coroutine.close()) as spawn_mock,
         patch.object(yandex_conv, 'fire_purchase_bg') as fire_mock,
         patch.object(yandex_conv, 'AsyncSessionLocal') as session_local,
     ):
@@ -78,7 +78,7 @@ async def test_disabled_feature_skips_everything() -> None:
     with (
         patch.object(yandex_conv, '_is_enabled', return_value=False),
         patch.object(yandex_conv, 'store_cid', AsyncMock()) as store_mock,
-        patch.object(yandex_conv, 'spawn_bg') as spawn_mock,
+        patch.object(yandex_conv, 'spawn_bg', side_effect=lambda coroutine: coroutine.close()) as spawn_mock,
         patch.object(yandex_conv, 'fire_purchase_bg') as fire_mock,
     ):
         await yandex_conv.store_cid_and_fire_purchase(user_id=42, cid='abc1234567890.0987654321', amount_kopeks=29900)
@@ -95,7 +95,7 @@ async def test_store_failure_does_not_block_purchase_event() -> None:
     with (
         patch.object(yandex_conv, '_is_enabled', return_value=True),
         patch.object(yandex_conv, 'store_cid', AsyncMock(side_effect=Exception('db down'))),
-        patch.object(yandex_conv, 'spawn_bg') as spawn_mock,
+        patch.object(yandex_conv, 'spawn_bg', side_effect=lambda coroutine: coroutine.close()) as spawn_mock,
         patch.object(yandex_conv, 'fire_purchase_bg') as fire_mock,
         patch.object(yandex_conv, 'AsyncSessionLocal') as session_local,
     ):

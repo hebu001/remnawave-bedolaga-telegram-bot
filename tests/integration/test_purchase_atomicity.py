@@ -76,7 +76,7 @@ async def context(sessions, monkeypatch):
             device_price_kopeks=1000,
             allowed_squads=['test-squad'],
         )
-        user = User(telegram_id=1001, balance_kopeks=50000, remnawave_uuid='test-panel-user')
+        user = User(telegram_id=1001, balance_kopeks=50000, remnawave_uuid='test-panel-user', remnawave_id=101)
         db.add_all([tariff, user])
         await db.commit()
         user_id, tariff_id = user.id, tariff.id
@@ -98,6 +98,7 @@ async def context(sessions, monkeypatch):
 
     panel = SimpleNamespace(
         update_remnawave_user=AsyncMock(side_effect=assert_committed),
+        sync_remnawave_user=AsyncMock(side_effect=assert_committed),
         create_remnawave_user=AsyncMock(side_effect=assert_committed),
     )
     monkeypatch.setattr(miniapp, 'SubscriptionService', lambda: panel)
@@ -316,6 +317,8 @@ async def test_purchase_failure_rolls_back_all_money_and_subscription_state(
         assert await snapshot(sessions) == before
         context.effects.assert_not_awaited()
         context.panel.update_remnawave_user.assert_not_awaited()
+        context.panel.create_remnawave_user.assert_not_awaited()
+        context.panel.sync_remnawave_user.assert_not_awaited()
     finally:
         if failure == 'commit':
             async with sessions() as db:

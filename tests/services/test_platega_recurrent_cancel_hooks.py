@@ -321,7 +321,6 @@ async def test_cancel_safe_wiring_proof_multi_tariff_delete_subscription(monkeyp
     ровно там, где её резолвит ленивый импорт внутри функции (атрибут модуля
     ``app.services.payment.platega`` на момент вызова).
     """
-    import app.services.payment.platega as platega_module
     from app.cabinet.routes.subscription_modules import multi_tariff
     from app.database.models import SubscriptionStatus
 
@@ -333,7 +332,7 @@ async def test_cancel_safe_wiring_proof_multi_tariff_delete_subscription(monkeyp
         recorded.append((db, subscription_id))
         call_order.append('platega_cancel')
 
-    monkeypatch.setattr(platega_module, 'cancel_platega_recurring_for_subscription_safe', fake_cancel)
+    monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', fake_cancel)
 
     class FakeSubscription(SimpleNamespace):
         pass
@@ -342,8 +341,11 @@ async def test_cancel_safe_wiring_proof_multi_tariff_delete_subscription(monkeyp
         id=42,
         status=SubscriptionStatus.EXPIRED.value,
         actual_status=SubscriptionStatus.EXPIRED.value,
-        remnawave_uuid=None,
+        # 3.0.0: панельный юзер адресуется числовым remnawave_id, колонка
+        # remnawave_uuid историческая и роутом не читается.
+        remnawave_id=None,
         tariff_id=None,
+        user_id=1,
     )
     user = SimpleNamespace(id=1)
 
@@ -357,13 +359,20 @@ async def test_cancel_safe_wiring_proof_multi_tariff_delete_subscription(monkeyp
         return None
 
     monkeypatch.setattr(multi_tariff, 'get_subscription_by_id_for_user', fake_get_subscription)
-    monkeypatch.setattr(multi_tariff, 'decrement_subscription_server_counts', fake_decrement_counts)
+    # Порядок шагов удаления живёт в общем сервисе — там же и счётчики.
+    monkeypatch.setattr(
+        'app.services.subscription_deletion_service.decrement_subscription_server_counts',
+        fake_decrement_counts,
+    )
     monkeypatch.setattr(
         'app.services.grace_access_runtime.ensure_no_open_grace_for_subscriptions',
         fake_ensure_no_open_grace,
     )
 
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
     db.delete = AsyncMock()
 
     result = await multi_tariff.delete_subscription(subscription_id=42, user=user, db=db)
@@ -390,7 +399,6 @@ async def test_cancel_safe_wiring_proof_my_subscriptions_delete_execute(monkeypa
     and the user keeps getting charged for a subscription that no longer
     exists.
     """
-    import app.services.payment.platega as platega_module
     from app.database.models import SubscriptionStatus
     from app.handlers.subscription import my_subscriptions
 
@@ -401,13 +409,15 @@ async def test_cancel_safe_wiring_proof_my_subscriptions_delete_execute(monkeypa
         recorded.append((db, subscription_id))
         call_order.append('platega_cancel')
 
-    monkeypatch.setattr(platega_module, 'cancel_platega_recurring_for_subscription_safe', fake_cancel)
+    monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', fake_cancel)
 
     subscription = SimpleNamespace(
         id=99,
+        user_id=1,
+        tariff_id=None,
         status=SubscriptionStatus.EXPIRED.value,
         actual_status=SubscriptionStatus.EXPIRED.value,
-        remnawave_uuid=None,
+        remnawave_id=None,
     )
 
     async def fake_get_subscription(db, sub_id, user_id):
@@ -419,9 +429,17 @@ async def test_cancel_safe_wiring_proof_my_subscriptions_delete_execute(monkeypa
     async def fake_decrement_counts(db, sub):
         return None
 
+    # Обработчик делегирует порядок общему сервису — патчим то, что зовёт ОН.
     monkeypatch.setattr(my_subscriptions, 'get_subscription_by_id_for_user', fake_get_subscription)
-    monkeypatch.setattr(my_subscriptions, 'decrement_subscription_server_counts', fake_decrement_counts)
     monkeypatch.setattr(my_subscriptions, 'show_my_subscriptions', AsyncMock())
+    monkeypatch.setattr(
+        'app.services.subscription_deletion_service.decrement_subscription_server_counts',
+        fake_decrement_counts,
+    )
+    monkeypatch.setattr(
+        'app.services.subscription_deletion_service._resolve_panel_target',
+        AsyncMock(return_value=(None, False)),
+    )
     monkeypatch.setattr(
         'app.services.grace_access_runtime.ensure_no_open_grace_for_subscriptions',
         fake_ensure_no_open_grace,
@@ -430,6 +448,9 @@ async def test_cancel_safe_wiring_proof_my_subscriptions_delete_execute(monkeypa
     callback = SimpleNamespace(data='sub_del_yes:99', answer=AsyncMock())
     db_user = SimpleNamespace(id=1)
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
     db.delete = AsyncMock()
     state = AsyncMock()
 
@@ -451,7 +472,6 @@ async def test_cancel_safe_wiring_proof_admin_bulk_delete_subscription(monkeypat
     (``admin_bulk_actions.py::_do_delete_subscription``, "Массовые действия"
     -> delete subscription for a batch of users).
     """
-    import app.services.payment.platega as platega_module
     from app.cabinet.routes import admin_bulk_actions
     from app.cabinet.schemas.bulk_actions import BulkActionParams
 
@@ -465,7 +485,7 @@ async def test_cancel_safe_wiring_proof_admin_bulk_delete_subscription(monkeypat
     async def fake_ensure_no_open_grace(db, subscription_ids):
         call_order.append('grace_check')
 
-    monkeypatch.setattr(platega_module, 'cancel_platega_recurring_for_subscription_safe', fake_cancel)
+    monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', fake_cancel)
     monkeypatch.setattr(
         'app.services.grace_access_runtime.ensure_no_open_grace_for_subscriptions',
         fake_ensure_no_open_grace,
@@ -476,10 +496,13 @@ async def test_cancel_safe_wiring_proof_admin_bulk_delete_subscription(monkeypat
         is_active=False,
         is_trial=False,
         tariff=None,
-        remnawave_uuid=None,
+        remnawave_id=None,
     )
-    user = SimpleNamespace(id=1, username='victim', subscriptions=[], remnawave_uuid=None)
+    user = SimpleNamespace(id=1, username='victim', subscriptions=[], remnawave_id=None)
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
 
     result = await admin_bulk_actions._do_delete_subscription(
         db, user, BulkActionParams(), dry_run=False, sub_override=sub
@@ -515,8 +538,6 @@ async def test_delete_user_account_cancels_platega_between_grace_checks(monkeypa
     other delete sites (the cancel call commits internally, releasing the
     advisory lock the first check acquired).
     """
-    import app.services.payment.platega as platega_module
-    import app.services.user_service as user_service_module
     from app.services.grace_access_runtime import GraceAccessDeletionBlocked
     from app.services.user_service import UserService
 
@@ -534,17 +555,20 @@ async def test_delete_user_account_cancels_platega_between_grace_checks(monkeypa
         if calls['n'] == 2:
             raise GraceAccessDeletionBlocked(tuple(subscription_ids))
 
-    monkeypatch.setattr(platega_module, 'cancel_platega_recurring_for_subscription_safe', fake_cancel)
+    monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', fake_cancel)
     monkeypatch.setattr(
         'app.services.grace_access_runtime.ensure_no_open_grace_for_subscriptions',
         fake_ensure_no_open_grace,
     )
 
-    subs = [SimpleNamespace(id=11, remnawave_uuid=None), SimpleNamespace(id=12, remnawave_uuid=None)]
-    user = SimpleNamespace(id=5, telegram_id=555, email=None, subscriptions=subs, remnawave_uuid=None)
-    monkeypatch.setattr(user_service_module, 'get_user_by_id', AsyncMock(return_value=user))
+    subs = [SimpleNamespace(id=11, remnawave_id=None), SimpleNamespace(id=12, remnawave_id=None)]
+    user = SimpleNamespace(id=5, telegram_id=555, email=None, subscriptions=subs, remnawave_id=None)
+    monkeypatch.setattr('app.services.user_service.get_user_by_id', AsyncMock(return_value=user))
 
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
 
     result = await UserService().delete_user_account(db, user_id=5, admin_id=1)
 
@@ -561,15 +585,22 @@ async def test_delete_user_from_db_cancels_platega_for_each_subscription(monkeyp
     grace-access guard, so a plain best-effort cancel loop before the
     deletes is enough — no lock to re-acquire.
     """
-    import app.services.payment.platega as platega_module
+    import app.services.payment.lava as lava_module
     from app.services.blocked_users_service import BlockedUsersService
 
     recorded: list[tuple[object, int]] = []
+    recorded_lava: list[tuple[object, int]] = []
 
     async def fake_cancel(db, subscription_id):
         recorded.append((db, subscription_id))
 
-    monkeypatch.setattr(platega_module, 'cancel_platega_recurring_for_subscription_safe', fake_cancel)
+    async def fake_cancel_lava(db, subscription_id):
+        recorded_lava.append((db, subscription_id))
+
+    monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', fake_cancel)
+    # Тот же teardown-путь гасит и рекуррент Lava — оба провайдера обязаны быть
+    # отменены до удаления пользователя.
+    monkeypatch.setattr(lava_module, 'cancel_lava_recurring_for_subscription_safe', fake_cancel_lava)
 
     subs = [SimpleNamespace(id=21, connected_squads=None), SimpleNamespace(id=22, connected_squads=None)]
     user = SimpleNamespace(id=9, telegram_id=999, email=None, subscriptions=subs)
@@ -579,6 +610,9 @@ async def test_delete_user_from_db_cancels_platega_for_each_subscription(monkeyp
     result_mock.scalars.return_value.all.return_value = []
 
     db = AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
     db.execute = AsyncMock(return_value=result_mock)
     db.delete = AsyncMock()
     db.commit = AsyncMock()
@@ -588,5 +622,6 @@ async def test_delete_user_from_db_cancels_platega_for_each_subscription(monkeyp
 
     assert ok is True
     assert recorded == [(db, 21), (db, 22)]
+    assert recorded_lava == [(db, 21), (db, 22)]
     db.delete.assert_awaited_once_with(user)
     db.commit.assert_awaited_once()

@@ -30,12 +30,14 @@ from app.database.models import (
     MulenPayPayment,
     OverpayPayment,
     Pal24Payment,
+    ParityPayPayment,
     PaymentMethod,
     PayPearPayment,
     PlategaPayment,
     RioPayPayment,
     RollyPayPayment,
     SeverPayPayment,
+    TabPayPayment,
     Transaction,
     TransactionType,
     User,
@@ -72,7 +74,7 @@ def _escape_like(value: str) -> str:
     return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
-class StatusFilter(str, enum.Enum):
+class StatusFilter(enum.StrEnum):
     """Supported status filter values."""
 
     ALL = 'all'
@@ -81,7 +83,7 @@ class StatusFilter(str, enum.Enum):
     CANCELLED = 'cancelled'
 
 
-class PeriodPreset(str, enum.Enum):
+class PeriodPreset(enum.StrEnum):
     """Predefined period presets."""
 
     H24 = '24h'
@@ -966,6 +968,76 @@ async def _search_lava(db: AsyncSession, params: SearchParams) -> list[PendingPa
     return records
 
 
+async def _search_paritypay(db: AsyncSession, params: SearchParams) -> list[PendingPayment]:
+    stmt = (
+        select(ParityPayPayment)
+        .options(selectinload(ParityPayPayment.user))
+        .order_by(desc(ParityPayPayment.created_at))
+    )
+    stmt = _apply_date_filter(stmt, ParityPayPayment.created_at, params.cutoff, params.upper_bound)
+
+    if params.search:
+        kind = _detect_user_search_kind(params.search)
+        if kind == _UserSearchKind.INVOICE:
+            conditions = [
+                ParityPayPayment.order_id.ilike(f'%{_escape_like(params.search)}%'),
+                ParityPayPayment.paritypay_payment_id.ilike(f'%{_escape_like(params.search)}%'),
+            ]
+            stmt = stmt.where(or_(*conditions))
+        else:
+            stmt = _apply_user_join_filter(stmt, ParityPayPayment, kind, params.search)
+
+    stmt = stmt.limit(MAX_RECORDS_PER_PROVIDER)
+    result = await db.execute(stmt)
+    records: list[PendingPayment] = []
+    for payment in result.scalars().all():
+        record = _build_record(
+            PaymentMethod.PARITYPAY,
+            payment,
+            identifier=payment.order_id,
+            amount_kopeks=payment.amount_kopeks,
+            status=payment.status or '',
+            is_paid=bool(payment.is_paid),
+            expires_at=getattr(payment, 'expires_at', None),
+        )
+        if record:
+            records.append(record)
+    return records
+
+
+async def _search_tabpay(db: AsyncSession, params: SearchParams) -> list[PendingPayment]:
+    stmt = select(TabPayPayment).options(selectinload(TabPayPayment.user)).order_by(desc(TabPayPayment.created_at))
+    stmt = _apply_date_filter(stmt, TabPayPayment.created_at, params.cutoff, params.upper_bound)
+
+    if params.search:
+        kind = _detect_user_search_kind(params.search)
+        if kind == _UserSearchKind.INVOICE:
+            conditions = [
+                TabPayPayment.order_id.ilike(f'%{_escape_like(params.search)}%'),
+                TabPayPayment.tabpay_payment_id.ilike(f'%{_escape_like(params.search)}%'),
+            ]
+            stmt = stmt.where(or_(*conditions))
+        else:
+            stmt = _apply_user_join_filter(stmt, TabPayPayment, kind, params.search)
+
+    stmt = stmt.limit(MAX_RECORDS_PER_PROVIDER)
+    result = await db.execute(stmt)
+    records: list[PendingPayment] = []
+    for payment in result.scalars().all():
+        record = _build_record(
+            PaymentMethod.TABPAY,
+            payment,
+            identifier=payment.order_id,
+            amount_kopeks=payment.amount_kopeks,
+            status=payment.status or '',
+            is_paid=bool(payment.is_paid),
+            expires_at=getattr(payment, 'expires_at', None),
+        )
+        if record:
+            records.append(record)
+    return records
+
+
 async def _search_cispay(db: AsyncSession, params: SearchParams) -> list[PendingPayment]:
     stmt = select(CisPayPayment).options(selectinload(CisPayPayment.user)).order_by(desc(CisPayPayment.created_at))
     stmt = _apply_date_filter(stmt, CisPayPayment.created_at, params.cutoff, params.upper_bound)
@@ -1035,6 +1107,48 @@ async def _search_stars(db: AsyncSession, params: SearchParams) -> list[PendingP
     return records
 
 
+async def _search_platega_recurring(db: AsyncSession, params: SearchParams) -> list[PendingPayment]:
+    """Успешные СБП-автопродления Platega (issue #3279).
+
+    Живут в транзакциях, а не в таблице провайдера: у списания нет счёта.
+    Пара «SUBSCRIPTION_PAYMENT + platega» однозначна — обычные пополнения
+    имеют тип DEPOSIT, списания с баланса идут с методом ``balance``.
+    """
+    stmt = (
+        select(Transaction)
+        .options(selectinload(Transaction.user))
+        .where(
+            Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+            Transaction.payment_method == PaymentMethod.PLATEGA.value,
+        )
+        .order_by(desc(Transaction.created_at))
+    )
+    stmt = _apply_date_filter(stmt, Transaction.created_at, params.cutoff, params.upper_bound)
+
+    if params.search:
+        kind = _detect_user_search_kind(params.search)
+        if kind == _UserSearchKind.INVOICE:
+            stmt = stmt.where(Transaction.external_id.ilike(f'%{_escape_like(params.search)}%'))
+        else:
+            stmt = _apply_user_join_filter(stmt, Transaction, kind, params.search)
+
+    stmt = stmt.limit(MAX_RECORDS_PER_PROVIDER)
+    result = await db.execute(stmt)
+    records: list[PendingPayment] = []
+    for transaction in result.scalars().all():
+        record = _build_record(
+            PaymentMethod.PLATEGA_RECURRENT,
+            transaction,
+            identifier=transaction.external_id or str(transaction.id),
+            amount_kopeks=transaction.amount_kopeks,
+            status='paid' if transaction.is_completed else 'pending',
+            is_paid=bool(transaction.is_completed),
+        )
+        if record:
+            records.append(record)
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Provider -> search function mapping
 # ---------------------------------------------------------------------------
@@ -1062,7 +1176,10 @@ _PROVIDER_SEARCH_MAP: dict[PaymentMethod, Any] = {
     PaymentMethod.DONUT: _search_donut,
     PaymentMethod.LAVA: _search_lava,
     PaymentMethod.CISPAY: _search_cispay,
+    PaymentMethod.TABPAY: _search_tabpay,
+    PaymentMethod.PARITYPAY: _search_paritypay,
     PaymentMethod.TELEGRAM_STARS: _search_stars,
+    PaymentMethod.PLATEGA_RECURRENT: _search_platega_recurring,
 }
 
 

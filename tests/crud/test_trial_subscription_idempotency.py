@@ -53,6 +53,7 @@ def _sub(**kw) -> MagicMock:
 def _db() -> AsyncMock:
     """Мок AsyncSession с нужными методами."""
     db = AsyncMock()
+    db.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
     db.commit = AsyncMock()
     db.rollback = AsyncMock()
     db.refresh = AsyncMock()

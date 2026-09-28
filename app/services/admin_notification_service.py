@@ -14,8 +14,8 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from sqlalchemy import select
-from sqlalchemy.exc import MissingGreenlet
+from sqlalchemy import inspect as sa_inspect, select
+from sqlalchemy.exc import MissingGreenlet, NoInspectionAvailable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -32,7 +32,11 @@ from app.database.models import (
     Subscription,
     Transaction,
     User,
+    WithdrawalRequest,
+    WithdrawalRequestStatus,
 )
+from app.keyboards.group_callbacks import strip_group_unsafe_buttons
+from app.utils.formatters import format_username_link
 from app.utils.message_patch import caption_exceeds_telegram_limit
 from app.utils.rich_admin import classic_admin_html_to_rich, try_send_rich_admin_message
 from app.utils.timezone import format_local_datetime
@@ -59,6 +63,18 @@ def _redact_telegram_secrets(text: str) -> str:
     return _BOT_TOKEN_RE.sub('bot[REDACTED]', text)
 
 
+def _format_waiting(waited_minutes: int) -> str:
+    """Сколько заявка ждёт решения: «3 д 4 ч», «2 ч 5 мин», «15 мин»."""
+    total = max(0, int(waited_minutes))
+    days, rest = divmod(total, 24 * 60)
+    hours, minutes = divmod(rest, 60)
+    if days:
+        return f'{days} д {hours} ч' if hours else f'{days} д'
+    if hours:
+        return f'{hours} ч {minutes} мин' if minutes else f'{hours} ч'
+    return f'{minutes} мин'
+
+
 class NotificationCategory(StrEnum):
     """Категории уведомлений для маршрутизации по топикам."""
 
@@ -75,6 +91,29 @@ class NotificationCategory(StrEnum):
 
 
 logger = structlog.get_logger(__name__)
+
+
+def _loaded_relationship(instance: object, name: str) -> Any:
+    """Значение связи, только если она УЖЕ загружена; иначе None и никакого IO.
+
+    ``getattr(obj, name, None)`` для этого не годится: у незагруженной связи
+    async-сессия не отдаёт None, а лезет в базу — и падает MissingGreenlet, потому
+    что default у getattr срабатывает лишь на AttributeError.
+
+    Ровно на этом падало уведомление о регистрации по рекламной кампании:
+    apply_campaign_bonus перечитывает пользователя через ``db.refresh(user)``
+    (сам по себе — фикс прошлого MissingGreenlet), а refresh сбрасывает ранее
+    загруженные связи, включая promo_group.
+    """
+    try:
+        state = sa_inspect(instance)
+    except NoInspectionAvailable:
+        # Не ORM-объект (тестовые фейки, SimpleNamespace) — обычный доступ безопасен.
+        return getattr(instance, name, None)
+
+    if name in state.unloaded:
+        return None
+    return state.dict.get(name)
 
 
 class AdminNotificationService:
@@ -115,7 +154,7 @@ class AdminNotificationService:
                 return f'ID {referred_by_id} (не найден)'
 
             if referrer.username:
-                return f'@{html.escape(referrer.username)} (ID: {referred_by_id})'
+                return f'{format_username_link(referrer.username)} (ID: {referred_by_id})'
             if referrer.telegram_id:
                 return f'ID {referrer.telegram_id}'
             if referrer.email:
@@ -127,10 +166,17 @@ class AdminNotificationService:
             return f'ID {referred_by_id}'
 
     async def _get_user_promo_group(self, db: AsyncSession, user: User) -> PromoGroup | None:
-        if getattr(user, 'promo_group', None):
-            return user.promo_group
+        promo_group = _loaded_relationship(user, 'promo_group')
+        if promo_group:
+            return promo_group
 
-        if not user.promo_group_id:
+        try:
+            promo_group_id = user.promo_group_id
+        except Exception:
+            # Инстанс отвязан от сессии или протух — колонка тоже ушла бы в ленивую
+            # подгрузку. Берём последнее известное значение из __dict__.
+            promo_group_id = user.__dict__.get('promo_group_id')
+        if not promo_group_id:
             return None
 
         try:
@@ -139,16 +185,17 @@ class AdminNotificationService:
             # relationship might not be available — fallback to direct fetch
             pass
 
-        if getattr(user, 'promo_group', None):
-            return user.promo_group
+        promo_group = _loaded_relationship(user, 'promo_group')
+        if promo_group:
+            return promo_group
 
         try:
-            return await get_promo_group_by_id(db, user.promo_group_id)
+            return await get_promo_group_by_id(db, promo_group_id)
         except Exception as e:
             logger.error(
                 'Ошибка загрузки промогруппы пользователя',
-                promo_group_id=user.promo_group_id,
-                telegram_id=user.telegram_id,
+                promo_group_id=promo_group_id,
+                telegram_id=user.__dict__.get('telegram_id'),
                 e=e,
             )
             return None
@@ -322,9 +369,11 @@ class AdminNotificationService:
         if campaign.is_subscription_bonus:
             default_devices = getattr(settings, 'DEFAULT_DEVICE_LIMIT', 1)
             details = [
-                f'📅 {campaign.subscription_duration_days or 0} дн. '
-                f'• 📊 {campaign.subscription_traffic_gb or 0} ГБ '
-                f'• 📱 {campaign.subscription_device_limit or default_devices} устр.',
+                (
+                    f'📅 {campaign.subscription_duration_days or 0} дн. '
+                    f'• 📊 {campaign.subscription_traffic_gb or 0} ГБ '
+                    f'• 📱 {campaign.subscription_device_limit or default_devices} устр.'
+                ),
             ]
             if campaign.subscription_squads:
                 details.append(f'🌐 Сквады: {len(campaign.subscription_squads)} шт.')
@@ -406,7 +455,7 @@ class AdminNotificationService:
                 '',
                 f'👤 <b>Пользователь:</b> {user_display}',
                 f'🆔 <b>{user_id_label}:</b> {user_id_display}',
-                f'📱 <b>Username:</b> @{html.escape(getattr(user, "username", None) or "отсутствует")}',
+                f'📱 <b>Username:</b> {format_username_link(getattr(user, "username", None), "отсутствует")}',
                 f'👥 <b>Статус:</b> {user_status}',
                 '',
             ]
@@ -555,7 +604,7 @@ class AdminNotificationService:
             # Добавляем username только если есть
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             message_lines.append(f'📋 {user_status}')
 
@@ -718,7 +767,7 @@ class AdminNotificationService:
 
         username = getattr(user, 'username', None)
         if username:
-            message_lines.append(f'📱 @{html.escape(username)}')
+            message_lines.append(f'📱 {format_username_link(username)}')
 
         message_lines.append(f'💳 {topup_status}')
 
@@ -733,8 +782,10 @@ class AdminNotificationService:
             [
                 f'💵 <b>{settings.format_price(transaction.amount_kopeks)}</b> | {payment_method}',
                 '',
-                f'📉 {settings.format_price(old_balance)} → 📈 {settings.format_price(user.balance_kopeks)}'
-                f' (<b>+{settings.format_price(balance_change)}</b>)',
+                (
+                    f'📉 {settings.format_price(old_balance)} → 📈 {settings.format_price(user.balance_kopeks)}'
+                    f' (<b>+{settings.format_price(balance_change)}</b>)'
+                ),
             ]
         )
 
@@ -977,7 +1028,7 @@ class AdminNotificationService:
 
 👤 <b>Пользователь:</b> {user_display}
 🆔 <b>{user_id_label}:</b> {user_id_display}
-📱 <b>Username:</b> @{html.escape(getattr(user, 'username', None) or 'отсутствует')}
+📱 <b>Username:</b> {format_username_link(getattr(user, 'username', None), 'отсутствует')}
 
 {promo_block}
 
@@ -1064,7 +1115,7 @@ class AdminNotificationService:
                 '',
                 f'👤 <b>Пользователь:</b> {user_display}',
                 f'🆔 <b>{user_id_label}:</b> {user_id_display}',
-                f'📱 <b>Username:</b> @{html.escape(getattr(user, "username", None) or "отсутствует")}',
+                f'📱 <b>Username:</b> {format_username_link(getattr(user, "username", None), "отсутствует")}',
                 '',
                 promo_block,
                 '',
@@ -1189,7 +1240,7 @@ class AdminNotificationService:
             ]
 
             if telegram_user.username:
-                message_lines.append(f'📱 @{html.escape(telegram_user.username)}')
+                message_lines.append(f'📱 {format_username_link(telegram_user.username)}')
 
             message_lines.append(f'📋 {user_status}')
 
@@ -1289,7 +1340,7 @@ class AdminNotificationService:
                 f'👤 {html.escape(telegram_user_name)} (<code>{telegram_user_id}</code>)',
             ]
             if telegram_username:
-                message_lines.append(f'📱 @{html.escape(telegram_username)}')
+                message_lines.append(f'📱 {format_username_link(telegram_username)}')
 
             promo_group = await self._get_user_promo_group(db, user)
             if promo_group:
@@ -1378,7 +1429,7 @@ class AdminNotificationService:
                 '',
                 f'👤 <b>Пользователь:</b> {user_display}',
                 f'🆔 <b>{user_id_label}:</b> {user_id_display}',
-                f'📱 <b>Username:</b> @{html.escape(getattr(user, "username", None) or "отсутствует")}',
+                f'📱 <b>Username:</b> {format_username_link(getattr(user, "username", None), "отсутствует")}',
                 '',
                 self._format_promo_group_block(new_group, title='Новая промогруппа', icon='🏆'),
             ]
@@ -1464,9 +1515,9 @@ class AdminNotificationService:
         reply_markup: types.InlineKeyboardMarkup | None = None,
         *,
         category: NotificationCategory | None = None,
+        thread_id: int | None = None,
     ) -> bool:
-        if not self.chat_id:
-            logger.warning('ADMIN_NOTIFICATIONS_CHAT_ID не настроен')
+        if not self._is_enabled():
             return False
 
         # Per-category suppression
@@ -1474,7 +1525,21 @@ class AdminNotificationService:
             logger.debug('Уведомление подавлено (категория отключена)', category=category.value)
             return False
 
-        thread_id = self._resolve_topic_id(category)
+        # Явный thread_id (например, топик заявок на вывод) важнее топика категории
+        if thread_id is None:
+            thread_id = self._resolve_topic_id(category)
+
+        # В групповом админ-чате работают только разрешённые callback-кнопки
+        # (фильтр чатов глушит остальные): такие выкидываем здесь, а не рисуем
+        # мёртвыми. URL-кнопки и разрешённые действия остаются.
+        if reply_markup is not None and self.resolve_recipient_role() == 'group':
+            reply_markup, dropped = strip_group_unsafe_buttons(reply_markup)
+            if dropped:
+                logger.warning(
+                    'Кнопки не работают в групповом админ-чате — убраны из уведомления',
+                    chat_id=self.chat_id,
+                    dropped=dropped,
+                )
 
         # Rich-вид (Bot API 10.1): заголовок, разделители, footer с tg-time.
         # При недоступности/ошибке молча продолжаем классическим путём ниже
@@ -1628,8 +1693,12 @@ class AdminNotificationService:
                 # Cabinet gift: show buyer with link to user profile
                 buyer = getattr(purchase, 'buyer', None)
                 if buyer:
-                    buyer_name = f'@{buyer.username}' if buyer.username else buyer.email or f'id:{buyer.id}'
-                    message_lines.append(f'👤 Покупатель: <code>{html.escape(buyer_name)}</code>')
+                    if buyer.username:
+                        buyer_display = format_username_link(buyer.username)
+                    else:
+                        buyer_name = buyer.email or f'id:{buyer.id}'
+                        buyer_display = f'<code>{html.escape(buyer_name)}</code>'
+                    message_lines.append(f'👤 Покупатель: {buyer_display}')
                 else:
                     message_lines.append(f'{contact_icon} Покупатель: <code>{contact_display}</code>')
             else:
@@ -1681,6 +1750,80 @@ class AdminNotificationService:
             logger.error('Ошибка отправки уведомления о гостевой покупке', error=e)
             return False
 
+    async def send_grace_access_notification(
+        self,
+        *,
+        event: str,
+        user: User,
+        subscription: Subscription,
+        tariff_name: str | None,
+        reason: str,
+        grace_until: datetime,
+        hours: int,
+        quota_gb: float,
+        allowed: str,
+        completion_reason: str | None = None,
+        last_error: str | None = None,
+    ) -> bool:
+        """Выдача или завершение grace-доступа — в чат админов, категория «Продления».
+
+        Владелец: «выдача втухлую — это тупо»: админ обязан видеть, кому, почему и до
+        какого срока бот временно оставил доступ к тому, что оператор назвал в
+        GRACE_ACCESS_ALLOWED_SERVICES (``allowed``, уже экранировано), и чем это
+        закончилось — продлением, истечением срока или конфликтом с панелью.
+        """
+        try:
+            user_display = self._get_user_display(user)
+            user_id_label = self._get_user_identifier_label(user)
+            user_id_display = self._get_user_identifier_display(user)
+            username = format_username_link(getattr(user, 'username', None), 'отсутствует')
+            subscription_line = f'#{subscription.id}'
+            if tariff_name:
+                subscription_line += f' «{html.escape(tariff_name)}»'
+            reason_line = 'исчерпан трафик' if reason == 'limited' else 'срок подписки истёк'
+            quota_text = f'{quota_gb:g} ГБ'
+            until_text = format_local_datetime(grace_until, '%d.%m.%Y %H:%M')
+
+            if event == 'granted':
+                message = f"""🛟 <b>GRACE-ДОСТУП ВЫДАН</b>
+
+👤 <b>Пользователь:</b> {user_display}
+🆔 <b>{user_id_label}:</b> {user_id_display}
+📱 <b>Username:</b> {username}
+
+📋 <b>Подписка:</b> {subscription_line}
+⚠️ <b>Почему:</b> {reason_line}
+🛟 <b>Что выдано:</b> {allowed}, {quota_text} на {hours} ч.
+⏳ <b>Действует до:</b> {until_text}
+
+⏰ <i>{format_local_datetime(datetime.now(UTC), '%d.%m.%Y %H:%M:%S')}</i>"""
+            else:
+                outcomes = {
+                    'paid': '✅ человек продлил подписку — вернули обычный тариф',
+                    'timeout': '⌛ срок grace вышел, подписку не продлили — доступ закрыт',
+                    'drained': '🚰 grace выключают (слив) — доступ закрыт',
+                    'revoked': '🚫 отозван: пользователь заблокирован или подписка отключена',
+                    'conflict': '⚠️ конфликт с панелью — доступ закрыт',
+                }
+                outcome = outcomes.get(completion_reason or '', f'завершён ({completion_reason or "?"})')
+                error_line = f'\n❗ <code>{html.escape(last_error)}</code>' if last_error else ''
+                message = f"""🛟 <b>GRACE-ДОСТУП ЗАВЕРШЁН</b>
+
+👤 <b>Пользователь:</b> {user_display}
+🆔 <b>{user_id_label}:</b> {user_id_display}
+📱 <b>Username:</b> {username}
+
+📋 <b>Подписка:</b> {subscription_line}
+⚠️ <b>Был выдан:</b> {reason_line}, до {until_text}
+🏁 <b>Итог:</b> {outcome}{error_line}
+
+⏰ <i>{format_local_datetime(datetime.now(UTC), '%d.%m.%Y %H:%M:%S')}</i>"""
+
+            return await self._send_message(message, category=NotificationCategory.RENEWALS)
+        except Exception as error:
+            logger.error('Ошибка отправки уведомления о grace-доступе', error=error)
+            return False
+
     async def send_webhook_notification(self, text: str) -> bool:
         """Send a generic webhook/infrastructure notification to admin chat.
 
@@ -1709,6 +1852,8 @@ class AdminNotificationService:
             'freekassa': f'💳 {settings.get_freekassa_display_name()}',
             'kassa_ai': f'💳 {settings.get_kassa_ai_display_name()}',
             'cispay': f'💳 {settings.get_cispay_display_name()}',
+            'tabpay': f'💳 {settings.get_tabpay_display_name()}',
+            'paritypay': f'💳 {settings.get_paritypay_display_name()}',
             'manual': '🛠️ Вручную (админ)',
             'balance': '💰 С баланса',
         }
@@ -2005,7 +2150,7 @@ class AdminNotificationService:
             # Добавляем username только если есть
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             # Тариф (если есть)
             if tariff_name:
@@ -2111,7 +2256,7 @@ class AdminNotificationService:
 
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             message_lines.append('')
 
@@ -2149,8 +2294,14 @@ class AdminNotificationService:
         user: User,
         amount_kopeks: int,
         payment_details: str | None = None,
+        *,
+        request_id: int | None = None,
     ) -> bool:
-        """Уведомление о запросе на вывод средств."""
+        """Уведомление о запросе на вывод средств.
+
+        С ``request_id`` к уведомлению прикладываются кнопки «Одобрить»/«Отклонить»
+        по роли получателя — как у заявки, поданной из бота.
+        """
         if not self._is_enabled():
             return False
 
@@ -2166,7 +2317,7 @@ class AdminNotificationService:
 
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             message_lines.extend(
                 [
@@ -2189,10 +2340,84 @@ class AdminNotificationService:
                 ]
             )
 
-            return await self._send_message('\n'.join(message_lines), category=NotificationCategory.PARTNERS)
+            reply_markup = None
+            if request_id is not None:
+                from app.keyboards.withdrawal import get_withdrawal_request_keyboard
+
+                reply_markup = get_withdrawal_request_keyboard(
+                    request_id,
+                    WithdrawalRequestStatus.PENDING.value,
+                    user_db_id=getattr(user, 'id', None),
+                    role=self.resolve_recipient_role(),
+                )
+
+            return await self._send_message(
+                '\n'.join(message_lines), reply_markup=reply_markup, category=NotificationCategory.PARTNERS
+            )
 
         except Exception as e:
             logger.error('Ошибка отправки уведомления о запросе на вывод', error=e)
+            return False
+
+    async def send_withdrawal_pending_reminder(self, request: WithdrawalRequest, waited_minutes: int) -> bool:
+        """Напоминание о заявке на вывод, которая ждёт решения дольше лимита.
+
+        Аналог SLA-напоминания по тикетам. Уходит в топик заявок на вывод
+        (REFERRAL_WITHDRAWAL_NOTIFICATIONS_TOPIC_ID), а без него — по категории
+        PARTNERS, то есть туда же, куда пришло исходное уведомление о заявке.
+        Кнопки — та же клавиатура, что у исходного уведомления, по роли получателя:
+        решить заявку можно прямо отсюда.
+        """
+        if not self._is_enabled():
+            return False
+
+        try:
+            from app.keyboards.withdrawal import get_withdrawal_request_keyboard
+
+            user = getattr(request, 'user', None)
+            user_display = self._get_user_display(user) if user else 'Unknown'
+            user_id_display = self._get_user_identifier_display(user) if user else '—'
+            username = getattr(user, 'username', None) if user else None
+
+            message_lines = [
+                '⏰ <b>Заявка на вывод ждёт решения</b>',
+                '',
+                f'🆔 <b>Заявка:</b> #{request.id}',
+                f'👤 <b>Пользователь:</b> {user_display} ({user_id_display})',
+            ]
+            if username:
+                message_lines.append(f'📱 <b>Username:</b> {format_username_link(username)}')
+            message_lines.extend(
+                [
+                    f'💵 <b>Сумма:</b> {settings.format_price(request.amount_kopeks)}',
+                    f'⏱️ <b>Ожидает решения:</b> {_format_waiting(waited_minutes)}',
+                ]
+            )
+
+            # Та же клавиатура, что у исходного уведомления. Собранная вручную вела на
+            # admin_user_<telegram_id> — у такого callback обработчика нет, — рисовала
+            # профиль в групповом чате и давала модератору кнопки, которые ответят
+            # «нет доступа».
+            keyboard = get_withdrawal_request_keyboard(
+                request.id,
+                WithdrawalRequestStatus.PENDING.value,
+                user_db_id=getattr(request, 'user_id', None) or getattr(user, 'id', None),
+                role=self.resolve_recipient_role(),
+            )
+
+            topic_id = getattr(settings, 'REFERRAL_WITHDRAWAL_NOTIFICATIONS_TOPIC_ID', None) or None
+            return await self._send_message(
+                '\n'.join(message_lines),
+                reply_markup=keyboard,
+                category=NotificationCategory.PARTNERS,
+                thread_id=topic_id,
+            )
+        except Exception as e:
+            logger.error(
+                'Ошибка отправки напоминания о заявке на вывод',
+                request_id=getattr(request, 'id', None),
+                error=e,
+            )
             return False
 
     async def send_bulk_ban_notification(
@@ -2327,8 +2552,7 @@ class AdminNotificationService:
             bot: экземпляр бота для отправки сообщения
             topic_id: ID топика для отправки уведомления (если не указан, использует стандартный)
         """
-        if not self.chat_id:
-            logger.warning('ADMIN_NOTIFICATIONS_CHAT_ID не настроен')
+        if not self._is_enabled() or not self.category_enabled.get(NotificationCategory.INFRASTRUCTURE, True):
             return False
 
         # Используем специальный топик для подозрительной активности, если он задан

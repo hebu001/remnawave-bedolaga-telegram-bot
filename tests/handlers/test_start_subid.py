@@ -9,6 +9,8 @@ class TestGiftStartParameter:
     def test_parses_current_and_legacy_namespaces(self) -> None:
         assert _parse_gift_start_parameter('GIFT_' + 'C' * 12) == (True, 'C' * 12)
         assert _parse_gift_start_parameter('giftclaim_' + 'C' * 12) == (True, 'C' * 12)
+        assert _parse_gift_start_parameter('GIFT-' + 'C' * 12) == (True, 'C' * 12)
+        assert _parse_gift_start_parameter('giftclaim-' + 'C' * 12) == (True, 'C' * 12)
 
     def test_reserves_even_malformed_gift_namespace(self) -> None:
         assert _parse_gift_start_parameter('GIFT_bad') == (True, 'bad')

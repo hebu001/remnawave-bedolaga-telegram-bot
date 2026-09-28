@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "pinned_upstream_commit": "877690a7039d1326b2c00eda3e297879b80c0678",
+  "source_sha256": {
+    "tests/live/test_bschek_live.py": "4f9c5e42a735d6a563114fe4ad57131bc1111e892a01d9116e57bdb6c27fd022",
+    "tests/services/test_payment_provider_configured.py": "8737c13f988ad56c321cfe9a903395c0195d024192d9639b99705bae4dfd9497",
+    "tests/services/test_referral_ledger_orientation.py": "c91708cc2283c1fd411294c8a568074d9d29b62d74642e709d535b75ae3b1d2a"
+  },
+  "allowed_skips": [
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_operators_shape_and_catalog_parsing",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_operators_shape_and_catalog_parsing",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_openapi_core_versions_match_constant",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_openapi_core_versions_match_constant",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_account_shape_without_secret",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_account_shape_without_secret",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_probe_preview_breakdown",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_probe_preview_breakdown",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_probe_preview_sni_needs_both_fields",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_probe_preview_sni_needs_both_fields",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_validation_codes_still_the_same[body0-unknown_operator]",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_validation_codes_still_the_same[body0-unknown_operator]",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_validation_codes_still_the_same[body1-no_probes]",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_validation_codes_still_the_same[body1-no_probes]",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_validation_codes_still_the_same[body2-invalid_request]",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_validation_codes_still_the_same[body2-invalid_request]",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_validation_codes_still_the_same[body3-too_many_targets]",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_validation_codes_still_the_same[body3-too_many_targets]",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_scan_preview_rejects_non_24",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_scan_preview_rejects_non_24",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_scan_preview_shape",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_scan_preview_shape",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/live/test_bschek_live.py::test_bad_key_is_unauthenticated",
+      "classname": "tests.live.test_bschek_live",
+      "name": "test_bad_key_is_unauthenticated",
+      "type": "pytest.skip",
+      "message": "BSCHEK_LIVE_API_KEY не задан — живой API не трогаем",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/services/test_payment_provider_configured.py::test_enabled_is_flag_when_credentials_are_present[apple_iap]",
+      "classname": "tests.services.test_payment_provider_configured",
+      "name": "test_enabled_is_flag_when_credentials_are_present[apple_iap]",
+      "type": "pytest.skip",
+      "message": "apple_iap: учётные данные не подделываются присваиванием",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/services/test_payment_provider_configured.py::test_missing_credential_disables_the_provider[apple_iap]",
+      "classname": "tests.services.test_payment_provider_configured",
+      "name": "test_missing_credential_disables_the_provider[apple_iap]",
+      "type": "pytest.skip",
+      "message": "apple_iap: учётные данные не подделываются присваиванием",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/services/test_referral_ledger_orientation.py::test_referral_id_grouping_excludes_referee_rows[database/crud/referral.py]",
+      "classname": "tests.services.test_referral_ledger_orientation",
+      "name": "test_referral_id_grouping_excludes_referee_rows[database/crud/referral.py]",
+      "type": "pytest.skip",
+      "message": "файл разобран вручную",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/services/test_referral_ledger_orientation.py::test_referral_id_grouping_excludes_referee_rows[services/account_merge_service.py]",
+      "classname": "tests.services.test_referral_ledger_orientation",
+      "name": "test_referral_id_grouping_excludes_referee_rows[services/account_merge_service.py]",
+      "type": "pytest.skip",
+      "message": "файл разобран вручную",
+      "status": "NOT RUN"
+    },
+    {
+      "nodeid": "tests/services/test_referral_ledger_orientation.py::test_referral_id_grouping_excludes_referee_rows[services/referral_reward_service.py]",
+      "classname": "tests.services.test_referral_ledger_orientation",
+      "name": "test_referral_id_grouping_excludes_referee_rows[services/referral_reward_service.py]",
+      "type": "pytest.skip",
+      "message": "файл разобран вручную",
+      "status": "NOT RUN"
+    }
+  ]
+}

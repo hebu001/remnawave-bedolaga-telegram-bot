@@ -3,12 +3,10 @@
   "baseline_commit": "4b06edcdce26850c03ca474e8d195ef94ddb347e",
   "upstream_commit": "877690a7039d1326b2c00eda3e297879b80c0678",
   "python": "3.13",
-  "test_only_packages": [
-    "greenlet==3.5.5"
-  ],
+  "test_only_packages": [],
   "notes": [
     "Existing fork regression suites plus directly related external contracts, not all upstream tests.",
-    "No business-policy choice is resolved by this baseline. RESET_TRAFFIC_ON_PAYMENT is recorded as current behavior only, pending user decision.",
+    "User decisions accepted: D01 reset on every paid renewal when enabled; D02 preserve short gift codes and current cabinet route; D03 legal-consent gate remains off; D04 require a tariff for legacy traffic purchases.",
     "Source-shape assertions (rich menu pins/runtime-name checks) may need fixture/assertion adaptation after merge; business behavior must remain reviewed.",
     "All PostgreSQL tests must run. Any skipped test makes the baseline result incomplete.",
     "External providers are mocked by existing tests; the baseline plugin rejects all non-Unix socket connections."

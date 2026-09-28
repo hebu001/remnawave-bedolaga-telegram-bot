@@ -10,6 +10,7 @@ from app.config import PERIOD_PRICES, settings
 from app.database.models import User
 from app.localization.loader import DEFAULT_LANGUAGE
 from app.localization.texts import get_texts
+from app.utils.legacy_subscription import is_legacy_subscription as _legacy_subscription
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button, strip_leading_emoji
 from app.utils.price_display import PriceInfo, format_price_button
 from app.utils.pricing_utils import (
@@ -1140,7 +1141,8 @@ def get_insufficient_balance_keyboard(
     language: str = DEFAULT_LANGUAGE,
     resume_callback: str | None = None,
     amount_kopeks: int | None = None,
-    has_saved_cart: bool = False,  # Новый параметр для указания наличия сохраненной корзины
+    has_saved_cart: bool = False,
+    resume_text: str | None = None,
 ) -> InlineKeyboardMarkup:
     texts = get_texts(language)
     keyboard = get_payment_methods_keyboard(amount_kopeks or 0, language)
@@ -1160,12 +1162,13 @@ def get_insufficient_balance_keyboard(
             )
             back_row_index = len(keyboard.inline_keyboard) - 1
 
-    # Если есть сохраненная корзина, добавляем кнопку возврата к оформлению
+    # Если есть сохраненная корзина или передан resume_callback, добавляем кнопку возврата
+    button_label = resume_text or texts.RETURN_TO_SUBSCRIPTION_CHECKOUT
     if has_saved_cart:
         return_row = [
             InlineKeyboardButton(
-                text=texts.RETURN_TO_SUBSCRIPTION_CHECKOUT,
-                callback_data='return_to_saved_cart',
+                text=button_label,
+                callback_data=resume_callback or 'return_to_saved_cart',
             )
         ]
         insert_index = back_row_index if back_row_index is not None else len(keyboard.inline_keyboard)
@@ -1173,7 +1176,7 @@ def get_insufficient_balance_keyboard(
     elif resume_callback:
         return_row = [
             InlineKeyboardButton(
-                text=texts.RETURN_TO_SUBSCRIPTION_CHECKOUT,
+                text=button_label,
                 callback_data=resume_callback,
             )
         ]
@@ -1184,7 +1187,11 @@ def get_insufficient_balance_keyboard(
 
 
 def get_subscription_keyboard(
-    language: str = DEFAULT_LANGUAGE, has_subscription: bool = False, is_trial: bool = False, subscription=None
+    language: str = DEFAULT_LANGUAGE,
+    has_subscription: bool = False,
+    is_trial: bool = False,
+    subscription=None,
+    gift_enabled: bool = False,
 ) -> InlineKeyboardMarkup:
     from app.config import settings
 
@@ -1284,6 +1291,9 @@ def get_subscription_keyboard(
             # Проверяем, является ли тариф суточным
             tariff = getattr(subscription, 'tariff', None) if subscription else None
             is_daily_tariff = tariff and getattr(tariff, 'is_daily', False)
+            # Куплена в классике, потом включили тарифы: продлить нельзя,
+            # автоплатёж не работает — в меню один путь, «Перейти на тариф».
+            is_legacy_subscription = _legacy_subscription(subscription)
 
             if is_daily_tariff:
                 # Для суточного тарифа: проверяем статус подписки
@@ -1305,6 +1315,18 @@ def get_subscription_keyboard(
                 keyboard.append(
                     [InlineKeyboardButton(text=pause_text, callback_data='toggle_daily_subscription_pause')]
                 )
+            elif is_legacy_subscription:
+                # Старая подписка (куплена в классике, тарифа нет, а оператор на
+                # тарифах): продления и автоплатежа у неё нет, единственный путь —
+                # выбрать тариф, он надевается на эту же подписку.
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            text=texts.t('MOVE_TO_TARIFF_BUTTON', '📦 Перейти на тариф'),
+                            callback_data='tariff_switch',
+                        )
+                    ]
+                )
             else:
                 # Для обычного тарифа: [Продлить] [Автоплатеж]
                 keyboard.append(
@@ -1324,7 +1346,7 @@ def get_subscription_keyboard(
                     callback_data='subscription_settings',
                 )
             ]
-            if settings.is_tariffs_mode() and subscription:
+            if settings.is_tariffs_mode() and subscription and not is_legacy_subscription:
                 # На истёкшей/отключённой подписке смена тарифа недоступна (хендлер её
                 # блокирует) — раньше кнопка «Тариф» всё равно показывалась и вела в тупик.
                 # Теперь для таких подписок показываем «Купить тариф» (покупку с нуля).
@@ -1356,6 +1378,9 @@ def get_subscription_keyboard(
             if subscription and (subscription.traffic_limit_gb or 0) > 0:
                 if settings.is_tariffs_mode() and tariff:
                     show_traffic_topup = tariff.can_topup_traffic()
+                elif is_legacy_subscription:
+                    # Старая подписка: классические пакеты трафика ей не продаём — сперва переход на тариф.
+                    show_traffic_topup = False
                 elif settings.is_traffic_topup_enabled() and not settings.is_traffic_topup_blocked():
                     show_traffic_topup = True
 
@@ -1367,6 +1392,16 @@ def get_subscription_keyboard(
                         )
                     ]
                 )
+
+    if gift_enabled:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('GIFT_SUBSCRIPTION_BUTTON', '🎁 Подарить подписку'),
+                    callback_data='subscription_gift',
+                )
+            ]
+        )
 
     keyboard.append([InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')])
 
@@ -1415,12 +1450,16 @@ def get_subscription_confirm_keyboard_with_cart(language: str = 'ru') -> InlineK
 def get_insufficient_balance_keyboard_with_cart(
     language: str = 'ru',
     amount_kopeks: int = 0,
+    resume_callback: str | None = None,
+    resume_text: str | None = None,
 ) -> InlineKeyboardMarkup:
     # Используем обновленную версию с флагом has_saved_cart=True
     keyboard = get_insufficient_balance_keyboard(
         language,
         amount_kopeks=amount_kopeks,
         has_saved_cart=True,
+        resume_callback=resume_callback,
+        resume_text=resume_text,
     )
 
     # Добавляем кнопку очистки корзины в начало
@@ -2218,10 +2257,11 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
 
     if settings.is_lava_card_enabled():
         lava_card_name = settings.get_lava_card_display_name()
+        lava_name = settings.get_lava_display_name()
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=texts.t('PAYMENT_LAVA_CARD', f'💳 {lava_card_name}'),
+                    text=texts.t('PAYMENT_LAVA_CARD', f'💳 {lava_card_name} - через {lava_name}'),
                     callback_data=_build_callback('lava_card'),
                 )
             ]
@@ -2230,10 +2270,11 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
 
     if settings.is_lava_sbp_enabled():
         lava_sbp_name = settings.get_lava_sbp_display_name()
+        lava_name = settings.get_lava_display_name()
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=texts.t('PAYMENT_LAVA_SBP', f'📱 {lava_sbp_name}'),
+                    text=texts.t('PAYMENT_LAVA_SBP', f'📱 {lava_sbp_name} - через {lava_name}'),
                     callback_data=_build_callback('lava_sbp'),
                 )
             ]
@@ -2283,6 +2324,82 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
                 InlineKeyboardButton(
                     text=texts.t('PAYMENT_CISPAY', f'💳 {cispay_name}'),
                     callback_data=_build_callback('cispay'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_tabpay_card_enabled():
+        tabpay_card_name = settings.get_tabpay_card_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_TABPAY_CARD', f'💳 {tabpay_card_name}'),
+                    callback_data=_build_callback('tabpay_card'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_tabpay_sbp_enabled():
+        tabpay_sbp_name = settings.get_tabpay_sbp_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_TABPAY_SBP', f'📱 {tabpay_sbp_name}'),
+                    callback_data=_build_callback('tabpay_sbp'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_tabpay_enabled() and not settings.is_tabpay_card_enabled() and not settings.is_tabpay_sbp_enabled():
+        tabpay_name = settings.get_tabpay_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_TABPAY', f'💳 {tabpay_name}'),
+                    callback_data=_build_callback('tabpay'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_paritypay_card_enabled():
+        paritypay_card_name = settings.get_paritypay_card_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_PARITYPAY_CARD', f'💳 {paritypay_card_name}'),
+                    callback_data=_build_callback('paritypay_card'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if settings.is_paritypay_sbp_enabled():
+        paritypay_sbp_name = settings.get_paritypay_sbp_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_PARITYPAY_SBP', f'📱 {paritypay_sbp_name}'),
+                    callback_data=_build_callback('paritypay_sbp'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
+
+    if (
+        settings.is_paritypay_enabled()
+        and not settings.is_paritypay_card_enabled()
+        and not settings.is_paritypay_sbp_enabled()
+    ):
+        paritypay_name = settings.get_paritypay_display_name()
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENT_PARITYPAY', f'💳 {paritypay_name}'),
+                    callback_data=_build_callback('paritypay'),
                 )
             ]
         )
@@ -2395,6 +2512,18 @@ def get_referral_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMar
             )
         ],
     ]
+
+    # Кнопка появляется, только когда админ разрешил хотя бы одну из настроек:
+    # экран, на котором нечего менять, обещает влияние, которого нет.
+    if settings.is_referral_reward_kind_choice_enabled() or settings.is_referral_days_target_choice_enabled():
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('REFERRAL_REWARD_SETTINGS_BUTTON', '⚙️ Настройки наград'),
+                    callback_data='referral_reward_settings',
+                )
+            ]
+        )
 
     # Добавляем кнопку вывода, если включена
     if settings.is_referral_withdrawal_enabled():
@@ -2823,8 +2952,12 @@ def get_change_devices_keyboard(
     else:
         max_devices = settings.MAX_DEVICES_LIMIT if settings.MAX_DEVICES_LIMIT > 0 else 100
 
-    # Минимум при уменьшении всегда 1 (device_limit тарифа — это "включено при покупке", а не нижняя граница)
-    min_devices = 1
+    # По умолчанию ниже включённого в тариф опускать нельзя — кнопки с меньшими
+    # значениями просто не показываем (ALLOW_DEVICES_BELOW_TARIFF_LIMIT=True
+    # возвращает прежний минимум 1).
+    from app.utils.subscription_utils import resolve_min_device_limit
+
+    min_devices = resolve_min_device_limit(tariff)
 
     start_range = max(min_devices, min(current_devices - 3, max_devices - 6))
     end_range = min(max_devices + 1, max(current_devices + 4, 7))
@@ -3003,7 +3136,7 @@ def get_manage_countries_keyboard(
             if days_left > 30:
                 price_text = f' ({discounted_per_month // 100}₽/мес × {days_left} дн. = {total_price // 100}₽)'
                 logger.info(
-                    '🔍 Сервер : ₽/мес × дн./30 = ₽ (скидка ₽)',
+                    '🔍 Стоимость сервера',
                     name=name,
                     discounted_per_month=discounted_per_month / 100,
                     days_left=days_left,
@@ -3421,6 +3554,7 @@ def get_updated_subscription_settings_keyboard(
     show_countries_management: bool = True,
     tariff=None,  # Тариф подписки (если есть - ограничиваем настройки)
     subscription=None,  # Подписка (для проверки суточной паузы)
+    is_legacy_subscription: bool = False,  # Старая подписка: без тарифа при включённых тарифах
 ) -> InlineKeyboardMarkup:
     from app.config import settings
 
@@ -3429,10 +3563,15 @@ def get_updated_subscription_settings_keyboard(
 
     # Если подписка на тарифе - отключаем страны, модем, трафик
     has_tariff = tariff is not None
+    # Классические докупки (страны, пакеты трафика, устройства по PRICE_PER_DEVICE)
+    # доступны только настоящей классической подписке. У старой подписки при
+    # включённых тарифах тарифа нет, но и классических цен для неё нет —
+    # единственный путь: перейти на тариф.
+    classic_addons_allowed = not has_tariff and not is_legacy_subscription
 
     # Для суточных тарифов кнопка паузы теперь в главном меню подписки
 
-    if show_countries_management and not has_tariff:
+    if show_countries_management and classic_addons_allowed:
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -3442,7 +3581,7 @@ def get_updated_subscription_settings_keyboard(
             ]
         )
 
-    if settings.is_traffic_selectable() and not has_tariff:
+    if settings.is_traffic_selectable() and classic_addons_allowed:
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -3472,7 +3611,7 @@ def get_updated_subscription_settings_keyboard(
                     )
                 ]
             )
-    elif settings.is_devices_selection_enabled():
+    elif classic_addons_allowed and settings.is_devices_selection_enabled():
         keyboard.append(
             [
                 InlineKeyboardButton(

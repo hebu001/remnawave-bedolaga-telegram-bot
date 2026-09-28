@@ -5,7 +5,7 @@ from typing import Any
 
 import structlog
 from aiogram import BaseMiddleware, Bot, types
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 
@@ -24,6 +24,7 @@ from app.services.subscription_service import SubscriptionService
 from app.utils.cache import cache
 from app.utils.check_reg_process import is_registration_process
 from app.utils.start_parameters import PENDING_PARTNER_MENU_KEY, is_partner_menu_start_parameter
+from app.utils.telegram_delivery import is_user_unreachable
 
 
 logger = structlog.get_logger(__name__)
@@ -31,6 +32,11 @@ logger = structlog.get_logger(__name__)
 # Redis key prefix and TTL for pending /start payload backup
 REDIS_PAYLOAD_KEY_PREFIX = 'pending_start_payload:'
 REDIS_PAYLOAD_TTL = 3600  # 1 hour
+
+# Отказы Telegram, означающие, что писать больше некому (бот заблокирован, аккаунт
+# удалён, чат недоступен), логируются debug-строкой: на error-уровне
+# TelegramNotifierProcessor развернул бы traceback в отчёт админам.
+_is_user_unreachable = is_user_unreachable
 
 
 async def save_pending_payload_to_redis(telegram_id: int, payload: str) -> bool:
@@ -193,8 +199,18 @@ class ChannelCheckerMiddleware(BaseMiddleware):
 
             try:
                 await event.message.edit_text(text, reply_markup=channel_sub_kb)
-            except TelegramBadRequest as e:
-                if 'message is not modified' not in str(e).lower():
+            except (TelegramBadRequest, TelegramForbiddenError) as e:
+                if 'message is not modified' in str(e).lower():
+                    pass
+                elif _is_user_unreachable(e):
+                    # Иначе 403 улетит в GlobalErrorMiddleware и станет отчётом
+                    # админам, хотя обновлять клавиатуру попросту некому.
+                    logger.debug(
+                        'Список каналов не обновлён: пользователь недоступен',
+                        telegram_id=telegram_id,
+                        error=str(e),
+                    )
+                else:
                     raise
 
             try:
@@ -254,6 +270,13 @@ class ChannelCheckerMiddleware(BaseMiddleware):
             elif isinstance(event, Update) and event.message:
                 return await bot.send_message(event.message.chat.id, text, reply_markup=channel_sub_kb)
         except Exception as e:
+            if _is_user_unreachable(e):
+                logger.debug(
+                    'Приглашение подписаться не доставлено: пользователь недоступен',
+                    telegram_id=getattr(user, 'id', None),
+                    error=str(e),
+                )
+                return None
             logger.error('Error sending subscription prompt', error=e)
 
     # -- _capture_start_payload ------------------------------------------------
@@ -493,23 +516,23 @@ class ChannelCheckerMiddleware(BaseMiddleware):
 
                 service = SubscriptionService()
                 for subscription in deactivated_subs:
-                    panel_uuid = (
-                        subscription.remnawave_uuid
-                        if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
-                        else user.remnawave_uuid
+                    panel_user_id = (
+                        subscription.remnawave_id
+                        if settings.is_multi_tariff_enabled() and subscription.remnawave_id
+                        else user.remnawave_id
                     )
-                    if panel_uuid:
+                    if panel_user_id:
                         try:
-                            await service.disable_remnawave_user(panel_uuid)
+                            await service.disable_remnawave_user(panel_user_id)
                         except Exception as api_error:
                             logger.error(
                                 'Failed to disable RemnaWave user',
-                                remnawave_uuid=panel_uuid,
+                                remnawave_id=panel_user_id,
                                 api_error=api_error,
                             )
 
                 # Notify user about deactivation
-                if deactivated_subs:
+                if deactivated_subs and settings.is_notifications_enabled():
                     try:
                         normalized = _normalize_channels(channels)
                         texts = get_texts(user.language or DEFAULT_LANGUAGE)
@@ -528,11 +551,18 @@ class ChannelCheckerMiddleware(BaseMiddleware):
                         channel_kb = get_channel_sub_keyboard(normalized, language=user.language)
                         await bot.send_message(telegram_id, notification_text, reply_markup=channel_kb)
                     except Exception as notify_error:
-                        logger.error(
-                            'Failed to send deactivation notification to user',
-                            telegram_id=telegram_id,
-                            notify_error=notify_error,
-                        )
+                        if _is_user_unreachable(notify_error):
+                            logger.debug(
+                                'Уведомление об отключении подписки не доставлено: пользователь недоступен',
+                                telegram_id=telegram_id,
+                                error=str(notify_error),
+                            )
+                        else:
+                            logger.error(
+                                'Failed to send deactivation notification to user',
+                                telegram_id=telegram_id,
+                                notify_error=notify_error,
+                            )
                 await db.commit()
             except Exception as db_error:
                 logger.error(
@@ -581,23 +611,26 @@ class ChannelCheckerMiddleware(BaseMiddleware):
                 # Enable in RemnaWave
                 service = SubscriptionService()
                 for subscription in disabled_subs:
-                    panel_uuid = (
-                        subscription.remnawave_uuid
-                        if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
-                        else user.remnawave_uuid
+                    panel_user_id = (
+                        subscription.remnawave_id
+                        if settings.is_multi_tariff_enabled() and subscription.remnawave_id
+                        else user.remnawave_id
                     )
-                    if panel_uuid:
+                    if panel_user_id:
                         try:
-                            await service.enable_remnawave_user(panel_uuid)
+                            await service.enable_remnawave_user(panel_user_id)
                         except Exception as api_error:
                             logger.error(
                                 'Failed to enable RemnaWave user',
-                                remnawave_uuid=panel_uuid,
+                                remnawave_id=panel_user_id,
                                 api_error=api_error,
                             )
 
                 # Notify user about reactivation
                 try:
+                    if not settings.is_notifications_enabled():
+                        await db.commit()
+                        return
                     texts = get_texts(user.language or DEFAULT_LANGUAGE)
                     if settings.is_multi_tariff_enabled() and len(disabled_subs) > 1:
                         notification_text = texts.t(

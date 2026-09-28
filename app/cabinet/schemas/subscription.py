@@ -58,6 +58,9 @@ class SubscriptionData(BaseModel):
     tariff_id: int | None = None
     tariff_name: str | None = None
     traffic_reset_mode: str | None = None
+    # Старая подписка (платная, без тарифа при включённых тарифах): продления
+    # и автоплатежа нет, единственный путь — выбрать тариф, он надевается на неё же.
+    requires_tariff_selection: bool = False
 
     class Config:
         from_attributes = True
@@ -82,6 +85,8 @@ class RenewalOptionResponse(BaseModel):
     price_rubles: float
     discount_percent: int = 0
     original_price_kopeks: int | None = None
+    # Период, отмеченный оператором как самый выгодный.
+    is_highlighted: bool = False
 
 
 class RenewalRequest(BaseModel):

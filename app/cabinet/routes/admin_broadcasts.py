@@ -7,15 +7,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import BroadcastHistory, Subscription, SubscriptionStatus, Tariff, User
+from app.database.models import BroadcastHistory, PromoGroup, Subscription, SubscriptionStatus, Tariff, User
 from app.handlers.admin.messages import get_target_users_count
 from app.keyboards.admin import BROADCAST_BUTTONS, DEFAULT_BROADCAST_BUTTONS
 from app.services.broadcast_service import (
+    EMAIL_TARGET_PROMO_GROUP_PREFIX,
     BroadcastConfig,
     BroadcastMediaConfig,
     EmailBroadcastConfig,
     broadcast_service,
     email_broadcast_service,
+    parse_email_scoped_target,
 )
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -35,6 +37,8 @@ from ..schemas.broadcasts import (
     EmailFiltersResponse,
     EmailPreviewRequest,
     EmailPreviewResponse,
+    EmailRenderRequest,
+    EmailRenderResponse,
     TariffFilter,
     TariffForBroadcast,
 )
@@ -197,6 +201,11 @@ async def _get_email_filter_count(db: AsyncSession, target: str) -> int:
             )
         )
 
+    elif scoped := parse_email_scoped_target(target):
+        kind, target_id = scoped
+        column = User.promo_group_id if kind == 'promo_group' else User.id
+        query = select(func.count(User.id)).where(*base_conditions, column == target_id)
+
     else:
         return 0
 
@@ -206,7 +215,30 @@ async def _get_email_filter_count(db: AsyncSession, target: str) -> int:
 
 def _validate_email_target(target: str) -> bool:
     """Validate email target filter."""
-    return target in EMAIL_FILTER_LABELS
+    return target in EMAIL_FILTER_LABELS or parse_email_scoped_target(target) is not None
+
+
+async def _ensure_email_scoped_target_exists(db: AsyncSession, target: str) -> None:
+    """Промогруппа/человек из таргета существуют, а у человека есть куда писать.
+
+    Без проверки письмо «одному пользователю» без подтверждённой почты молча
+    завершалось бы рассылкой на ноль адресатов.
+    """
+    scoped = parse_email_scoped_target(target)
+    if scoped is None:
+        return
+    kind, target_id = scoped
+    if kind == 'promo_group':
+        if await db.get(PromoGroup, target_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Promo group not found')
+        return
+    user = await db.get(User, target_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+    if not user.email or not user.email_verified:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='User has no verified email')
+    if user.status != 'active':
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='User is not active')
 
 
 async def _get_tariff_user_counts(db: AsyncSession) -> dict:
@@ -221,6 +253,24 @@ async def _get_tariff_user_counts(db: AsyncSession) -> dict:
         .group_by(Subscription.tariff_id)
     )
     return {row.tariff_id: row.count for row in result.all()}
+
+
+# Telegram: подпись к фото/видео/документу не длиннее 1024 символов (текстовое
+# сообщение — до 4096). Проверяем на входе: иначе каждый получатель получает
+# MEDIA_CAPTION_TOO_LONG, а админ — failed = total без объяснений.
+_MEDIA_CAPTION_LIMIT = 1024
+
+
+def _ensure_media_caption_fits(caption: str) -> None:
+    """Отклонить рассылку с медиа, чью подпись Telegram не примет."""
+    if len(caption) > _MEDIA_CAPTION_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f'Текст слишком длинный для сообщения с медиа. Максимум {_MEDIA_CAPTION_LIMIT} символов, '
+                f'сейчас {len(caption)}. Сократите текст или уберите медиафайл.'
+            ),
+        )
 
 
 def _validate_target(target: str, tariff_ids: set) -> bool:
@@ -412,12 +462,8 @@ async def create_broadcast(
 
     media_payload = request.media
 
-    # Validate caption length for media messages (Telegram limit: 1024 chars)
-    if media_payload and len(message_text) > 1024:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Текст слишком длинный для сообщения с медиа. Максимум 1024 символов, сейчас {len(message_text)}. Сократите текст или уберите медиафайл.',
-        )
+    if media_payload:
+        _ensure_media_caption_fits(media_payload.caption or message_text)
 
     # Create broadcast record
     broadcast = BroadcastHistory(
@@ -525,9 +571,28 @@ async def get_email_filters(
         if key == 'all_email':
             total_with_email = count
 
+    promo_group_filters: list[EmailFilterItem] = []
+    try:
+        promo_groups = (
+            await db.execute(select(PromoGroup).order_by(PromoGroup.priority.desc(), PromoGroup.name))
+        ).scalars()
+        for group in promo_groups:
+            key = f'{EMAIL_TARGET_PROMO_GROUP_PREFIX}{group.id}'
+            promo_group_filters.append(
+                EmailFilterItem(
+                    key=key,
+                    label=group.name,
+                    count=await _get_email_filter_count(db, key),
+                    group='promo_group',
+                )
+            )
+    except Exception as e:
+        logger.warning('Failed to list promo group email filters', error=e)
+
     return EmailFiltersResponse(
         filters=filters,
         total_with_email=total_with_email,
+        promo_group_filters=promo_group_filters,
     )
 
 
@@ -554,6 +619,31 @@ async def preview_email_broadcast(
         )
 
     return EmailPreviewResponse(target=request.target, count=count)
+
+
+@router.post('/email-render', response_model=EmailRenderResponse)
+async def render_email_broadcast(
+    request: EmailRenderRequest,
+    admin: User = Depends(require_permission('broadcasts:read')),
+) -> EmailRenderResponse:
+    """Письмо рассылки так, как его получит адресат.
+
+    Фрагмент HTML встаёт в общую обёртку писем (сохранённую в редакторе
+    шаблонов или встроенную), полный документ уходит как есть — ровно как при
+    отправке, чтобы превью в кабинете не расходилось с письмом.
+    """
+    from app.cabinet.services.email_layout import refresh_email_layout_cache
+    from app.services.broadcast_service import EmailBroadcastService, _EmailRecipient
+
+    await refresh_email_layout_cache()
+    recipient = _EmailRecipient(
+        email=admin.email or 'user@example.com',
+        user_name=admin.username or admin.first_name or 'User',
+        user_id=admin.id,
+        language=request.language or 'ru',
+    )
+    subject, body_html = EmailBroadcastService.render_email(request.subject, request.html_content, recipient)
+    return EmailRenderResponse(subject=subject, body_html=body_html)
 
 
 @router.post('/send', response_model=BroadcastResponse, status_code=status.HTTP_201_CREATED)
@@ -585,6 +675,10 @@ async def create_combined_broadcast(
                 detail='Message text is required for Telegram broadcast',
             )
 
+        # Та же граница, что у POST '' выше: именно этот эндпоинт использует кабинет.
+        if request.media:
+            _ensure_media_caption_fits(request.media.caption or request.message_text.strip())
+
         # Validate buttons
         if not _validate_buttons(request.selected_buttons):
             raise HTTPException(
@@ -599,6 +693,8 @@ async def create_combined_broadcast(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f'Invalid email target: {request.target}',
             )
+        if request.channel == 'email':
+            await _ensure_email_scoped_target_exists(db, request.target)
 
         # Validate email fields
         if not request.email_subject or not request.email_subject.strip():
@@ -673,6 +769,7 @@ async def create_combined_broadcast(
             email_subject=request.email_subject.strip(),
             email_html_content=request.email_html_content.strip(),
             initiator_name=admin_name,
+            category=request.category,
         )
 
         await email_broadcast_service.start_broadcast(broadcast.id, email_config)

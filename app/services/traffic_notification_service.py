@@ -22,6 +22,8 @@ from app.database.database import AsyncSessionLocal
 from app.database.models import Subscription, TrafficNotificationState, User
 from app.external.remnawave_api import UserStatus as PanelStatus
 from app.localization.texts import get_texts
+from app.services.notification_settings_service import NotificationSettingsService
+from app.services.panel_sync import find_foreign_panel_owner
 from app.services.remnawave_service import RemnaWaveService
 from app.utils.cache import cache
 from app.utils.notification_prefs import is_traffic_warning_enabled
@@ -40,16 +42,22 @@ def reached_threshold(used_bytes: int, limit_bytes: int, limited: bool = False) 
     return max((level for level in THRESHOLDS if used_bytes * 100 >= limit_bytes * level), default=0)
 
 
-def panel_uuid(subscription):
+def panel_user_id(subscription):
+    return subscription.remnawave_id if settings.is_multi_tariff_enabled() else subscription.user.remnawave_id
+
+
+def legacy_panel_uuid(subscription):
+    """Historical namespace only; never pass this UUID to the 3.x API."""
     return subscription.remnawave_uuid if settings.is_multi_tariff_enabled() else subscription.user.remnawave_uuid
 
 
-def traffic_cycle(panel, limit_bytes: int) -> str:
+def traffic_cycle(panel, limit_bytes: int, *, legacy_uuid: str | None = None) -> str:
     reset = panel.last_traffic_reset_at
     if reset is not None:
         reset = reset.replace(tzinfo=UTC) if reset.tzinfo is None else reset.astimezone(UTC)
-    identity = [panel.uuid, reset.isoformat() if reset else None, limit_bytes]
-    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    identity = [legacy_uuid or panel.id, reset.isoformat() if reset else None, limit_bytes]
+    digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    return digest if legacy_uuid else f'id:{digest[:61]}'
 
 
 class TrafficNotificationService:
@@ -66,8 +74,8 @@ class TrafficNotificationService:
                     await db.execute(
                         select(
                             Subscription.id,
-                            Subscription.remnawave_uuid,
-                            User.remnawave_uuid,
+                            Subscription.remnawave_id,
+                            User.remnawave_id,
                             Subscription.traffic_limit_gb,
                             TrafficNotificationState.subscription_id,
                         )
@@ -84,10 +92,10 @@ class TrafficNotificationService:
                     )
                 ).all()
             targets = {}
-            for sid, sub_uuid, user_uuid, limit, state_id in rows:
-                uuid = sub_uuid if settings.is_multi_tariff_enabled() else user_uuid
-                if uuid:
-                    targets.setdefault(uuid, []).append((sid, limit * GB, state_id is not None))
+            for sid, sub_id, user_id, limit, state_id in rows:
+                identifier = sub_id if settings.is_multi_tariff_enabled() else user_id
+                if identifier:
+                    targets.setdefault(identifier, []).append((sid, limit * GB, state_id is not None))
             if not targets:
                 return
             cursor = None
@@ -97,7 +105,7 @@ class TrafficNotificationService:
                     page = await api.get_all_users_page_stream(cursor=cursor, size=1000)
                     observed_at = datetime.now(UTC)
                     for panel in page.get('users', []):
-                        matches = targets.pop(panel.uuid, [])
+                        matches = targets.pop(panel.id, [])
                         if panel.user_traffic is None:
                             continue
                         for sid, limit, has_state in matches:
@@ -124,18 +132,22 @@ class TrafficNotificationService:
             sub = await db.scalar(
                 select(Subscription).options(selectinload(Subscription.user)).where(Subscription.id == subscription_id)
             )
-            uuid = panel_uuid(sub) if sub and sub.user else None
-        if not uuid:
+            identifier = panel_user_id(sub) if sub and sub.user else None
+        if not identifier:
             return
         # This path is used by signed webhooks; fetch authoritative current data
         # instead of trusting a delayed webhook's counter or threshold.
         async with self.panel.get_api_client() as api:
-            panel = await api.get_user_by_uuid(uuid)
+            panel = await api.get_user_by_id(identifier)
         if panel:
             await self.process_sample(subscription_id, panel, datetime.now(UTC))
 
     async def process_sample(self, subscription_id: int, panel, observed_at: datetime):
-        if not self.bot or panel.user_traffic is None:
+        if (
+            not self.bot
+            or panel.user_traffic is None
+            or not NotificationSettingsService.are_notifications_globally_enabled()
+        ):
             return False
         if panel.status not in (PanelStatus.ACTIVE, PanelStatus.LIMITED):
             return False
@@ -155,9 +167,15 @@ class TrafficNotificationService:
                 .where(Subscription.id == subscription_id)
                 .with_for_update()
             )
-            if not sub or not sub.user or panel_uuid(sub) != panel.uuid:
+            if not sub or not sub.user or panel_user_id(sub) != panel.id:
                 return False
             user = sub.user
+            if (
+                await find_foreign_panel_owner(db, user, sub, panel.id, multi_tariff=settings.is_multi_tariff_enabled())
+                is not None
+            ):
+                logger.warning('Traffic sample belongs to another subscription; state retained', subscription_id=sub.id)
+                return False
             if (
                 sub.status not in ('active', 'trial', 'limited')
                 or not user.telegram_id
@@ -169,8 +187,17 @@ class TrafficNotificationService:
             if limit <= 0:
                 return False
             level = reached_threshold(used, limit, panel.status == PanelStatus.LIMITED)
-            cycle = traffic_cycle(panel, limit)
             state = await db.get(TrafficNotificationState, sub.id)
+            identity_changed = state is not None and state.panel_user_id not in (None, panel.id)
+            # Keep old UUID hashes on the first verified numeric binding. Once
+            # an account is replaced, its numeric namespace stays authoritative
+            # even if an inert historical UUID is still present on the row.
+            legacy_uuid = legacy_panel_uuid(sub)
+            numeric_namespace = identity_changed or (state is not None and state.cycle_key.startswith('id:'))
+            if state and not numeric_namespace and not legacy_uuid:
+                logger.warning('Traffic cycle identity unresolved; state retained', subscription_id=sub.id)
+                return False
+            cycle = traffic_cycle(panel, limit, legacy_uuid=None if numeric_namespace else legacy_uuid)
             if state and observed_at <= state.observed_at:
                 return False
             if state is None:
@@ -178,6 +205,7 @@ class TrafficNotificationService:
                 previous = reached_threshold(int((sub.traffic_used_gb or 0) * GB), limit) if legacy_sent else 0
                 state = TrafficNotificationState(
                     subscription_id=sub.id,
+                    panel_user_id=panel.id,
                     cycle_key=cycle,
                     generation=0,
                     highest_threshold=min(previous, level),
@@ -186,12 +214,17 @@ class TrafficNotificationService:
                     delivery_status='observed',
                 )
                 db.add(state)
-            elif state.cycle_key != cycle or (panel.last_traffic_reset_at is None and used < state.used_bytes):
+            elif (
+                identity_changed
+                or state.cycle_key != cycle
+                or (panel.last_traffic_reset_at is None and used < state.used_bytes)
+            ):
                 state.cycle_key = cycle
                 state.generation += 1
                 state.highest_threshold = 0
                 state.delivery_status = 'observed'
                 state.next_attempt_at = None
+            state.panel_user_id = panel.id
             state.used_bytes = used
             state.observed_at = observed_at
             sub.traffic_used_gb = used / GB

@@ -7,7 +7,7 @@ from pathlib import Path
 
 def test_changed_runtime_paths_have_no_undefined_or_unbound_names():
     root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(  # noqa: S603 - fixed local Ruff command and repository paths, no user input
+    result = subprocess.run(  # Fixed local Ruff command and repository paths, no user input.
         [
             sys.executable,
             '-m',

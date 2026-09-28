@@ -27,21 +27,19 @@ output. The runner records their source SHA256 alongside test results.
 ## Reproduce
 
 Use a checkout without `.env` and Python 3.13. Dependencies come from the existing
-frozen lockfile, with one explicitly versioned test-only addition needed for
+frozen lockfile. The merged upstream dependencies include greenlet for
 SQLAlchemy asyncio on this macOS environment:
 
 ```sh
 uv sync --frozen --dev --python 3.13
-uv pip install --python .venv/bin/python greenlet==3.5.5
 .venv/bin/python tests/baseline/run.py \
   --pg-bin /absolute/path/to/postgresql/bin \
   --output /tmp/custom-baseline-new-run
 ```
 
-Use `.venv/bin/python` after the test-only install: a later `uv run`/`uv sync`
-can remove the overlay package. Neither the runtime dependency declarations nor
-`uv.lock` are changed by this setup. The PostgreSQL build used for the first run
-is 15.13, matching the major version of the test bot's database.
+The PostgreSQL build used for the first run is 15.13, matching the major
+version of the test bot's database. The historical phase-1 greenlet overlay is
+no longer needed with the pinned v4.15.0 lockfile.
 
 The runner creates a new cluster under `/tmp` for every invocation. It never
 accepts an existing database URL. PostgreSQL has no TCP listener and rejects
@@ -52,7 +50,9 @@ and remove their own random schemas inside this disposable cluster.
 
 The child process receives only basic OS variables and synthetic test settings.
 The pytest plugin rejects non-Unix `socket.connect` and `connect_ex`, so an
-accidental real HTTP provider request fails. Tests continue to use their existing
+accidental real HTTP provider request fails. The full suite has one explicit
+exception: its aiohttp TestServer fixture registers only its concrete loopback
+address/port for the server lifetime; other ports, external hosts and UDP remain blocked. Tests continue to use their existing
 provider mocks. This harness does not start the bot or a Telegram polling loop.
 
 The cluster stops on completion. `--keep-postgres` is available for the next local
@@ -65,7 +65,7 @@ Each new output directory receives `identity.json` (commit, dirty Git status,
 versions, hashes of application/migration/test sources including the harness and
 untracked additions, dependency configuration, manifest), `command.json`, PostgreSQL setup/server logs, `pytest.log`, JUnit XML,
 and `result.json`. Exit status is nonzero if pytest fails, produces no tests, or
-skips anything. PostgreSQL skips must never be reported as a passing baseline.
+skips anything in selected suites. RuntimeWarning and PytestUnraisableExceptionWarning fail the run, including unawaited coroutines. PostgreSQL skips must never be reported as a passing baseline.
 
 ## Limits during the merge
 
@@ -74,8 +74,45 @@ implementation. Source-shape tests and migration filename references will need
 review when adapting to `panel_sync` and distinct custom revision IDs. Do not
 reintroduce the old architecture solely to satisfy those assertions.
 
-The traffic-reset policy is pending user choice; current tests record current
-behavior and do not settle that choice. Public 12-character gift claim codes and
-the existing cabinet gift route are to be preserved, as confirmed by the user.
+Accepted policy: every paid renewal resets traffic when RESET_TRAFFIC_ON_PAYMENT
+is true; the false setting remains off. Public 12-character gift claim codes and
+the existing cabinet gift route are preserved. Legal-consent registration gating
+remains off until the cabinet is ready; tariff-less traffic purchase uses the
+upstream tariff-required response.
 This run does not prove Remnawave 3.x compatibility, a safe schema transition,
 live provider behavior, VPN traffic, or successful deployment.
+
+## Merged integration gate
+
+`--suite integration` selects `integration-contracts.json`: each custom baseline
+file plus bridge/runtime migration proofs and relevant upstream API, panel_sync,
+grace, auth/payment/gift and Telegram regressions. Paths are deduplicated across
+groups. `--suite runtime` isolates strict catalog parity and durable backup
+roundtrips for diagnosis; `--suite migration` retains the frozen bridge/DDL proof.
+`--suite full` lets pytest collect the entire configured `tests/` directory, matching the upstream CI full-suite step without selecting or excluding test files. It uses the upstream default strict asyncio mode and retains the PostgreSQL and warning gates. Selected suites retain their historical explicit auto mode.
+
+For a full run, `check_results.py` accepts only the 17 exact optional NOT RUN tuples in `optional-not-run.json`, with byte hashes of their pinned upstream test sources. These are 12 credential-gated bschek live tests, two Apple IAP credential cases, and three manually reviewed referral static checks. They are never counted as passed: `baseline_complete` stays false; `mandatory_complete` may be true with status `passed_with_optional_not_run`. Changed/additional skips, xfail, strict XPASS, pytest failure, nonzero exit, missing/empty JUnit or no passed test fail the gate. CI invokes the same checker and supplies both PostgreSQL URL variables. Source evidence also records the staged Git tree hash and workflows/Makefile.
+
+The harness supplies both TEST_POSTGRES_URL and upstream TEST_DATABASE_URL to
+its newly created Unix-only cluster and sets REQUIRE_POSTGRES_TESTS=1. Stateful
+cases are not allowed to disappear as skips.
+
+Runtime schema checks compare all catalog fields for both supported old fork
+profiles and a shared-0100 schema upgraded through real pinned upstream DDL.
+They also verify original-column rows, repeat startup, the disabled built-in
+seed, legacy gift aliases, and complete ORM backup/restore including explicit
+SQL NULL. A missing durable or association table must fail backup creation without publishing
+an archive or removing an existing good archive.
+
+The runtime gate also covers the pinned upstream **metadata bootstrap** schema,
+independently frozen from upstream models into SQL with source/provenance hashes.
+It verifies existing-index shape checks, absence of a duplicated seed, and a
+clear refusal when an old nullable payment flag is unknown. Campaign-linked
+referral earnings are included in the real backup roundtrip. Non-unique
+constraint errors during restore propagate; only proven duplicate-key errors
+retain the existing partial-merge handling.
+
+A restore with replacement is not globally atomic: its existing TRUNCATE uses
+a separate connection. A later insert failure is reported as failure, but does
+not restore the data removed by that TRUNCATE. An actual rollout still needs a
+coordinated snapshot and rehearsed recovery procedure.

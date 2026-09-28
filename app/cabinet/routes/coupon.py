@@ -22,6 +22,7 @@ from app.services.coupon_service import (
 )
 from app.services.notification_delivery_service import NotificationType, notification_delivery_service
 from app.utils.cache import RateLimitCache
+from app.utils.timezone import format_local_datetime
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.coupons import CouponRedeemRequest, CouponRedeemResponse, CouponStatusResponse
@@ -37,6 +38,7 @@ _ERROR_MESSAGES = {
     'invalid': 'Coupon not found or already used',
     'expired': 'Coupon has expired',
     'already_redeemed_by_you': 'You have already redeemed this coupon',
+    'per_user_limit': 'You have reached your limit of coupons from this batch',
     'internal': 'Server error occurred',
 }
 
@@ -64,7 +66,7 @@ async def redeem_coupon_endpoint(
             notification_type = (
                 NotificationType.SUBSCRIPTION_RENEWED if result.renewed else NotificationType.SUBSCRIPTION_ACTIVATED
             )
-            end_date_str = result.end_date.strftime('%d.%m.%Y') if result.end_date else ''
+            end_date_str = format_local_datetime(result.end_date, '%d.%m.%Y') if result.end_date else ''
             await notification_delivery_service.send_notification(
                 user=user,
                 notification_type=notification_type,

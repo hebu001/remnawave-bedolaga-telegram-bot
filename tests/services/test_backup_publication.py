@@ -76,7 +76,7 @@ async def test_archive_not_visible_until_compression_completes(service, monkeypa
         assert (await service.create_backup())[0] is False
         release.set()
         success, _, path = await task
-        assert success is True and Path(path).exists()
+        assert success is True and await asyncio.to_thread(Path(path).exists)
         assert len(await service.get_backup_list()) == 1
     finally:
         release.set()

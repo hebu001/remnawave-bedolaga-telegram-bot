@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cabinet.auth.email_auth_gate import is_email_auth_enabled
 from app.config import settings
 from app.database.crud.system_setting import get_setting_value
 from app.database.crud.user import (
@@ -24,6 +25,7 @@ from app.database.crud.user import (
     get_user_by_id,
     get_user_by_oauth_provider,
     get_user_by_telegram_id,
+    provider_attested_email,
     set_user_oauth_provider_id,
 )
 from app.database.models import User
@@ -45,6 +47,7 @@ from ..auth.merge_service import (
 from ..auth.oauth_providers import (
     generate_oauth_state,
     get_provider,
+    resolve_oauth_redirect_uri,
     validate_oauth_state,
 )
 from ..auth.telegram_auth import (
@@ -81,10 +84,10 @@ class OAuthStateData(TypedDict):
     code_verifier: NotRequired[str]  # PKCE code verifier (VK)
 
 
-def _get_active_providers() -> list[str]:
-    """Вернуть список активных провайдеров аутентификации (только включённые)."""
+async def _get_active_providers(db: AsyncSession) -> list[str]:
+    """Активные способы входа: email — по тому же переключателю, что UI и роуты."""
     providers: list[str] = ['telegram']
-    if settings.is_cabinet_email_auth_enabled():
+    if await is_email_auth_enabled(db):
         providers.append('email')
     providers.extend(settings.get_enabled_oauth_provider_names())
     return providers
@@ -99,6 +102,9 @@ class LinkedProvider(BaseModel):
     provider: str
     linked: bool
     identifier: str | None = None
+    #: Email, который будет забыт при отвязке: он получен от этого провайдера,
+    #: а пароля для входа по почте нет. Кабинет предупреждает перед отвязкой.
+    forgets_email: str | None = None
 
 
 class LinkedProvidersResponse(BaseModel):
@@ -237,7 +243,9 @@ async def _exchange_and_link_oauth(
 
     Used by both link_provider_callback (JWT-authed) and link_server_complete (state-authed).
     """
-    oauth_provider = get_provider(provider)
+    # Тот же redirect_uri, что был выбран на init: провайдер сверяет их на
+    # обмене кода, а разошедшиеся значения дают invalid_grant.
+    oauth_provider = get_provider(provider, redirect_uri=state_data.get('oauth_redirect_uri'))
     if not oauth_provider:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -298,24 +306,33 @@ async def _exchange_and_link_oauth(
     # Check if provider_id is linked to ANOTHER account.
     existing_user = await get_user_by_oauth_provider(db, provider, user_info.provider_id)
     if existing_user and existing_user.id != user.id:
-        # A social login belongs to exactly ONE account. This used to silently
-        # offer an account MERGE (absorb the other account) — surprising and
-        # unsafe: linking a login should never move/merge accounts. Refuse it.
-        # To move the social login, the owner unlinks it from the other account
-        # first; to deliberately combine two accounts, use the email/Telegram
-        # merge flows. (You can only reach here by completing OAuth as this
-        # provider account, so this is not a takeover — but it must not be a
-        # silent merge either.)
+        # Соцсеть уже держит другой аккаунт — обычно пустой, заведённый входом
+        # «через Google» на сайте. Отказ 409 был тупиком (#3263): отвязать соцсеть
+        # от того аккаунта нельзя — она там единственный способ входа, а удалить
+        # его самому человеку нечем. Люди заводили дубли и платили повторно.
+        #
+        # Предлагаем слияние, как у Telegram: владение обоими аккаунтами доказано
+        # (сессия этого + только что пройденный вход через провайдера того), а
+        # само слияние не молчаливое — страница /merge показывает оба аккаунта,
+        # просит выбрать подписку и подтвердить; токен одноразовый и привязан к
+        # тому, кто начал. Соцсеть переносится при слиянии (execute_merge).
         logger.info(
-            'Account linking rejected: provider already linked to another account',
+            'Account linking conflict: provider already linked to another account, offering merge',
             context=log_context,
             provider=provider,
             current_user_id=user.id,
             existing_user_id=existing_user.id,
         )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=('This social account is already linked to a different account. Unlink it from that account first.'),
+        merge_token = await create_merge_token(
+            primary_user_id=user.id,
+            secondary_user_id=existing_user.id,
+            provider=provider,
+            provider_id=user_info.provider_id,
+        )
+        return LinkCallbackResponse(
+            success=False,
+            merge_required=True,
+            merge_token=merge_token,
         )
 
     # Backfill the account email from the provider when a Telegram-first (or any
@@ -373,16 +390,18 @@ router = APIRouter(prefix='/auth/account', tags=['Cabinet Account Linking'])
 @router.get('/linked-providers', response_model=LinkedProvidersResponse)
 async def get_linked_providers(
     user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
 ) -> LinkedProvidersResponse:
     """Return all auth methods with their link status for the current user."""
     providers: list[LinkedProvider] = []
-    for provider in _get_active_providers():
+    for provider in await _get_active_providers(db):
         identifier = _get_provider_identifier(user, provider)
         providers.append(
             LinkedProvider(
                 provider=provider,
                 linked=identifier is not None,
                 identifier=identifier,
+                forgets_email=provider_attested_email(user, provider) if identifier else None,
             )
         )
     return LinkedProvidersResponse(providers=providers)
@@ -391,6 +410,7 @@ async def get_linked_providers(
 @router.get('/link/{provider}/init', response_model=LinkInitResponse)
 async def link_provider_init(
     provider: OAuthProviderName,
+    http_request: Request,
     user: User = Depends(get_current_cabinet_user),
 ) -> LinkInitResponse:
     """Start OAuth flow for linking a new provider to the current account."""
@@ -403,7 +423,11 @@ async def link_provider_init(
             detail='Provider is already linked to your account',
         )
 
-    oauth_provider = get_provider(provider)
+    # Привязка уходит на тот же домен, с которого пришёл запрос, — иначе
+    # пользователь с зеркала возвращается на канонический и привязка срывается
+    # (та же причина, что и у логина в routes/oauth.py).
+    redirect_uri = resolve_oauth_redirect_uri(http_request.headers.get('origin'))
+    oauth_provider = get_provider(provider, redirect_uri=redirect_uri)
     if not oauth_provider:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -415,6 +439,7 @@ async def link_provider_init(
     extra_data: dict[str, str] = {
         'linking': 'true',
         'user_id': str(user.id),
+        'oauth_redirect_uri': redirect_uri,
     }
     if auth_extra:
         extra_data.update(auth_extra)
@@ -927,7 +952,7 @@ async def execute_merge_endpoint(
     # RemnaWave user deletions are DEFERRED until after commit: an external delete
     # can't be rolled back with the DB, so deleting before commit would (on a
     # failed merge) leave a deleted panel user while the DB merge is rolled back.
-    deferred_deletions: list[str] = []
+    deferred_deletions: list[int] = []
     from app.services.grace_access_runtime import GraceAccessDeletionBlocked
 
     try:

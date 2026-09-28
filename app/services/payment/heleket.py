@@ -297,7 +297,7 @@ class HeleketPaymentMixin:
             return updated_payment
 
         if status_normalized not in {'paid', 'paid_over'}:
-            logger.info('Heleket платеж в статусе , зачисление не требуется', uuid=updated_payment.uuid, status=status)
+            logger.info('Heleket платёж в этом статусе зачисления не требует', uuid=updated_payment.uuid, status=status)
             return updated_payment
 
         amount_kopeks = updated_payment.amount_kopeks
@@ -425,7 +425,7 @@ class HeleketPaymentMixin:
                 logger.error('Ошибка отправки админ-уведомления Heleket', error=error)
 
             # Отправляем уведомление только Telegram-пользователям
-            if user.telegram_id:
+            if user.telegram_id and settings.is_notifications_enabled():
                 try:
                     keyboard = await self.build_topup_success_keyboard(user)
 

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "scope": "Merged runtime migration schema and backup completeness; isolated PostgreSQL only",
+  "upstream_commit": "877690a7039d1326b2c00eda3e297879b80c0678",
+  "groups": {
+    "runtime_migrations": ["tests/integration/test_merged_runtime_migrations.py"]
+  }
+}

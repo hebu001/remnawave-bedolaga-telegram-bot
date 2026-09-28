@@ -9,6 +9,10 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cabinet.auth.registration_access import (
+    evaluate_public_registration,
+    raise_for_registration_decision,
+)
 from app.cabinet.dependencies import get_cabinet_db
 from app.cabinet.ip_utils import get_client_ip
 from app.cabinet.utils.locale import DEFAULT_LOCALE, resolve_locale_text
@@ -18,20 +22,29 @@ from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.user import get_user_by_email
 from app.database.models import GuestPurchase, GuestPurchaseStatus, LandingPage, Tariff
 from app.services.gift_claim_service import (
-    build_gift_bot_link,
-    build_gift_web_link,
+    GiftClaimAlreadyOwnedError,
+    GiftClaimNotActivatableError,
+    GiftClaimNotFoundError,
+    GiftClaimSelfActivationError,
+    claim_gift_for_user,
     get_gift_by_claim_identifier,
+    gift_public_code,
 )
 from app.services.guest_purchase_service import (
     GuestPurchaseError,
     _find_or_create_user,
     activate_purchase as activate_guest_purchase,
     create_purchase,
+    evaluate_guest_purchase_registration,
     validate_and_calculate,
 )
 from app.services.payment_method_config_service import _get_method_defaults
 from app.services.payment_service import PaymentService
+from app.services.registration_access_service import RegistrationChannel
 from app.utils.cache import RateLimitCache, cache
+from app.utils.gift_links import (
+    build_gift_claim_artifacts,
+)
 
 
 logger = structlog.get_logger(__name__)
@@ -56,6 +69,9 @@ class LandingTariffPeriod(BaseModel):
     original_price_kopeks: int | None = None  # set if discount active
     original_price_label: str | None = None
     discount_percent: int | None = None  # effective discount for this tariff
+    # Период, отмеченный оператором как самый выгодный: страница обводит его
+    # рамкой и выбирает сразу, вместо первого по счёту.
+    is_highlighted: bool = False
 
 
 class LandingTariff(BaseModel):
@@ -66,6 +82,7 @@ class LandingTariff(BaseModel):
     device_limit: int
     tier_level: int
     periods: list[LandingTariffPeriod]
+    is_highlighted: bool = False  # тариф отмечен оператором как выгодный
     is_daily: bool = False  # суточный тариф: единственный период — 1 день
     daily_price_kopeks: int = 0
 
@@ -118,6 +135,11 @@ class LandingConfigResponse(BaseModel):
 
 _EMAIL_RE = re.compile(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
 _TELEGRAM_RE = re.compile(r'^@?[a-zA-Z][a-zA-Z0-9_]{4,31}$')
+# Тот же набор символов, что валидирует кабинет в schemas/auth.py и утилита
+# captureCampaignFromUrl() во фронтенде — слаг ходит между ними без переводов.
+# Сверяем через fullmatch: у re «$» пропускает завершающий перевод строки, а у
+# pydantic-паттерна в schemas/auth.py — нет, и «одинаковая» проверка разошлась бы.
+_CAMPAIGN_SLUG_RE = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
 
 
 def _validate_contact(contact_type: str, contact_value: str) -> None:
@@ -126,6 +148,29 @@ def _validate_contact(contact_type: str, contact_value: str) -> None:
         raise ValueError('Invalid email format')
     if contact_type == 'telegram' and not _TELEGRAM_RE.match(contact_value):
         raise ValueError('Invalid Telegram username format')
+
+
+def _extract_campaign_slug(body_slug: str | None, request: Request) -> str | None:
+    """Resolve the advertising campaign slug for a guest purchase.
+
+    Body wins over cookie: the body works for a landing on any domain, while
+    the cookie only survives when the landing sits on a sibling subdomain of
+    the cabinet. A malformed value is dropped instead of silently falling back
+    to the other source — attributing a purchase to the wrong campaign is worse
+    than not attributing it at all.
+
+    A blank body value is «not sent», not «sent and malformed»: a frontend that
+    always fills the field from storage posts an empty string when there is no
+    campaign, and treating that as a malformed slug would disable the cookie
+    source on exactly the deployment it exists for.
+    """
+    if body_slug is not None and body_slug.strip():
+        return body_slug if _CAMPAIGN_SLUG_RE.fullmatch(body_slug) else None
+
+    cookie_slug = request.cookies.get('campaign')
+    if cookie_slug and _CAMPAIGN_SLUG_RE.fullmatch(cookie_slug):
+        return cookie_slug
+    return None
 
 
 class PurchaseRequest(BaseModel):
@@ -142,6 +187,7 @@ class PurchaseRequest(BaseModel):
     referrer: str | None = Field(default=None, max_length=500)
     subid: str | None = Field(default=None, max_length=255)
     yclid: str | None = Field(default=None, max_length=64, pattern=r'^[0-9]{1,64}$')
+    campaign_slug: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode='after')
     def validate_contacts(self) -> 'PurchaseRequest':
@@ -179,6 +225,9 @@ class PurchaseStatusResponse(BaseModel):
     is_claimable: bool = False
     claim_url: str | None = None
     bot_claim_link: str | None = None
+    gift_code: str | None = None
+    bot_claim_url: str | None = None
+    cabinet_claim_url: str | None = None
 
 
 class GiftClaimRequest(BaseModel):
@@ -291,9 +340,30 @@ def _build_purchase_status_response(purchase: GuestPurchase) -> PurchaseStatusRe
     )
     claim_url: str | None = None
     bot_claim_link: str | None = None
+    gift_code: str | None = None
+    bot_claim_url: str | None = None
+    cabinet_claim_url: str | None = None
+
     if is_claimable:
-        claim_url = build_gift_web_link(purchase)
-        bot_claim_link = build_gift_bot_link(purchase)
+        bot_username = settings.get_bot_username()
+        cabinet_url = settings.CABINET_URL
+        try:
+            artifacts = build_gift_claim_artifacts(
+                purchase.token,
+                claim_code=gift_public_code(purchase),
+                bot_username=bot_username,
+                cabinet_url=cabinet_url,
+            )
+            gift_code = artifacts.public_code
+            bot_claim_url = artifacts.bot_claim_url
+            cabinet_claim_url = artifacts.cabinet_claim_url
+            # Keep legacy fields populated with exact values for backwards compatibility
+            claim_url = artifacts.cabinet_claim_url
+            bot_claim_link = artifacts.bot_claim_url
+        except Exception:
+            # Ссылки — единственный способ передать подарок, поэтому молча отдавать
+            # пустой ответ нельзя: покупатель решит, что подарок не оплатился.
+            logger.exception('Failed to build gift claim artifacts', purchase_id=purchase.id)
 
     return PurchaseStatusResponse(
         status=purchase.status,
@@ -314,6 +384,9 @@ def _build_purchase_status_response(purchase: GuestPurchase) -> PurchaseStatusRe
         is_claimable=is_claimable,
         claim_url=claim_url,
         bot_claim_link=bot_claim_link,
+        gift_code=gift_code,
+        bot_claim_url=bot_claim_url,
+        cabinet_claim_url=cabinet_claim_url,
     )
 
 
@@ -420,6 +493,7 @@ async def _load_landing_tariffs(
                     original_price_kopeks=original_price_kopeks,
                     original_price_label=original_price_label,
                     discount_percent=effective_discount,
+                    is_highlighted=tariff.highlight_period_days == days,
                 )
             )
 
@@ -435,6 +509,7 @@ async def _load_landing_tariffs(
                 device_limit=tariff.device_limit,
                 tier_level=tariff.tier_level,
                 periods=periods,
+                is_highlighted=bool(tariff.is_highlighted),
                 is_daily=bool(tariff.is_daily),
                 daily_price_kopeks=tariff.daily_price_kopeks or 0,
             )
@@ -558,8 +633,7 @@ async def claim_gift(
     if await RateLimitCache.is_ip_rate_limited(client_ip, 'gift_claim', limit=5, window=60, fail_closed=True):
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Too many requests')
 
-    # Lock the row so concurrent claims serialize (exactly one binds). New short
-    # claim codes are exact-match; legacy token forms remain readable.
+    # Lock exact public claim code or an explicitly preserved legacy identifier.
     purchase = await get_gift_by_claim_identifier(db, token, for_update=True)
     if purchase is None or not purchase.is_gift:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Gift not found')
@@ -584,18 +658,40 @@ async def claim_gift(
     if purchase.user_id is not None and (existing_user is None or purchase.user_id != existing_user.id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='This gift has already been claimed')
 
+    # Public web claim cannot create or revive an account while invite-only is
+    # enabled — the typed email is not proof of an administrative identity. The
+    # full 64-char gift token required above IS the invitation, though: it is the
+    # same bearer secret the Telegram ``GIFT_`` deep link carries, so the claim is
+    # admitted whenever gift links are an accepted invite (INVITE_ONLY_ALLOW_GIFT_LINKS).
+    decision = await evaluate_public_registration(
+        db,
+        channel=RegistrationChannel.LANDING_GIFT_CLAIM,
+        existing_user=existing_user,
+        email=body.email,
+        email_verified=False,
+        verified_admin=False,
+        start_parameter=f'GIFT_{token}',
+    )
+    raise_for_registration_decision(decision)
+
     # Guards passed — now create/finalize the account the gift binds to.
     user, _is_new = await _find_or_create_user(db, 'email', body.email, purchase=purchase, tariff_id=purchase.tariff_id)
 
-    # Bind (if unbound) and move PAID → PENDING_ACTIVATION so activate accepts it.
-    if purchase.user_id is None:
-        purchase.user_id = user.id
-    if purchase.status == GuestPurchaseStatus.PAID.value:
-        purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
-    await db.flush()
-
     try:
-        purchase = await activate_guest_purchase(db, purchase.token, skip_notification=True)
+        purchase = await claim_gift_for_user(
+            db,
+            claimant_user_id=user.id,
+            claim_input=token,
+            allow_legacy_short=False,
+        )
+    except GiftClaimNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Gift not found') from exc
+    except GiftClaimAlreadyOwnedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='This gift has already been claimed') from exc
+    except GiftClaimSelfActivationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Cannot activate your own gift') from exc
+    except GiftClaimNotActivatableError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='This gift cannot be activated') from exc
     except GuestPurchaseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
@@ -796,6 +892,18 @@ async def create_landing_purchase(
             detail=f'Amount exceeds the maximum ({settings.format_price(max_amount)}) for this payment method',
         )
 
+    # A non-gift landing purchase would create or revive the recipient after
+    # payment. Enforce the current policy before creating any payment record;
+    # fulfillment repeats the check immediately before mutating User.
+    if not body.is_gift:
+        _, decision = await evaluate_guest_purchase_registration(
+            db,
+            channel=RegistrationChannel.LANDING_PURCHASE,
+            contact_type=body.contact_type,
+            contact_value=body.contact_value,
+        )
+        raise_for_registration_decision(decision)
+
     # Create purchase record (no commit yet — wait for payment creation)
     purchase = await create_purchase(
         db,
@@ -812,6 +920,7 @@ async def create_landing_purchase(
         gift_message=body.gift_message,
         subid=body.subid,
         referrer=body.referrer,
+        campaign_slug=_extract_campaign_slug(body.campaign_slug, raw_request),
         commit=False,
     )
 
@@ -853,7 +962,7 @@ async def create_landing_purchase(
         await db.rollback()
         logger.error(
             'Payment created but no payment_url returned',
-            purchase_token=purchase.token[:5],
+            purchase_id=purchase.id,
             provider=payment_result.get('provider'),
         )
         raise HTTPException(

@@ -241,7 +241,7 @@ class ContestRotationService:
         try:
             return ZoneInfo(tz_name)
         except Exception:
-            logger.warning('Не удалось загрузить TZ , используем UTC', tz_name=tz_name)
+            logger.warning('Не удалось загрузить часовой пояс — используем UTC', tz_name=tz_name)
             return ZoneInfo('UTC')
 
     def _build_payload_for_template(self, tpl: ContestTemplate) -> dict:
@@ -332,7 +332,7 @@ class ContestRotationService:
 
     async def _broadcast_to_users(self, text: str) -> None:
         """Отправляет анонс всем пользователям с активной/триальной подпиской."""
-        if not self.bot:
+        if not self.bot or not settings.is_notifications_enabled():
             return
 
         try:
@@ -358,6 +358,10 @@ class ContestRotationService:
                     nonlocal sent, failed
                     # Skip email-only users (no telegram_id)
                     if not u.telegram_id:
+                        return
+                    from app.utils.notification_prefs import is_promo_offers_enabled
+
+                    if not is_promo_offers_enabled(u):
                         return
                     async with semaphore:
                         try:

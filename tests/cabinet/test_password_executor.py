@@ -175,6 +175,8 @@ async def test_overlong_passwords_do_not_even_enter_executor(executor, monkeypat
     ],
 )
 async def test_saturated_password_endpoints_return_retryable_503_without_writes(monkeypatch, path, auto_create):
+    # Feature-gate policy is covered separately; this fixture owns bcrypt admission.
+    monkeypatch.setattr(auth, 'require_email_auth_enabled', AsyncMock())
     pool = PasswordExecutor(workers=1, capacity=1)
     monkeypatch.setattr(password_utils, 'password_executor', pool)
     operation, started, release = blocking_work()
@@ -225,6 +227,7 @@ async def test_saturated_password_endpoints_return_retryable_503_without_writes(
 
 @pytest.mark.asyncio
 async def test_account_limit_is_normalized_and_shared_across_ips_before_bcrypt(monkeypatch):
+    monkeypatch.setattr(auth, 'require_email_auth_enabled', AsyncMock())
     keys = []
 
     async def limited(key, action, **kwargs):

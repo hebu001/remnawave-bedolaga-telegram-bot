@@ -15,6 +15,7 @@ from app.database.crud.server_squad import (
 )
 from app.database.crud.subscription import (
     add_subscription_servers,
+    apply_trial_conversion_defaults,
     create_paid_subscription,
     should_carry_trial_remaining_days,
 )
@@ -29,6 +30,7 @@ from app.services.subscription_service import SubscriptionService
 from app.utils.pricing_utils import (
     apply_percentage_discount,
     calculate_months_from_days,
+    calculate_price_per_month,
     format_period_description,
     validate_pricing_calculation,
 )
@@ -332,8 +334,16 @@ class MiniAppSubscriptionPurchaseService:
         )
         server_catalog: dict[str, ServerSquad] = {server.squad_uuid: server for server in available_servers}
 
-        if subscription and subscription.connected_squads:
-            for uuid in subscription.connected_squads:
+        # Серверы подписки — без сквада грейса, осевшего в ней (v4.10–4.11): иначе
+        # по умолчанию человеку предлагалось «купить» сквад грейса.
+        own_squads: list[str] = []
+        if subscription is not None:
+            from app.services.grace_access_echo import terms_without_grace_echo
+
+            own_squads, _ = await terms_without_grace_echo(db, subscription)
+
+        if own_squads:
+            for uuid in own_squads:
                 if uuid in server_catalog:
                     continue
                 try:
@@ -351,7 +361,7 @@ class MiniAppSubscriptionPurchaseService:
             except (TypeError, ValueError):
                 continue
 
-        default_connected = list(getattr(subscription, 'connected_squads', []) or [])
+        default_connected = list(own_squads)
         if not default_connected:
             for server in available_servers:
                 if getattr(server, 'is_available', True) and not getattr(server, 'is_full', False):
@@ -392,7 +402,7 @@ class MiniAppSubscriptionPurchaseService:
                 else None
             )
 
-            per_month_price = base_price // months if months else base_price
+            per_month_price = calculate_price_per_month(base_price, period_days)
             per_month_price_label = texts.format_price(per_month_price)
 
             traffic_config = self._build_traffic_config(
@@ -935,7 +945,7 @@ class MiniAppSubscriptionPurchaseService:
                 'Not enough funds on balance',
             )
 
-        per_month_price = pricing.final_total // pricing.months if pricing.months else pricing.final_total
+        per_month_price = calculate_price_per_month(pricing.final_total, pricing.selection.period.days)
 
         return {
             'total_price_kopeks': pricing.final_total,
@@ -1074,6 +1084,10 @@ class MiniAppSubscriptionPurchaseService:
         now = datetime.now(UTC)
 
         if subscription:
+            # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+            from app.services.grace_access_echo import undo_grace_overlay_echo
+
+            await undo_grace_overlay_echo(db, subscription)
             bonus_period = timedelta()
             if subscription.is_trial:
                 was_trial_conversion = True
@@ -1095,6 +1109,11 @@ class MiniAppSubscriptionPurchaseService:
                     logger.error('Failed to create subscription conversion record', conversion_error=conversion_error)
 
             subscription.is_trial = False
+            if was_trial_conversion:
+                # is_trial сбрасывается и для НЕ-триалов (обычное продление), поэтому
+                # дефолт автоплатежа вешаем на флаг конверсии, иначе продление платной
+                # подписки затирало бы выбор пользователя.
+                apply_trial_conversion_defaults(subscription)
             subscription.status = SubscriptionStatus.ACTIVE.value
             subscription.traffic_limit_gb = pricing.selection.traffic_value
             subscription.device_limit = pricing.selection.devices
@@ -1159,23 +1178,23 @@ class MiniAppSubscriptionPurchaseService:
         # Disable killed trials on RemnaWave panel
         for trial_sub in killed_trials:
             try:
-                _trial_uuid = trial_sub.remnawave_uuid or (
-                    getattr(user, 'remnawave_uuid', None) if not settings.is_multi_tariff_enabled() else None
-                )
-                if _trial_uuid:
-                    await subscription_service.disable_remnawave_user(_trial_uuid)
+                _trial_panel_id = trial_sub.remnawave_id
+                if _trial_panel_id is None and not settings.is_multi_tariff_enabled():
+                    _trial_panel_id = getattr(user, 'remnawave_id', None)
+                if _trial_panel_id is not None:
+                    await subscription_service.disable_remnawave_user(_trial_panel_id)
                 await decrement_subscription_server_counts(db, trial_sub)
             except Exception as trial_err:
                 logger.warning('Failed to disable trial on RemnaWave', error=trial_err, trial_id=trial_sub.id)
 
         try:
             # In multi-tariff mode, each subscription has its own panel user.
-            # A new subscription has no remnawave_uuid yet, so always CREATE.
-            # In single-tariff mode, reuse the user-level UUID if available.
+            # A new subscription has no remnawave_id yet, so always CREATE.
+            # In single-tariff mode, reuse the user-level panel id if available.
             if settings.is_multi_tariff_enabled():
-                _should_create = not subscription.remnawave_uuid
+                _should_create = subscription.remnawave_id is None
             else:
-                _should_create = not getattr(user, 'remnawave_uuid', None)
+                _should_create = getattr(user, 'remnawave_id', None) is None
 
             if _should_create:
                 await subscription_service.create_remnawave_user(
@@ -1199,7 +1218,7 @@ class MiniAppSubscriptionPurchaseService:
             remnawave_retry_queue.enqueue(
                 subscription_id=subscription.id,
                 user_id=user.id,
-                action='create' if not getattr(subscription, 'remnawave_uuid', None) else 'update',
+                action='create' if getattr(subscription, 'remnawave_id', None) is None else 'update',
             )
 
         transaction = await create_transaction(

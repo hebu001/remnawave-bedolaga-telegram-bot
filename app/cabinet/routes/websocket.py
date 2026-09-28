@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -21,6 +23,7 @@ from app.cabinet.ip_utils import get_client_ip
 from app.database.database import AsyncSessionLocal
 from app.database.models import User
 from app.services.permission_service import PermissionService
+from app.utils.websocket_errors import CLIENT_GONE_ERRORS, is_client_gone
 
 
 logger = structlog.get_logger(__name__)
@@ -143,16 +146,26 @@ async def create_cabinet_ws_ticket(
     return {'ticket': ticket, 'expires_in': TICKET_TTL_SECONDS}
 
 
+async def _reject(websocket: WebSocket, reason: str) -> None:
+    """Принять и сразу закрыть соединение с кодом отказа.
+
+    Клиент может отвалиться и здесь — тогда закрывать уже нечего и некому.
+    """
+    with contextlib.suppress(*CLIENT_GONE_ERRORS):
+        await websocket.accept()
+        await websocket.close(code=1008, reason=reason)
+
+
 @router.websocket('/ws')
 async def cabinet_websocket_endpoint(websocket: WebSocket):
     # Long-lived bearer credentials are deliberately not accepted in a URL.
     # Client deployment must switch to POST /ws/ticket before this rollout.
     ticket = websocket.query_params.get('ticket', '')
-    if 'token' in websocket.query_params or not ticket:
-        await websocket.close(code=1008, reason='WebSocket ticket required')
-        return
     session = None
     try:
+        if 'token' in websocket.query_params or not ticket:
+            await websocket.close(code=1008, reason='WebSocket ticket required')
+            return
         async with asyncio.timeout(SEND_TIMEOUT_SECONDS):
             async with AsyncSessionLocal() as db:
                 payload = await consume_ws_ticket(db, ticket, websocket.headers.get('origin', ''))
@@ -203,7 +216,10 @@ async def cabinet_websocket_endpoint(websocket: WebSocket):
         pass
     except Exception as error:
         # Never include request URLs, tickets or JWTs in application logs.
-        logger.debug('Cabinet WS ended', error_type=type(error).__name__)
+        if is_client_gone(error):
+            logger.debug('Cabinet WS ended', error_type=type(error).__name__, client_gone=True)
+        else:
+            logger.error('Cabinet WS failed', error_type=type(error).__name__)
     finally:
         if session is not None:
             await cabinet_ws_manager.close(session)
@@ -296,10 +312,25 @@ async def notify_user_balance_change(
 # ============================================================================
 
 
+def _iso_utc(value: datetime | str | None) -> str:
+    """Дата для WebSocket-события — ISO 8601 в UTC; кабинет форматирует её для человека сам.
+
+    Раньше сюда прилетала строка ``format_email_datetime`` («27.11.2030, 12:00»),
+    и кабинет показывал «Действует до: Invalid Date». Строка допускается только
+    как уже готовый ISO (обратная совместимость), ``None`` — пустая строка.
+    """
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat()
+
+
 async def notify_user_subscription_activated(
     user_id: int,
     subscription_id: int | None = None,
-    expires_at: str = '',
+    expires_at: datetime | str | None = None,
     tariff_name: str = '',
 ) -> None:
     """Уведомить пользователя об активации подписки."""
@@ -308,7 +339,7 @@ async def notify_user_subscription_activated(
         {
             'type': 'subscription.activated',
             'subscription_id': subscription_id,
-            'expires_at': expires_at,
+            'expires_at': _iso_utc(expires_at),
             'tariff_name': tariff_name,
         },
     )
@@ -317,7 +348,7 @@ async def notify_user_subscription_activated(
 async def notify_user_subscription_expiring(
     user_id: int,
     days_left: int,
-    expires_at: str,
+    expires_at: datetime | str | None,
 ) -> None:
     """Уведомить пользователя о скором истечении подписки."""
     await cabinet_ws_manager.send_to_user(
@@ -325,7 +356,7 @@ async def notify_user_subscription_expiring(
         {
             'type': 'subscription.expiring',
             'days_left': days_left,
-            'expires_at': expires_at,
+            'expires_at': _iso_utc(expires_at),
         },
     )
 
@@ -343,7 +374,7 @@ async def notify_user_subscription_expired(user_id: int) -> None:
 async def notify_user_subscription_renewed(
     user_id: int,
     subscription_id: int | None = None,
-    new_expires_at: str = '',
+    new_expires_at: datetime | str | None = None,
     amount_kopeks: int = 0,
 ) -> None:
     """Уведомить пользователя о продлении подписки."""
@@ -352,7 +383,7 @@ async def notify_user_subscription_renewed(
         {
             'type': 'subscription.renewed',
             'subscription_id': subscription_id,
-            'new_expires_at': new_expires_at,
+            'new_expires_at': _iso_utc(new_expires_at),
             'amount_kopeks': amount_kopeks,
             'amount_rubles': amount_kopeks / 100,
         },
@@ -405,7 +436,7 @@ async def notify_user_traffic_purchased(
 async def notify_user_autopay_success(
     user_id: int,
     amount_kopeks: int,
-    new_expires_at: str,
+    new_expires_at: datetime | str | None,
 ) -> None:
     """Уведомить пользователя об успешном автопродлении."""
     await cabinet_ws_manager.send_to_user(
@@ -414,7 +445,7 @@ async def notify_user_autopay_success(
             'type': 'autopay.success',
             'amount_kopeks': amount_kopeks,
             'amount_rubles': amount_kopeks / 100,
-            'new_expires_at': new_expires_at,
+            'new_expires_at': _iso_utc(new_expires_at),
         },
     )
 

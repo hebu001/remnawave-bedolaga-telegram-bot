@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database.models import PromoCode, PromoCodeType, PromoCodeUse, User
+from app.utils.timezone import local_day_start
 
 
 logger = structlog.get_logger(__name__)
@@ -57,6 +58,7 @@ async def create_promocode(
     type: PromoCodeType,
     balance_bonus_kopeks: int = 0,
     subscription_days: int = 0,
+    traffic_gb: int = 0,
     max_uses: int = 1,
     valid_until: datetime | None = None,
     created_by: int | None = None,
@@ -67,6 +69,7 @@ async def create_promocode(
         type=type.value,
         balance_bonus_kopeks=balance_bonus_kopeks,
         subscription_days=subscription_days,
+        traffic_gb=traffic_gb,
         max_uses=max_uses,
         valid_until=valid_until,
         created_by=created_by,
@@ -225,7 +228,7 @@ async def get_promocode_statistics(db: AsyncSession, promocode_id: int) -> dict:
     )
     total_uses = total_uses_result.scalar()
 
-    today = datetime.now(UTC).date()
+    today = local_day_start()
     today_uses_result = await db.execute(
         select(func.count(PromoCodeUse.id)).where(
             and_(PromoCodeUse.promocode_id == promocode_id, PromoCodeUse.used_at >= today)

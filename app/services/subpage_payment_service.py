@@ -64,67 +64,72 @@ async def resolve_subscription_by_short_uuid(
     db: AsyncSession,
     short_uuid: str,
 ) -> tuple[User, Subscription] | None:
-    """Resolve a panel shortUuid to the local (user, subscription) pair.
-
-    Local DB first (Subscription.remnawave_short_uuid), then the panel API
-    (user-by-short-uuid -> panel uuid -> local user). Returns None when the
-    shortUuid is unknown — callers must answer with a uniform 404.
-    """
-    if not _SHORT_UUID_RE.match(short_uuid):
+    """Resolve a public shortUuid without guessing a sibling tariff or owner."""
+    if not _SHORT_UUID_RE.fullmatch(short_uuid):
         return None
 
-    result = await db.execute(
-        select(Subscription)
-        .options(*_subscription_load_options())
-        .where(Subscription.remnawave_short_uuid == short_uuid)
-        .limit(1)
+    matches = list(
+        (
+            await db.scalars(
+                select(Subscription)
+                .options(*_subscription_load_options())
+                .where(Subscription.remnawave_short_uuid == short_uuid)
+                .limit(2)
+            )
+        ).all()
     )
-    subscription = result.scalars().first()
-    if subscription is not None and subscription.user is not None:
-        return subscription.user, subscription
+    if len(matches) > 1:
+        logger.warning('Subpage: ambiguous local shortUuid')
+        return None
+    if matches:
+        subscription = matches[0]
+        return (subscription.user, subscription) if subscription.user else None
 
-    # Fallback: ask the panel. Needed for subscriptions created before
-    # remnawave_short_uuid was populated locally.
     from app.services.remnawave_service import RemnaWaveService
 
     service = RemnaWaveService()
     if not service.is_configured:
         return None
-
     try:
         async with service.get_api_client() as api:
             panel_user = await api.get_user_by_short_uuid(short_uuid)
     except Exception as error:
-        logger.warning('Subpage: panel lookup by shortUuid failed', error=str(error))
+        logger.warning('Subpage: panel lookup by shortUuid failed', error_type=type(error).__name__)
+        return None
+    if panel_user is None or type(panel_user.id) is not int or panel_user.id <= 0:
+        return None
+    if panel_user.short_uuid != short_uuid:
         return None
 
-    if panel_user is None or not panel_user.uuid:
+    # Subscription identity is authoritative in multi-tariff mode. User-level
+    # identity is historical there and must never select another paid tariff.
+    matches = list(
+        (
+            await db.scalars(
+                select(Subscription)
+                .options(*_subscription_load_options())
+                .where(Subscription.remnawave_id == panel_user.id)
+                .limit(2)
+            )
+        ).all()
+    )
+    if len(matches) > 1:
+        return None
+    if matches:
+        subscription = matches[0]
+        return (subscription.user, subscription) if subscription.user else None
+    if settings.is_multi_tariff_enabled():
         return None
 
-    from app.database.crud.user import get_user_by_remnawave_uuid
+    from app.database.crud.subscription import get_subscription_by_user_id
+    from app.database.crud.user import get_user_by_remnawave_id
 
-    user = await get_user_by_remnawave_uuid(db, panel_user.uuid)
+    user = await get_user_by_remnawave_id(db, panel_user.id)
     if user is None:
         return None
-
-    subscription = None
-    if settings.is_multi_tariff_enabled():
-        result = await db.execute(
-            select(Subscription)
-            .options(*_subscription_load_options())
-            .where(Subscription.remnawave_uuid == panel_user.uuid)
-            .limit(1)
-        )
-        subscription = result.scalars().first()
-
-    if subscription is None:
-        from app.database.crud.subscription import get_subscription_by_user_id
-
-        subscription = await get_subscription_by_user_id(db, user.id)
-
-    if subscription is None:
+    subscription = await get_subscription_by_user_id(db, user.id)
+    if subscription is None or subscription.remnawave_id not in (None, panel_user.id):
         return None
-
     return user, subscription
 
 

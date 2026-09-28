@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import PaymentMethod, Subscription, TransactionType
+from app.services.payment.payer_identity import PayerIdentity, payer_from_guest, resolve_user_payer
 from app.services.platega_service import PlategaService
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
@@ -52,7 +53,10 @@ class PlategaPaymentMixin:
         payment_method_code: int,
         return_url: str | None = None,
         failed_url: str | None = None,
+        payer: PayerIdentity | None = None,
     ) -> dict[str, Any] | None:
+        """Разовый платёж Platega. ``payer`` — плательщик-гость лендинга; у пользователя
+        он читается по ``user_id`` (metadata.userId/userName обязательны, см. payer_identity)."""
         service: PlategaService | None = getattr(self, 'platega_service', None)
         if not service or not service.is_configured:
             logger.error('Platega сервис не инициализирован')
@@ -82,8 +86,17 @@ class PlategaPaymentMixin:
         effective_return_url = return_url or settings.get_platega_return_url()
         effective_failed_url = failed_url or settings.get_platega_failed_url()
 
+        if payer is None:
+            payer = (
+                await resolve_user_payer(db, user_id)
+                if user_id is not None
+                # Ни пользователя, ни гостя вызывающий не дал — плательщик по id платежа.
+                else payer_from_guest(correlation_id, contact_type=None, contact_value=None)
+            )
+
         try:
             response = await service.create_payment(
+                payer=payer,
                 payment_method=payment_method_code,
                 amount=amount_value,
                 currency=settings.PLATEGA_CURRENCY,
@@ -132,7 +145,7 @@ class PlategaPaymentMixin:
         )
 
         logger.info(
-            'Создан Platega платеж для пользователя (метод , сумма ₽)',
+            'Создан Platega платёж',
             transaction_id=transaction_id or payment.id,
             user_id=user_id,
             payment_method_code=payment_method_code,
@@ -192,6 +205,12 @@ class PlategaPaymentMixin:
                 'status': existing.status,
             }
 
+        # Взаимоисключение с рекуррентом Lava: оба движка push-модели, и две
+        # живые привязки на одной подписке списывали бы дважды за цикл.
+        from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+
+        await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
+
         period_days = (
             resolve_autopay_period_candidate(getattr(subscription, 'autopay_period_days', None), tariff)
             or resolve_autopay_period_candidate(getattr(settings, 'DEFAULT_AUTOPAY_PERIOD_DAYS', 0), tariff)
@@ -201,13 +220,38 @@ class PlategaPaymentMixin:
         is_daily = bool(getattr(tariff, 'is_daily', False))
         interval, charge_days = resolve_platega_interval(period_days, is_daily)
 
-        amount_kopeks = tariff.get_purchasable_price_for_period(charge_days)
+        # Сумма — полная цена продления, а не голая цена периода: у подписки
+        # могут быть докупленные устройства (в классическом режиме — ещё и
+        # трафик/серверы), и балансовое автопродление списывает именно с ними.
+        # Голая цена периода недобирала бы разницу при каждом списании.
+        # user=None намеренно: временные промо-скидки в повторяющемся списании
+        # не замораживаем (см. docstring), поэтому считаем «чистую» цену
+        # тарифа за период плюс доп. устройства.
+        amount_kopeks = 0
+        try:
+            from app.services.pricing_engine import pricing_engine
+
+            pricing_result = await pricing_engine.calculate_tariff_purchase_price(
+                tariff,
+                charge_days,
+                device_limit=getattr(subscription, 'device_limit', None),
+            )
+            amount_kopeks = int(pricing_result.final_total or 0)
+        except Exception as pricing_error:  # pragma: no cover - defensive
+            logger.warning(
+                'Не удалось посчитать цену с доп. устройствами — берём голую цену периода',
+                error=str(pricing_error),
+            )
+        # Фолбэк на прежнее поведение: голая цена периода без доплат.
+        if amount_kopeks <= 0:
+            amount_kopeks = tariff.get_purchasable_price_for_period(charge_days)
         # Нулевая цена отклоняется наравне с отсутствующей: подписка Platega на
         # 0 ₽ бессмысленна и вела бы к пустым регулярным «списаниям».
         if not amount_kopeks:
             raise ValueError(f'Тариф не имеет цены за период {charge_days} дней — СБП-автопродление недоступно')
 
         response = await self.platega_service.create_subscription(
+            payer=await resolve_user_payer(db, user_id),
             amount=amount_kopeks / 100,
             currency=settings.PLATEGA_CURRENCY,
             interval=interval,
@@ -377,9 +421,13 @@ class PlategaPaymentMixin:
         from app.database.crud import platega_subscription as sub_crud
         from app.services import platega_recurrent as pr
 
-        status = payload.get('Status')
-        platega_id = payload.get('SubscriptionId')
-        charge_id = payload.get('Id')
+        # Регистр ключей у Platega разный: разовые коллбеки приходят в
+        # camelCase, примеры подписочных в спеке — в PascalCase. Читаем
+        # через общий разбор, иначе списание не находит свою подписку.
+        fields = pr.read_callback_fields(payload)
+        status = fields.status
+        platega_id = fields.subscription_id
+        charge_id = fields.charge_id
 
         if not platega_id:
             logger.warning('Platega subscription callback без SubscriptionId', status=status)
@@ -411,7 +459,7 @@ class PlategaPaymentMixin:
             await self._notify_sbp_recurring(db, record, 'activated')
             return
 
-        if status in pr.CHARGE_SUCCESS:
+        if status is not None and status.upper() in pr.CHARGE_SUCCESS:
             if not charge_id:
                 # CONFIRMED без Id доверять нельзя: без id идемпотентность ниже
                 # не сработает, и каждый повтор такого коллбека продлевал бы
@@ -470,7 +518,16 @@ class PlategaPaymentMixin:
                 )
                 return
 
+            # Оверлей грейса, осевший в подписке, — не её срок: иначе новый период
+            # отсчитывался бы от конца грейса.
+            from app.services.grace_access_echo import undo_grace_overlay_echo
+
+            await undo_grace_overlay_echo(db, subscription)
             subscription.extend_subscription(record.charge_days)
+            # Условия тарифа на новый период: база тарифа + активные докупки.
+            from app.database.crud.subscription import reconcile_tariff_traffic_limit
+
+            await reconcile_tariff_traffic_limit(db, subscription)
 
             # Списание по локально ОТМЕНЁННОЙ записи = удалённая отмена не
             # прошла (сбой Platega в момент cancel). Деньги взяты — продлеваем
@@ -484,7 +541,7 @@ class PlategaPaymentMixin:
                 record.status = 'ACTIVE'
             record.last_charge_at = datetime.now(UTC)
             record.charges_success += 1
-            record.next_charge_at = _parse_next_charge(payload.get('NextChargeAt'))
+            record.next_charge_at = _parse_next_charge(fields.next_charge_at)
 
             tx = await create_transaction(
                 db,
@@ -607,6 +664,9 @@ class PlategaPaymentMixin:
         завершиться 200 OK независимо от того, доставилось ли сообщение в
         Telegram.
         """
+        if not settings.is_notifications_enabled():
+            return
+
         try:
             from app.cabinet.routes.websocket import cabinet_ws_manager
 
@@ -997,7 +1057,7 @@ class PlategaPaymentMixin:
 
         method_title = settings.get_platega_method_display_title(payment.payment_method_code)
 
-        if getattr(self, 'bot', None) and user.telegram_id:
+        if getattr(self, 'bot', None) and user.telegram_id and settings.is_notifications_enabled():
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
                 await self.bot.send_message(

@@ -22,11 +22,26 @@ from app.utils.validators import sanitize_telegram_name
 logger = structlog.get_logger(__name__)
 
 
-async def _refresh_remnawave_description(remnawave_uuid: str, description: str, telegram_id: int) -> None:
+def _is_blocked_non_admin(user: Any) -> bool:
+    """BLOCKED stops everyone except an account named in ADMIN_IDS/ADMIN_EMAILS.
+
+    Blocking such an account is refused at every write site, so a BLOCKED admin row can
+    only predate that guard — typically the broadcast auto-block after the owner muted
+    the bot. Honouring it here would lock the owner out of their own bot for good.
+    """
+    from app.database.models import UserStatus
+    from app.services.rbac_bootstrap_service import is_protected_from_blocking
+
+    return user.status == UserStatus.BLOCKED.value and not is_protected_from_blocking(user)
+
+
+async def _refresh_remnawave_description(remnawave_id: int, description: str, telegram_id: int) -> None:
     try:
+        from app.services.panel_sync import patch_panel_account
+
         remnawave_service = RemnaWaveService()
         async with remnawave_service.get_api_client() as api:
-            await api.update_user(uuid=remnawave_uuid, description=description)
+            await patch_panel_account(api, user_id=remnawave_id, description=description)
         logger.info('✅ [Middleware] Описание пользователя обновлено в RemnaWave', telegram_id=telegram_id)
     except Exception as remnawave_error:
         logger.error(
@@ -98,13 +113,22 @@ class AuthMiddleware(BaseMiddleware):
                     return None
                 from app.database.models import UserStatus
 
-                if db_user.status == UserStatus.BLOCKED.value:
+                if _is_blocked_non_admin(db_user):
                     if isinstance(event, Message):
                         await event.answer('🚫 Ваш аккаунт заблокирован администратором.')
                     elif isinstance(event, CallbackQuery):
                         await event.answer('🚫 Ваш аккаунт заблокирован администратором.', show_alert=True)
                     logger.info('🚫 Заблокированный пользователь попытался использовать бота', user_id=user.id)
                     return None
+
+                if db_user.status == UserStatus.BLOCKED.value:
+                    # Reached only by an env admin (the check above let them through).
+                    # Heal the stale row instead of just ignoring it, so the flag stops
+                    # suppressing their subscription reactivation and notifications too.
+                    db_user.status = UserStatus.ACTIVE.value
+                    db_user.updated_at = datetime.now(UTC)
+                    await db.commit()
+                    logger.info('♻️ Снят устаревший BLOCKED с аккаунта админа из env', user_id=user.id)
 
                 if db_user.status == UserStatus.DELETED.value:
                     state: FSMContext = data.get('state')
@@ -202,13 +226,13 @@ class AuthMiddleware(BaseMiddleware):
                     db_user.updated_at = datetime.now(UTC)
                     logger.info('💾 [Middleware] Профиль пользователя обновлен в middleware', user_id=user.id)
 
-                    if db_user.remnawave_uuid:
+                    if db_user.remnawave_id:
                         description = settings.format_remnawave_user_description(
                             full_name=db_user.full_name, username=db_user.username, telegram_id=db_user.telegram_id
                         )
                         asyncio.create_task(
                             _refresh_remnawave_description(
-                                remnawave_uuid=db_user.remnawave_uuid,
+                                remnawave_id=db_user.remnawave_id,
                                 description=description,
                                 telegram_id=db_user.telegram_id,
                             )
@@ -222,10 +246,10 @@ class AuthMiddleware(BaseMiddleware):
                             telegram_id=db_user.telegram_id,
                         )
                         for sub in getattr(db_user, 'subscriptions', None) or []:
-                            if sub.remnawave_uuid and sub.remnawave_uuid != db_user.remnawave_uuid:
+                            if sub.remnawave_id and sub.remnawave_id != db_user.remnawave_id:
                                 asyncio.create_task(
                                     _refresh_remnawave_description(
-                                        remnawave_uuid=sub.remnawave_uuid,
+                                        remnawave_id=sub.remnawave_id,
                                         description=description,
                                         telegram_id=db_user.telegram_id,
                                     )

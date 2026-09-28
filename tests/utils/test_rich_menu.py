@@ -163,6 +163,60 @@ async def test_builder_single_subscription_structure(monkeypatch):
     assert '<table' not in html_out
 
 
+async def test_builder_links_username_used_instead_of_name(monkeypatch):
+    """Без имени full_name подставляет логин — показываем его ссылкой на профиль.
+
+    skip_entity_detection=True гасит автоопределение @упоминаний, поэтому голый
+    логин в шапке был бы мёртвым текстом.
+    """
+    monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(type(settings), 'is_tariffs_mode', lambda self: False)
+
+    user = _make_user(None)
+    user.first_name = None
+    user.last_name = None
+    user.username = 'durov'
+    user.full_name = 'durov'
+
+    html_out = await rich_menu.build_main_menu_rich_html(user, DummyTexts(), AsyncMock())
+
+    assert '<b><a href="https://t.me/durov">@durov</a></b>' in html_out
+    assert 'Ваш профиль' in html_out
+
+
+async def test_builder_keeps_plain_name_when_user_has_one(monkeypatch):
+    """Имя есть — шапка остаётся обычным текстом, ссылка на логин не подставляется."""
+    monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(type(settings), 'is_tariffs_mode', lambda self: False)
+
+    user = _make_user(None)
+    user.first_name = 'Егор'
+    user.last_name = None
+    user.username = 'durov'
+
+    html_out = await rich_menu.build_main_menu_rich_html(user, DummyTexts(), AsyncMock())
+
+    assert '<b>Егор &lt;script&gt;</b>' in html_out
+    assert 't.me/durov' not in html_out
+
+
+async def test_builder_survives_user_without_username_attribute(monkeypatch):
+    """Шапка не должна падать на объекте без username — иначе меню молча уедет в классику.
+
+    try_send_rich_main_menu ловит любое исключение сборки и возвращает False, так что
+    AttributeError здесь стоил бы rich-меню без единой записи в логе о причине.
+    """
+    monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(type(settings), 'is_tariffs_mode', lambda self: False)
+
+    user = _make_user(None)
+    assert not hasattr(user, 'username')
+
+    html_out = await rich_menu.build_main_menu_rich_html(user, DummyTexts(), AsyncMock())
+
+    assert '<b>Егор &lt;script&gt;</b>' in html_out
+
+
 async def test_builder_multi_tariff_renders_primary(monkeypatch):
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
     primary = _make_subscription(datetime.now(UTC))
@@ -538,9 +592,6 @@ async def test_show_main_menu_prefers_rich_and_falls_back(monkeypatch):
     rich False — классика рисует меню."""
     import app.handlers.menu as menu_mod
 
-    async def _noop(*args, **kwargs):
-        return None
-
     monkeypatch.setattr(menu_mod, 'has_subscription_checkout_draft', AsyncMock(return_value=False))
     monkeypatch.setattr(menu_mod, 'should_offer_checkout_resume', lambda *a, **k: False)
     monkeypatch.setattr(menu_mod.user_cart_service, 'has_user_cart', AsyncMock(return_value=False))
@@ -709,7 +760,7 @@ async def test_logo_auto_url_from_webhook(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, 'WEBHOOK_URL', 'https://bot.example.com/webhook', raising=False)
     monkeypatch.setattr(settings, 'LOGO_FILE', str(logo), raising=False)
 
-    assert rich_menu._resolve_rich_logo_url() == 'https://bot.example.com/cabinet/branding/bot-logo'
+    assert rich_menu._resolve_rich_logo_url().startswith('https://bot.example.com/cabinet/branding/bot-logo?v=')
 
     # Файла нет — логотип не подставляется
     monkeypatch.setattr(settings, 'LOGO_FILE', str(tmp_path / 'missing.png'), raising=False)
@@ -834,25 +885,91 @@ def test_collapsible_flag_default_is_enabled():
     assert Settings.model_fields['MAIN_MENU_RICH_SUBSCRIPTIONS_COLLAPSIBLE'].default is True
 
 
-def test_tg_time_outside_int32_range_falls_back_to_text():
-    """Telegram хранит даты 32-битным unix time: tg-time с датой после 19.01.2038
-    или до эпохи сервер отклоняет ошибкой RICH_MESSAGE_DATE_INVALID — вместо тега
-    остаётся fallback-текст."""
-    valid = rich_menu._tg_time(datetime(2030, 1, 1, tzinfo=UTC), 'd', '01.01.2030')
-    assert valid.startswith('<tg-time unix="')
+def test_tg_time_beyond_telegram_date_limit_falls_back_to_text():
+    """Telegram принимает дату сущности только до «сейчас + 1098 дней»
+    (core.telegram.org/api/entities). Дальше сервер отвечает RICH_MESSAGE_DATE_INVALID
+    и роняет ВСЁ rich-сообщение, поэтому вместо тега оставляем fallback-текст.
 
-    boundary = rich_menu._tg_time(datetime.fromtimestamp(2**31 - 1, UTC), 'd', 'граница')
-    assert boundary.startswith('<tg-time unix="2147483647"')
+    Даты берём относительными: абсолютные протухали бы вместе с лимитом.
+    """
+    now = datetime.now(UTC)
 
-    too_late = rich_menu._tg_time(datetime(2038, 1, 20, tzinfo=UTC), 'd', '20.01.2038')
-    assert too_late == '20.01.2038'
+    soon = rich_menu._tg_time(now + timedelta(days=30), 'd', 'через месяц')
+    assert soon.startswith('<tg-time unix="')
+
+    near_limit = rich_menu._tg_time(now + timedelta(days=1000), 'd', 'почти предел')
+    assert near_limit.startswith('<tg-time unix="')
+
+    # Чуть больше 3 лет — уже за лимитом Telegram, хотя в 32-битный unix влезает.
+    # Ровно этот случай ломал меню: старая проверка пропускала всё до 2038 года.
+    beyond = rich_menu._tg_time(now + timedelta(days=1100), 'd', '01.01.2030')
+    assert beyond == '01.01.2030'
+
+    int32_max = rich_menu._tg_time(datetime.fromtimestamp(2**31 - 1, UTC), 'd', 'граница')
+    assert int32_max == 'граница'
 
     too_early = rich_menu._tg_time(datetime(1969, 12, 31, tzinfo=UTC), 'd', '31.12.1969')
     assert too_early == '31.12.1969'
 
     # Fallback-текст экранируется так же, как внутри tg-time
-    escaped = rich_menu._tg_time(datetime(2099, 1, 1, tzinfo=UTC), 'd', 'a<b>&c')
+    escaped = rich_menu._tg_time(now + timedelta(days=5000), 'd', 'a<b>&c')
     assert escaped == 'a&lt;b&gt;&amp;c'
+
+
+def test_strip_tg_time_keeps_inner_text():
+    """Страховка: снимаем теги дат, но текст внутри остаётся."""
+    source = '<p>до <tg-time unix="123" format="d">31.12.2029</tg-time> ещё далеко</p>'
+
+    assert rich_menu._strip_tg_time(source) == '<p>до 31.12.2029 ещё далеко</p>'
+    # Несколько тегов и переносы внутри
+    many = '<tg-time unix="1" format="r">a</tg-time>|<tg-time unix="2" format="d">b\nc</tg-time>'
+    assert rich_menu._strip_tg_time(many) == 'a|b\nc'
+    # Остальная разметка не страдает
+    assert rich_menu._strip_tg_time('<b>без дат</b>') == '<b>без дат</b>'
+
+
+def test_is_rich_date_error_matches_server_code():
+    from aiogram.exceptions import TelegramBadRequest
+
+    date_error = TelegramBadRequest(method=None, message='Bad Request: RICH_MESSAGE_DATE_INVALID')
+    other_error = TelegramBadRequest(method=None, message='Bad Request: MESSAGE_TOO_LONG')
+
+    assert rich_menu._is_rich_date_error(date_error) is True
+    assert rich_menu._is_rich_date_error(other_error) is False
+
+
+async def test_send_retries_without_tg_time_on_date_error():
+    """Одна отвергнутая дата не должна ронять меню целиком в классику."""
+    from aiogram.exceptions import TelegramBadRequest
+
+    calls: list[str] = []
+
+    async def fake_send(*, chat_id, rich_message, reply_markup=None, message_effect_id=None):
+        calls.append(rich_message.html)
+        if len(calls) == 1:
+            raise TelegramBadRequest(method=None, message='Bad Request: RICH_MESSAGE_DATE_INVALID')
+
+    bot = SimpleNamespace(send_rich_message=fake_send)
+    rich_html = '<p><tg-time unix="99999999999" format="d">01.01.2099</tg-time></p>'
+
+    await rich_menu._send_rich_menu(bot, 1, rich_html, None, 'ru')
+
+    assert len(calls) == 2, 'должен быть ровно один повтор'
+    assert '<tg-time' in calls[0]
+    assert '<tg-time' not in calls[1]
+    assert '01.01.2099' in calls[1], 'текст даты должен остаться'
+
+
+def test_tg_time_keeps_past_dates():
+    """Новый лимит не должен задеть обычную истёкшую подписку."""
+    past = rich_menu._tg_time(datetime.now(UTC) - timedelta(days=30), 'd', 'месяц назад')
+    assert past.startswith('<tg-time unix="')
+
+
+def test_tg_time_survives_extreme_datetimes():
+    """datetime.max/min: timestamp() на них падает на части платформ — не роняем меню."""
+    assert rich_menu._tg_time(datetime.max.replace(tzinfo=UTC), 'd', 'макс') == 'макс'
+    assert rich_menu._tg_time(datetime.min.replace(tzinfo=UTC), 'd', 'мин') == 'мин'
 
 
 async def test_far_future_end_date_in_multi_mode_profile_renders_as_text(monkeypatch):
@@ -871,3 +988,135 @@ async def test_far_future_end_date_in_single_profile_renders_as_text(monkeypatch
     html_out = await rich_menu.build_main_menu_rich_html(_make_user(sub), DummyTexts(), AsyncMock())
     assert '<tg-time' not in html_out
     assert '2099' in html_out and 'дн.' in html_out
+
+
+async def test_try_send_decode_error_falls_back_to_classic(monkeypatch):
+    """ClientDecodeError не наследуется от TelegramAPIError и пролетал мимо всех except.
+
+    Свежий сервер может вернуть тип rich-блока, которого установленная aiogram ещё не
+    знает: строгий discriminated union RichBlock отвергает его при разборе ОТВЕТА.
+    Сообщение при этом уже доставлено, а хендлер падал — пользователь не видел ни
+    rich-меню, ни классического фоллбека, и флаг недоступности не взводился.
+    """
+    from aiogram.exceptions import ClientDecodeError
+
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = ClientDecodeError('Failed to decode object', ValueError('unknown block'), '{}')
+
+    sent = await rich_menu.try_send_rich_main_menu(bot, 1, _make_user(None), DummyTexts(), AsyncMock(), MagicMock())
+
+    assert sent is False
+    # Ошибка разбора ответа — не признак «сервер не умеет rich», rich остаётся включённым.
+    assert rich_menu.is_rich_menu_enabled() is True
+
+
+async def test_try_edit_decode_error_falls_back_to_classic(monkeypatch):
+    from aiogram.exceptions import ClientDecodeError
+
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+
+    callback = _make_callback()
+    callback.bot.side_effect = ClientDecodeError('Failed to decode object', ValueError('unknown block'), '{}')
+
+    edited = await rich_menu.try_edit_rich_main_menu(
+        callback, _make_user(None), DummyTexts(), AsyncMock(), _make_keyboard()
+    )
+
+    assert edited is False
+
+
+async def test_inline_buttons_setting_moves_keyboard_into_canvas(monkeypatch):
+    """Bot API 10.3: кнопки уезжают в полотно, клавиатуры под сообщением не остаётся."""
+
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', True, raising=False)
+
+    bot = AsyncMock()
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text='Подписка', callback_data='menu_subscription')]]
+    )
+
+    sent = await rich_menu.try_send_rich_main_menu(bot, 1, _make_user(None), DummyTexts(), AsyncMock(), keyboard)
+
+    assert sent is True
+    kwargs = bot.send_rich_message.await_args.kwargs
+    assert '<tg-button type="callback_data" data="menu_subscription">' in kwargs['rich_message'].html
+    # Дублировать кнопки незачем: либо внутри, либо под сообщением.
+    assert kwargs['reply_markup'] is None
+
+
+async def test_inline_buttons_setting_off_keeps_classic_keyboard(monkeypatch):
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', False, raising=False)
+
+    bot = AsyncMock()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='a', callback_data='a')]])
+
+    await rich_menu.try_send_rich_main_menu(bot, 1, _make_user(None), DummyTexts(), AsyncMock(), keyboard)
+
+    kwargs = bot.send_rich_message.await_args.kwargs
+    assert '<tg-button' not in kwargs['rich_message'].html
+    assert kwargs['reply_markup'] is keyboard
+
+
+async def test_unmovable_button_keeps_keyboard_outside(monkeypatch):
+    """Если перенести можно не всё — клавиатура остаётся под сообщением целиком."""
+
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', True, raising=False)
+
+    bot = AsyncMock()
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text='ok', callback_data='ok')],
+            [InlineKeyboardButton(text='Оплатить', pay=True)],
+        ]
+    )
+
+    await rich_menu.try_send_rich_main_menu(bot, 1, _make_user(None), DummyTexts(), AsyncMock(), keyboard)
+
+    kwargs = bot.send_rich_message.await_args.kwargs
+    assert '<tg-button' not in kwargs['rich_message'].html
+    assert kwargs['reply_markup'] is keyboard
+
+
+async def test_edit_clears_old_keyboard_when_buttons_move_inside(monkeypatch):
+    """У editMessageText отсутствующий reply_markup означает «не трогать».
+
+    Без явной пустой клавиатуры прежние кнопки остались бы висеть рядом с новыми,
+    перенесёнными в полотно.
+    """
+
+    async def fake_build(user, texts, db):
+        return '<p>menu</p>'
+
+    monkeypatch.setattr(rich_menu, 'build_main_menu_rich_html', fake_build)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', True, raising=False)
+
+    callback = _make_callback()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='a', callback_data='a')]])
+
+    edited = await rich_menu.try_edit_rich_main_menu(callback, _make_user(None), DummyTexts(), AsyncMock(), keyboard)
+
+    assert edited is True
+    request = callback.bot.await_args.args[0]
+    assert '<tg-button' in request.rich_message.html
+    assert request.reply_markup is not None
+    assert request.reply_markup.inline_keyboard == []

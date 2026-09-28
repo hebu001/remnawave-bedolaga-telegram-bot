@@ -12,6 +12,7 @@ from app.database.models import User
 from app.services.backup_io import BackupIOBusy
 from app.services.backup_service import backup_service
 from app.utils.decorators import admin_required, error_handler
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -49,7 +50,7 @@ def get_backup_list_keyboard(backups: list, page: int = 1, per_page: int = 5):
         try:
             if backup.get('timestamp'):
                 dt = datetime.fromisoformat(backup['timestamp'].replace('Z', '+00:00'))
-                date_str = dt.strftime('%d.%m %H:%M')
+                date_str = format_local_datetime(dt, '%d.%m %H:%M')
             else:
                 date_str = '?'
         except:
@@ -219,7 +220,7 @@ async def manage_backup_file(callback: types.CallbackQuery, db_user: User, db: A
     try:
         if backup_info.get('timestamp'):
             dt = datetime.fromisoformat(backup_info['timestamp'].replace('Z', '+00:00'))
-            date_str = dt.strftime('%d.%m.%Y %H:%M:%S')
+            date_str = format_local_datetime(dt, '%d.%m.%Y %H:%M:%S')
         else:
             date_str = 'Неизвестно'
     except:

@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .media import TELEGRAM_FILE_ID_PATTERN
+
 
 # ============ Channel Types ============
 
@@ -106,7 +108,9 @@ class BroadcastMediaRequest(BaseModel):
     """Media attachment for broadcast."""
 
     type: str = Field(..., pattern=r'^(photo|video|document)$')
-    file_id: str
+    # Только то, что вернул /cabinet/media/upload: URL или пустая строка упали бы
+    # у каждого получателя уже на отправке.
+    file_id: str = Field(..., pattern=TELEGRAM_FILE_ID_PATTERN)
     caption: str | None = None
 
 
@@ -202,6 +206,8 @@ class EmailFiltersResponse(BaseModel):
 
     filters: list[EmailFilterItem]
     total_with_email: int
+    # Основная промогруппа человека (users.promo_group_id); ключ promo_group_{id}.
+    promo_group_filters: list[EmailFilterItem] = []
 
 
 # ============ Combined Broadcast ============
@@ -241,3 +247,16 @@ class EmailPreviewResponse(BaseModel):
 
     target: str
     count: int
+
+
+class EmailRenderRequest(BaseModel):
+    """Письмо рассылки так, как его получит адресат (в общей обёртке)."""
+
+    subject: str = ''
+    html_content: str = ''
+    language: str = 'ru'
+
+
+class EmailRenderResponse(BaseModel):
+    subject: str
+    body_html: str

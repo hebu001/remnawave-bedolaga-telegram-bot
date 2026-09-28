@@ -61,7 +61,7 @@ async def run(args):
             actual = (
                 await connection.execute(text("SELECT current_setting('data_directory'),inet_server_addr()"))
             ).one()
-            if Path(actual[0]).resolve() != data or actual[1] is not None:
+            if await asyncio.to_thread(Path(actual[0]).resolve) != data or actual[1] is not None:
                 raise ValueError('Connection is not the selected local Unix-only test cluster')
             await connection.rollback()
             report = await connection.run_sync(

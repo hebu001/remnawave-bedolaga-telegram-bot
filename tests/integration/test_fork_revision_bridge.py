@@ -43,12 +43,19 @@ async def test_dry_run_atomic_apply_repeat_and_actual_startup(profile):
             assert result.applied
             assert await connection.run_sync(application_rows, columns) == before
             await connection.rollback()
+            repeat = await call(
+                connection, schema, apply=True, expected_revision='0106', expected_digest=report.schema_sha256
+            )
+            assert repeat.state == 'already_bridged' and not repeat.applied
             for _ in range(2):
                 await connection.run_sync(_upgrade_on_connection, config(schema=schema))
-                repeat = await call(
-                    connection, schema, apply=True, expected_revision='0106', expected_digest=report.schema_sha256
-                )
-                assert repeat.state == 'already_bridged' and not repeat.applied
+                assert await connection.run_sync(bridge.read_revisions, schema) == ['evo_0109']
+                await connection.rollback()
+                # Once runtime DDL has advanced, the old bridge must not restamp it.
+                with pytest.raises(bridge.ForkRevisionError):
+                    await call(
+                        connection, schema, apply=True, expected_revision='0106', expected_digest=report.schema_sha256
+                    )
             assert await connection.run_sync(application_rows, columns) == before
 
 
@@ -228,8 +235,12 @@ async def test_current_fork_fresh_bootstrap_and_repeat():
         async with engine.connect() as connection:
             for _ in range(2):
                 await connection.run_sync(_upgrade_on_connection, config(schema=schema))
-                report = await call(connection, schema)
-                assert report.state == 'already_bridged' and report.profile == 'fork-0106-fresh'
+                assert await connection.run_sync(bridge.read_revisions, schema) == ['evo_0109']
+                current = await connection.run_sync(bridge.snapshot_schema, schema)
+                if _ == 0:
+                    initial = current
+                assert current == initial
+                await connection.rollback()
 
 
 async def test_uncooperative_writer_lock_has_bounded_timeout():

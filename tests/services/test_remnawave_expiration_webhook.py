@@ -6,9 +6,18 @@ while still accepting the old events from 2.7.x panels.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from app.config import settings
+from app.services import remnawave_webhook_service
 from app.services.remnawave_webhook_service import RemnaWaveWebhookService
+
+
+def _db():
+    db = AsyncMock()
+    db.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+    return db
 
 
 def _service() -> RemnaWaveWebhookService:
@@ -116,6 +125,29 @@ async def test_no_subscription_sends_nothing():
     svc._notify_user.assert_not_awaited()
 
 
+async def test_webhook_expiry_respects_user_days_threshold(monkeypatch):
+    svc = RemnaWaveWebhookService(MagicMock())
+    send_notification = AsyncMock(return_value=True)
+    monkeypatch.setattr(remnawave_webhook_service.notification_delivery_service, 'send_notification', send_notification)
+    monkeypatch.setattr(settings, 'WEBHOOK_NOTIFY_USER_ENABLED', True)
+    monkeypatch.setattr(settings, 'WEBHOOK_NOTIFY_SUB_EXPIRING', True)
+    monkeypatch.setattr(settings, 'ENABLE_NOTIFICATIONS', True)
+    user = SimpleNamespace(
+        id=1,
+        language='ru',
+        notification_settings={
+            'subscription_expiry_enabled': True,
+            'subscription_expiry_days': 1,
+        },
+    )
+
+    await svc._notify_user(user, 'WEBHOOK_SUB_EXPIRES_72H')
+    send_notification.assert_not_awaited()
+
+    await svc._notify_user(user, 'WEBHOOK_SUB_EXPIRES_24H')
+    send_notification.assert_awaited_once()
+
+
 async def test_new_2_8_0_api_token_admin_events_registered():
     """2.8.0 added service.api_token_created/deleted — surfaced as admin notifications."""
     svc = _service()
@@ -130,7 +162,7 @@ async def test_user_modified_syncs_used_traffic_from_nested_user_traffic():
     sub = MagicMock()
     sub.status = 'active'
     sub.traffic_used_gb = 0.0
-    await svc._handle_user_modified(AsyncMock(), _user(), sub, {'userTraffic': {'usedTrafficBytes': 5 * 1024**3}})
+    await svc._handle_user_modified(_db(), _user(), sub, {'userTraffic': {'usedTrafficBytes': 5 * 1024**3}})
     assert sub.traffic_used_gb == 5.0
 
 
@@ -140,5 +172,5 @@ async def test_user_modified_used_traffic_falls_back_to_flat_key():
     sub = MagicMock()
     sub.status = 'active'
     sub.traffic_used_gb = 0.0
-    await svc._handle_user_modified(AsyncMock(), _user(), sub, {'usedTrafficBytes': 2 * 1024**3})
+    await svc._handle_user_modified(_db(), _user(), sub, {'usedTrafficBytes': 2 * 1024**3})
     assert sub.traffic_used_gb == 2.0

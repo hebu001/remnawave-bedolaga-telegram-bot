@@ -6,7 +6,7 @@ Install the frozen lockfile and the manifest's test-only packages before running
 
 # Local developer harness: argv contains trusted tool paths, and XML is produced
 # by the pytest child into this run's newly created output directory.
-# ruff: noqa: S603, S607, S314
+# ruff: noqa: S603, S607
 
 import argparse
 import hashlib
@@ -17,9 +17,10 @@ import platform
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 from pathlib import Path
+
+from check_results import summarize
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,7 +35,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--pg-bin', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--suite', choices=['custom', 'migration'], default='custom')
+    parser.add_argument('--suite', choices=['custom', 'migration', 'runtime', 'integration', 'full'], default='custom')
     parser.add_argument('--keep-postgres', action='store_true', help='Retain this new cluster for follow-up checks')
     args = parser.parse_args()
     if (ROOT / '.env').exists():
@@ -47,11 +48,27 @@ def main():
             parser.error(f'Missing PostgreSQL binary: {pg_bin / executable}')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    manifest_path = MANIFEST if args.suite == 'custom' else MANIFEST.with_name('migration-contracts.json')
-    manifest = json.loads(manifest_path.read_text())
+    if args.suite == 'full':
+        # Match CI's configured testpaths: pytest owns discovery below tests/;
+        # this mode must not inherit the selected integration file list.
+        manifest = {
+            'schema_version': 1,
+            'scope': 'Complete pytest collection under tests; fresh synthetic PostgreSQL; no file exclusions',
+            'groups': {'full_pytest_suite': ['tests']},
+        }
+    else:
+        manifest_path = MANIFEST if args.suite == 'custom' else MANIFEST.with_name(f'{args.suite}-contracts.json')
+        manifest = json.loads(manifest_path.read_text())
     paths = [path for group in manifest['groups'].values() for path in group]
-    if len(paths) != len(set(paths)) or not all((ROOT / path).is_file() for path in paths):
+    if len(paths) != len(set(paths)) or not all(
+        (ROOT / path).is_file() or (args.suite == 'full' and (ROOT / path).is_dir()) for path in paths
+    ):
         parser.error('Manifest contains duplicates or missing tests')
+    test_files = (
+        len({path for pattern in ('test_*.py', '*_test.py') for path in (ROOT / 'tests').rglob(pattern)})
+        if args.suite == 'full'
+        else len(paths)
+    )
     cluster = Path(tempfile.mkdtemp(prefix='bot-custom-pg-', dir='/tmp')).resolve()
     socket_dir = cluster / 'socket'
     socket_dir.mkdir(mode=0o700)
@@ -67,6 +84,8 @@ def main():
         DATABASE_MODE='postgresql',
         DATABASE_URL=url,
         TEST_POSTGRES_URL=url,
+        TEST_DATABASE_URL=url,
+        REQUIRE_POSTGRES_TESTS='1',
         BACKUP_LOCATION=str(cluster / 'backups'),
         BRIDGE_EVIDENCE_DIR=str(output),
     )
@@ -82,9 +101,21 @@ def main():
             if path
             and (ROOT / path).is_file()
             and (
-                path.startswith(('app/', 'migrations/', 'scripts/'))
+                path.startswith(('app/', 'migrations/', 'scripts/', '.github/workflows/'))
                 or (path.startswith('tests/') and Path(path).suffix in {'.py', '.json', '.sql'})
-                or path in {'pyproject.toml', 'uv.lock', 'alembic.ini', 'main.py'}
+                or path
+                in {
+                    'pyproject.toml',
+                    'uv.lock',
+                    'alembic.ini',
+                    'main.py',
+                    'Dockerfile',
+                    'Makefile',
+                    'docker-compose.yml',
+                    '.dockerignore',
+                    '.env.example',
+                    'docs/project_structure_reference.md',
+                }
             )
             and '.env' not in Path(path).parts
             and '__pycache__' not in Path(path).parts
@@ -95,10 +126,11 @@ def main():
         'started_utc': datetime.now(UTC).isoformat(),
         'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         'branch': subprocess.check_output(['git', 'branch', '--show-current'], cwd=ROOT, text=True).strip(),
+        'index_tree': subprocess.check_output(['git', 'write-tree'], cwd=ROOT, text=True).strip(),
         'git_status': subprocess.check_output(['git', 'status', '--porcelain=v1'], cwd=ROOT, text=True).splitlines(),
         'python': platform.python_version(),
         'postgres': subprocess.check_output([str(pg_bin / 'postgres'), '--version'], text=True).strip(),
-        'test_files': len(paths),
+        'test_files': test_files,
         'source_sha256': {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in source_paths},
         'lockfile_sha256': hashlib.sha256((ROOT / 'uv.lock').read_bytes()).hexdigest(),
         'packages': {dist.metadata['Name']: dist.version for dist in importlib.metadata.distributions()},
@@ -153,27 +185,23 @@ def main():
             '-p',
             'network_guard',
             '-q',
+            '-W',
+            'error::RuntimeWarning',
+            '-W',
+            'error::pytest.PytestUnraisableExceptionWarning',
             '-o',
-            'asyncio_mode=auto',
+            'xfail_strict=true',
+            *(['-o', 'asyncio_mode=auto'] if args.suite != 'full' else []),
             f'--junitxml={output / "pytest.xml"}',
             *paths,
         ]
         (output / 'command.json').write_text(json.dumps(argv, indent=2) + '\n')
         with (output / 'pytest.log').open('w') as log:
             result = subprocess.run(argv, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
-        summary = {'pytest_exit_code': result.returncode, 'finished_utc': datetime.now(UTC).isoformat()}
         junit = output / 'pytest.xml'
-        if junit.exists():
-            cases = ET.parse(junit).getroot().findall('.//testcase')
-            summary.update(
-                tests=len(cases),
-                failures=sum(case.find('failure') is not None for case in cases),
-                errors=sum(case.find('error') is not None for case in cases),
-                skipped=sum(case.find('skipped') is not None for case in cases),
-            )
-            summary['passed'] = summary['tests'] - summary['failures'] - summary['errors'] - summary['skipped']
-        complete = result.returncode == 0 and summary.get('tests', 0) > 0 and summary.get('skipped', 1) == 0
-        summary['baseline_complete'] = complete
+        summary = summarize(junit, result.returncode, allow_optional=args.suite == 'full')
+        summary['finished_utc'] = datetime.now(UTC).isoformat()
+        complete = summary['mandatory_complete'] if args.suite == 'full' else summary['baseline_complete']
         (output / 'result.json').write_text(json.dumps(summary, indent=2) + '\n')
         print(json.dumps(summary, indent=2))
         print(f'Evidence: {output}')

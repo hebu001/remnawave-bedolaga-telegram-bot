@@ -5,6 +5,7 @@ from pathlib import Path
 import structlog
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 
 from app.database.fork_revision_bridge import migration_lock, migration_preflight
@@ -76,6 +77,17 @@ def _install_runtime_schema_guards(conn) -> None:
         )
 
 
+def _seed_fresh_database(connection, cfg) -> None:
+    """Apply seed data skipped by metadata bootstrap, using the pinned revision."""
+    from app.database.models import UserReminder
+
+    # 0127 seeds a disabled reminder during ordinary upgrades. A fresh database
+    # skips historical DDL, but must receive the identical data exactly once.
+    revision = ScriptDirectory.from_config(cfg).get_revision('0127')
+    if revision is not None:
+        connection.execute(UserReminder.__table__.insert().values(**revision.module.BUILTIN_LINK_AUTH))
+
+
 async def _ensure_runtime_schema_guards() -> None:
     """Install DDL guards that ``metadata.create_all`` cannot express."""
     from app.database.database import engine
@@ -88,16 +100,19 @@ async def assert_migration_safe() -> None:
     """Fatal preflight also runs when migration/ordinary failure flags are enabled."""
     from app.database.database import engine
 
+    cfg = _get_alembic_config()
+    known = {revision.revision for revision in ScriptDirectory.from_config(cfg).walk_revisions()}
     async with engine.connect() as conn:
-        await conn.run_sync(migration_preflight)
+        await conn.run_sync(lambda connection: migration_preflight(connection, known_revisions=known))
 
 
 def _upgrade_on_connection(connection, cfg) -> None:
     from app.database.models import Base
 
     schema = cfg.attributes.get('schema', 'public')
+    known = {revision.revision for revision in ScriptDirectory.from_config(cfg).walk_revisions()}
     with migration_lock(connection, schema):
-        migration_preflight(connection, schema)
+        migration_preflight(connection, schema, known_revisions=known)
         fresh = not inspect(connection).has_table(
             'alembic_version', schema=schema if connection.dialect.name == 'postgresql' else None
         )
@@ -109,6 +124,7 @@ def _upgrade_on_connection(connection, cfg) -> None:
             with connection.begin():
                 Base.metadata.create_all(connection)
                 _install_runtime_schema_guards(connection)
+                _seed_fresh_database(connection, cfg)
                 cfg.attributes['verified_fresh_bootstrap'] = True
                 try:
                     command.stamp(cfg, 'head')

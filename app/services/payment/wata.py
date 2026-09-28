@@ -399,7 +399,7 @@ class WataPaymentMixin:
                     payment = await self._finalize_wata_payment(db, payment, transaction_payload)
             else:
                 logger.debug(
-                    'WATA транзакция в статусе , повторная обработка не требуется',
+                    'WATA транзакция в этом статусе повторной обработки не требует',
                     transaction_id=transaction_id or getattr(payment, 'payment_link_id', ''),
                     normalized_status=normalized_status or 'unknown',
                 )
@@ -591,7 +591,7 @@ class WataPaymentMixin:
             except Exception as error:
                 logger.error('Ошибка отправки админ уведомления WATA', error=error)
 
-        if getattr(self, 'bot', None) and user.telegram_id:
+        if getattr(self, 'bot', None) and user.telegram_id and settings.is_notifications_enabled():
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
                 await self.bot.send_message(

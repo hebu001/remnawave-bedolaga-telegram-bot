@@ -369,6 +369,9 @@ def _autopay_subscription(**overrides) -> SimpleNamespace:
 
 async def test_toggle_autopay_enable_cancels_active_sbp_recurring(monkeypatch):
     cb, user, db = _make_callback(), _make_user(), AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
     cb.data = 'autopay_enable'
     subscription = _autopay_subscription()
 
@@ -406,6 +409,9 @@ async def test_toggle_autopay_enable_blocked_before_cancel_for_trial(monkeypatch
     """A trial subscription is rejected before update_subscription_autopay is
     even reached — the SBP-cancel hook must not fire on a rejected toggle."""
     cb, user, db = _make_callback(), _make_user(), AsyncMock()
+    db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.execute.return_value.scalars.return_value.first.return_value = None
     cb.data = 'autopay_enable'
     subscription = _autopay_subscription(is_trial=True)
 

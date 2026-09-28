@@ -95,7 +95,8 @@ async def test_legacy_twelve_character_token_prefix_remains_supported() -> None:
     assert resolved is purchase
     legacy_statement = db.execute.await_args_list[1].args[0]
     sql = str(legacy_statement)
-    assert 'guest_purchases.token LIKE' in sql
+    assert 'guest_purchases.legacy_claim_prefix =' in sql
+    assert 'guest_purchases.token LIKE' not in sql
     assert 'guest_purchases.claim_code LIKE' not in sql
 
 

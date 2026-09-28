@@ -46,6 +46,7 @@ from app.utils.decorators import admin_required, error_handler
 from app.utils.formatters import format_datetime, format_duration
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 from app.utils.subscription_utils import get_display_subscription_link
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -303,7 +304,7 @@ def _format_promo_offer_log_entry(
     index: int,
     texts,
 ) -> str:
-    timestamp = entry.created_at.strftime('%d.%m.%Y %H:%M') if entry.created_at else '-'
+    timestamp = format_local_datetime(entry.created_at, '%d.%m.%Y %H:%M') if entry.created_at else '-'
     action_key = ACTION_LABEL_KEYS.get(entry.action, '')
     action_label = texts.get(action_key, entry.action.title())
     lines = [f'{index}. <b>{timestamp}</b> — {action_label}']
@@ -1979,6 +1980,8 @@ async def _send_offer_to_users(
 
     async def send_single_offer(user):
         """Отправляет одно предложение с семафором ограничения"""
+        from app.utils.notification_prefs import is_promo_offers_enabled
+
         # Email-only юзеры (без telegram_id) раньше пропускались целиком —
         # ни оффера, ни уведомления. Теперь оффер создаётся, а уведомление
         # уходит на подтверждённую почту (активация — в кабинете).
@@ -2029,6 +2032,17 @@ async def _send_offer_to_users(
                         server_name=squad_name,
                     )
 
+                    # Настройка уведомлений глушит СООБЩЕНИЕ, но не саму скидку:
+                    # оффер уже создан выше и остаётся доступным в кабинете и
+                    # миниаппе. Так же ведёт себя кабинетная рассылка
+                    # (`admin_promo_offers.broadcast`), и расходиться они не должны.
+                    if not settings.is_notifications_enabled() or not is_promo_offers_enabled(user):
+                        logger.debug(
+                            'Промо-оффер создан, уведомление подавлено настройками',
+                            user_id=user.id,
+                        )
+                        return True
+
                     if not user.telegram_id:
                         # Email-only юзер: тот же текст на почту, кнопке «Получить»
                         # соответствует ссылка на кабинет внутри шаблона письма.
@@ -2038,6 +2052,7 @@ async def _send_offer_to_users(
                             email=user.email,
                             language=user.language or db_user.language,
                             username=user.first_name or user.username or '',
+                            user_id=user.id,
                             message_text=message_text,
                             valid_hours=template.valid_hours,
                             discount_percent=template.discount_percent or 0,
