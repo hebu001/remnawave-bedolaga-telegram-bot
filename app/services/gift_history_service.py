@@ -144,11 +144,14 @@ async def list_sender_gifts(
     buyer_id: int,
     offset: int = 0,
     limit: int = DEFAULT_HISTORY_LIMIT,
+    *,
+    include_all_statuses: bool = False,
 ) -> tuple[list[GiftHistoryItem], int]:
     """Query paginated gift history purchased by the given buyer.
 
     Source-neutral: includes gifts bought via bot, cabinet, or landing.
-    Filters strictly to eligible statuses: PAID, PENDING_ACTIVATION, DELIVERED.
+    By default filters to PAID, PENDING_ACTIVATION, DELIVERED.
+    Cabinet history can include unpaid and failed attempts without making them claimable.
     Orders by created_at DESC, id DESC.
 
     Args:
@@ -156,6 +159,7 @@ async def list_sender_gifts(
         buyer_id: User ID of the gift buyer.
         offset: Number of items to skip (non-negative).
         limit: Number of items per page (bounded between MIN_HISTORY_LIMIT and MAX_HISTORY_LIMIT).
+        include_all_statuses: Include all purchase statuses in the buyer's history.
 
     Returns:
         tuple[items, total_count]: List of immutable GiftHistoryItem instances and total count.
@@ -163,11 +167,12 @@ async def list_sender_gifts(
     bounded_limit = max(MIN_HISTORY_LIMIT, min(limit, MAX_HISTORY_LIMIT))
     bounded_offset = max(0, offset)
 
-    base_conditions = (
+    base_conditions = [
         GuestPurchase.buyer_user_id == buyer_id,
         GuestPurchase.is_gift.is_(True),
-        GuestPurchase.status.in_(ELIGIBLE_GIFT_HISTORY_STATUSES),
-    )
+    ]
+    if not include_all_statuses:
+        base_conditions.append(GuestPurchase.status.in_(ELIGIBLE_GIFT_HISTORY_STATUSES))
 
     # Total count query
     count_query = select(func.count()).select_from(GuestPurchase).where(*base_conditions)

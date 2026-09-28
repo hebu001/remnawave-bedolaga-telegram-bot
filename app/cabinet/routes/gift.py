@@ -647,13 +647,16 @@ async def get_sent_gifts(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get all gifts the current user has sent."""
-    items, _total_count = await list_sender_gifts(db, buyer_id=user.id, offset=0, limit=100)
+    items, _total_count = await list_sender_gifts(db, buyer_id=user.id, offset=0, limit=100, include_all_statuses=True)
 
     bot_username = settings.get_bot_username()
     cabinet_url = settings.CABINET_URL
 
     sent: list[SentGiftResponse] = []
     for item in items:
+        # The history projection carries the same token/claim_code pair as a purchase.
+        # Keep the cabinet's compact public code for migrated gifts without claim_code.
+        public_code = gift_public_code(item)  # type: ignore[arg-type]
         activated_by_username = None
         if item.is_delivered and item.recipient_display and item.recipient_display.startswith('@'):
             activated_by_username = item.recipient_display
@@ -664,7 +667,7 @@ async def get_sent_gifts(
         if item.is_claimable:
             artifacts = build_gift_claim_artifacts(
                 item.token,
-                claim_code=item.claim_code,
+                claim_code=public_code,
                 bot_username=bot_username,
                 cabinet_url=cabinet_url,
             )
@@ -674,7 +677,7 @@ async def get_sent_gifts(
 
         sent.append(
             SentGiftResponse(
-                token=item.public_code,
+                token=public_code,
                 tariff_name=item.tariff_name,
                 period_days=item.period_days,
                 device_limit=item.device_limit,

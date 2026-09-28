@@ -1213,6 +1213,197 @@ async def test_get_sent_gifts_contract_and_channel_parity(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sent_gifts_preserves_all_owner_statuses_without_unlocking_claims(monkeypatch):
+    """Cabinet history includes unsuccessful attempts, but never another buyer or non-gifts."""
+    from app.cabinet.schemas.gift import ActivateGiftRequest
+    from app.config import settings
+    from app.services.gift_history_service import list_sender_gifts
+
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.com')
+    monkeypatch.setattr(settings, 'BOT_USERNAME', 'test_vpn_bot')
+    activate = AsyncMock()
+    monkeypatch.setattr('app.services.guest_purchase_service.activate_purchase', activate)
+
+    async with memory_session(monkeypatch, _TABLES) as db:
+        buyer = User(id=10, username='buyer')
+        stranger = User(id=20, username='stranger')
+        tariff = Tariff(id=1, name='Standard')
+        purchases = [
+            GuestPurchase(
+                id=index,
+                token=str(index) * 64,
+                claim_code=f'public{index:06d}',
+                contact_type='email',
+                contact_value='buyer@example.com',
+                tariff_id=1,
+                period_days=30,
+                amount_kopeks=20000,
+                is_gift=True,
+                status=purchase_status.value,
+                buyer_user_id=buyer.id,
+            )
+            for index, purchase_status in enumerate(GuestPurchaseStatus, start=1)
+        ]
+        foreign = GuestPurchase(
+            id=7,
+            token='f' * 64,
+            claim_code='foreign12345',
+            contact_type='email',
+            contact_value='stranger@example.com',
+            tariff_id=1,
+            period_days=30,
+            amount_kopeks=20000,
+            is_gift=True,
+            status='paid',
+            buyer_user_id=stranger.id,
+        )
+        non_gift = GuestPurchase(
+            id=8,
+            token='n' * 64,
+            contact_type='email',
+            contact_value='buyer@example.com',
+            tariff_id=1,
+            period_days=30,
+            amount_kopeks=20000,
+            is_gift=False,
+            status='paid',
+            buyer_user_id=buyer.id,
+        )
+        db.add_all([buyer, stranger, tariff, *purchases, foreign, non_gift])
+        await db.commit()
+
+        sent = await gift_routes.get_sent_gifts(user=buyer, db=db)
+        assert len(sent) == 6
+        assert {item.status for item in sent} == {status.value for status in GuestPurchaseStatus}
+        assert {item.token for item in sent} == {purchase.claim_code for purchase in purchases}
+        for item in sent:
+            if item.status in {'paid', 'pending_activation'}:
+                assert item.gift_code == item.token
+                assert item.bot_claim_url == f'https://t.me/test_vpn_bot?start=GIFT_{item.token}'
+                assert item.cabinet_claim_url == f'https://cabinet.example.com/gift?tab=activate&code={item.token}'
+            else:
+                assert item.gift_code is None
+                assert item.bot_claim_url is None
+                assert item.cabinet_claim_url is None
+
+        # Existing bot/history consumers keep upstream eligibility by default.
+        default_items, default_total = await list_sender_gifts(db, buyer_id=buyer.id)
+        assert default_total == 3
+        assert {item.status for item in default_items} == {'paid', 'pending_activation', 'delivered'}
+        page, full_total = await list_sender_gifts(db, buyer_id=buyer.id, limit=2, include_all_statuses=True)
+        assert full_total == 6
+        assert len(page) == 2
+
+        for purchase in purchases:
+            if purchase.status not in {'pending', 'failed', 'expired'}:
+                continue
+            with pytest.raises(HTTPException) as rejected:
+                await gift_routes.activate_gift_by_code(
+                    body=ActivateGiftRequest(code=purchase.claim_code), user=stranger, db=db
+                )
+            assert rejected.value.status_code == 400
+            assert rejected.value.detail == 'This gift cannot be activated'
+            assert purchase.user_id is None
+        activate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sent_migrated_null_claim_code_keeps_compact_share_and_claim_guards(monkeypatch):
+    """A migrated legacy alias survives the current cabinet's raw-code share builder."""
+    from urllib.parse import parse_qs, urlparse
+
+    from app.cabinet.schemas.gift import ActivateGiftRequest
+    from app.config import settings
+    from app.services.gift_claim_service import get_gift_by_claim_identifier
+
+    monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.com')
+    monkeypatch.setattr(settings, 'BOT_USERNAME', 'test_vpn_bot')
+    activate = AsyncMock()
+    monkeypatch.setattr('app.services.guest_purchase_service.activate_purchase', activate)
+
+    async with memory_session(monkeypatch, _TABLES) as db:
+        buyer = User(id=10, username='buyer')
+        claimant = User(id=20, username='claimant')
+        stranger = User(id=30, username='stranger')
+        tariff = Tariff(id=1, name='Standard')
+        alias = 'legacy_12-Ab'
+        purchase = GuestPurchase(
+            id=1,
+            token=alias + 'x' * 52,
+            claim_code=None,
+            legacy_claim_prefix=alias,
+            contact_type='email',
+            contact_value='buyer@example.com',
+            tariff_id=1,
+            period_days=30,
+            amount_kopeks=20000,
+            is_gift=True,
+            status='paid',
+            buyer_user_id=buyer.id,
+        )
+        db.add_all([buyer, claimant, stranger, tariff, purchase])
+        await db.commit()
+
+        assert await gift_routes.get_sent_gifts(user=stranger, db=db) == []
+        sent = await gift_routes.get_sent_gifts(user=buyer, db=db)
+        assert len(sent) == 1
+        assert sent[0].token == alias
+        assert sent[0].gift_code == alias
+        assert sent[0].bot_claim_url == f'https://t.me/test_vpn_bot?start=GIFT_{alias}'
+        assert sent[0].cabinet_claim_url == f'https://cabinet.example.com/gift?tab=activate&code={alias}'
+        assert purchase.claim_code is None  # Read-only history does not rotate an issued alias.
+
+        # Exact baseline giftShare.ts contract: trim, escape underscores, prefix once.
+        safe_code = sent[0].token.strip().replace('_', '%5F')
+        shared_bot_url = f'https://t.me/test_vpn_bot?start=GIFT%5F{safe_code}'
+        shared_web_url = f'https://cabinet.example.com/gift?tab=activate&code={safe_code}'
+        assert parse_qs(urlparse(shared_bot_url).query)['start'] == [f'GIFT_{alias}']
+        assert await get_gift_by_claim_identifier(db, shared_bot_url) is purchase
+        assert await get_gift_by_claim_identifier(db, shared_web_url) is purchase
+
+        with pytest.raises(HTTPException) as self_claim:
+            await gift_routes.activate_gift_by_code(body=ActivateGiftRequest(code=shared_web_url), user=buyer, db=db)
+        assert self_claim.value.status_code == 400
+        activate.assert_not_awaited()
+
+        claimed = await gift_routes.activate_gift_by_code(
+            body=ActivateGiftRequest(code=shared_bot_url), user=claimant, db=db
+        )
+        assert claimed.status == 'activated'
+        assert purchase.user_id == claimant.id
+        activate.assert_awaited_once_with(db, purchase.token, skip_notification=True)
+
+        with pytest.raises(HTTPException) as already_owned:
+            await gift_routes.activate_gift_by_code(body=ActivateGiftRequest(code=shared_web_url), user=stranger, db=db)
+        assert already_owned.value.status_code == 404
+        assert already_owned.value.detail == 'Gift not found'
+        assert activate.await_count == 1
+
+        # A duplicate legacy alias must still fail closed instead of selecting a gift.
+        collision = GuestPurchase(
+            id=2,
+            token=alias + 'y' * 52,
+            claim_code=None,
+            legacy_claim_prefix=alias,
+            contact_type='email',
+            contact_value='buyer@example.com',
+            tariff_id=1,
+            period_days=30,
+            amount_kopeks=20000,
+            is_gift=True,
+            status='paid',
+            buyer_user_id=buyer.id,
+        )
+        db.add(collision)
+        await db.commit()
+        with pytest.raises(HTTPException) as ambiguous:
+            await gift_routes.activate_gift_by_code(body=ActivateGiftRequest(code=shared_bot_url), user=stranger, db=db)
+        assert ambiguous.value.status_code == 404
+        assert collision.user_id is None
+        assert activate.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_get_sent_gifts_includes_bot_origin_gifts(monkeypatch):
     """Gifts purchased via Telegram bot appear in cabinet /gift/sent with canonical claim artifacts."""
     from app.config import settings
