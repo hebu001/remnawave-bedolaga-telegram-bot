@@ -2682,13 +2682,16 @@ class RemnaWaveService:
                                         update_kwargs['external_squad_uuid'] = sub.tariff.external_squad_uuid
 
                                     try:
-                                        await api.update_user(**update_kwargs)
+                                        updated_user = await api.update_user(**update_kwargs)
                                         # Сохраняем UUID если его не было
                                         if settings.is_multi_tariff_enabled():
                                             if not sub.remnawave_uuid:
                                                 sub.remnawave_uuid = panel_uuid
                                         elif not user.remnawave_uuid:
                                             user.remnawave_uuid = panel_uuid
+                                        sub.remnawave_short_uuid = updated_user.short_uuid
+                                        sub.subscription_url = updated_user.subscription_url
+                                        sub.subscription_crypto_link = updated_user.happ_crypto_link
                                         return ('updated', db_sub, None)
                                     except RemnaWaveAPIError as api_error:
                                         # UUID в БД протух — панель-юзера уже нет. Пересоздаём,

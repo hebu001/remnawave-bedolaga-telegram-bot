@@ -1,6 +1,8 @@
 import sys
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
@@ -12,6 +14,52 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.services.remnawave_service import RemnaWaveService
+
+
+async def test_sync_existing_user_refreshes_subscription_links(monkeypatch):
+    import app.services.remnawave_service as module
+
+    user = SimpleNamespace(id=1, telegram_id=None, email=None, username='test', full_name='Test')
+    sub = SimpleNamespace(
+        id=1, user=user, status='active', end_date=datetime(2030, 1, 1, tzinfo=UTC),
+        tariff=None, traffic_limit_gb=300, connected_squads=[], remnawave_short_id='abc',
+        remnawave_uuid='panel-user', remnawave_short_uuid='old-short',
+        subscription_url='https://old.example/old-short', subscription_crypto_link='old-crypto',
+    )
+    panel_user = SimpleNamespace(short_uuid='new-short', subscription_url='https://sub2.example/new-short',
+                                 happ_crypto_link='new-crypto')
+    api = MagicMock()
+    api.update_user = AsyncMock(return_value=panel_user)
+
+    @asynccontextmanager
+    async def client():
+        yield api
+
+    @asynccontextmanager
+    async def lease(subscription_id):
+        assert subscription_id == sub.id
+        yield SimpleNamespace(allowed=True, subscription=sub)
+
+    monkeypatch.setattr('app.database.crud.subscription.get_subscriptions_batch', AsyncMock(return_value=[sub]))
+    monkeypatch.setattr('app.services.grace_access_runtime.grace_sensitive_panel_update', lease)
+    monkeypatch.setattr(module, 'resolve_hwid_device_limit_for_payload', lambda _: 2)
+    monkeypatch.setattr(module, 'get_traffic_reset_strategy', lambda _: 'MONTH')
+    monkeypatch.setattr(module, 'settings', SimpleNamespace(
+        is_multi_tariff_enabled=lambda: True,
+        build_remnawave_subscription_username=lambda **_: 'test_abc',
+        format_remnawave_user_description=lambda **_: 'Test',
+    ))
+    service = _create_service()
+    service.get_api_client = client
+    db = AsyncMock()
+
+    stats = await service.sync_users_to_panel(db)
+
+    assert stats == {'created': 0, 'updated': 1, 'errors': 0}
+    assert sub.remnawave_short_uuid == panel_user.short_uuid
+    assert sub.subscription_url == panel_user.subscription_url
+    assert sub.subscription_crypto_link == panel_user.happ_crypto_link
+    api.create_user.assert_not_called()
 
 
 def _create_service() -> RemnaWaveService:
