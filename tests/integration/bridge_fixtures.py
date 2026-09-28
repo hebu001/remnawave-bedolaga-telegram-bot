@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 
+LAB_ROOT = Path('/tmp').resolve()  # noqa: S108 — canonical root of freshly owned private clusters
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / 'tests/fixtures/migrations'
 UPSTREAM = '877690a7039d1326b2c00eda3e297879b80c0678'
@@ -51,13 +52,23 @@ async def upgrade(connection, cfg, target='head'):
 @asynccontextmanager
 async def database(profile='fresh', seed=True):
     url = make_url(os.environ['TEST_POSTGRES_URL'])
-    socket = Path(url.query.get('host', ''))
+    socket = await asyncio.to_thread(Path(url.query.get('host', '')).resolve)
+    assert url.drivername == 'postgresql+asyncpg'
     assert url.host == '127.0.0.1' and url.username == 'bot_custom_baseline'
-    assert str(socket).startswith('/private/tmp/bot-custom-pg-') and await asyncio.to_thread(socket.is_dir)
+    assert url.password is None and url.database == 'postgres'
+    assert dict(url.query) == {'host': str(socket)}
+    assert socket.name == 'socket'
+    assert socket.parent.parent == LAB_ROOT
+    assert socket.parent.name.startswith('bot-custom-pg-') and await asyncio.to_thread(socket.is_dir)
+    cluster_stat = await asyncio.to_thread(socket.parent.stat)
+    assert cluster_stat.st_uid == os.getuid() and not cluster_stat.st_mode & 0o077
+    data = socket.parent / 'data'
+    assert await asyncio.to_thread((data / 'PG_VERSION').is_file)
     schema = 'bridge_' + uuid4().hex
     admin = create_async_engine(url, poolclass=NullPool)
     async with admin.begin() as connection:
-        assert await connection.scalar(text('SELECT inet_server_addr()')) is None
+        actual = (await connection.execute(text("SELECT current_setting('data_directory'),inet_server_addr()"))).one()
+        assert await asyncio.to_thread(Path(actual[0]).resolve) == data and actual[1] is None
         await connection.execute(text(f'CREATE SCHEMA {schema}'))
     engine = create_async_engine(url, poolclass=NullPool, connect_args={'server_settings': {'search_path': schema}})
     try:

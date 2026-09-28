@@ -13,9 +13,14 @@
 
 from __future__ import annotations
 
+import ast
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.fixtures.postgres_db import (
     REQUIRE_POSTGRES_ENV,
@@ -26,6 +31,7 @@ from tests.fixtures.postgres_db import (
 )
 
 
+MAKE = shutil.which('make')
 WORKFLOW_PATH = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'tests.yml'
 
 
@@ -76,7 +82,66 @@ def test_ci_workflow_runs_postgres_tests_for_real() -> None:
     assert WORKFLOW_PATH.exists(), 'нет workflow с тестами'
     workflow = WORKFLOW_PATH.read_text(encoding='utf-8')
 
-    assert 'postgres:15-alpine' in workflow, 'CI не поднимает PostgreSQL'
-    assert f'{TEST_DATABASE_URL_ENV}:' in workflow, 'CI не передаёт адрес тестовой базы'
-    assert f"{REQUIRE_POSTGRES_ENV}: '1'" in workflow, 'CI не запрещает молчаливый пропуск тестов на PostgreSQL'
-    assert 'pytest -m postgres' in workflow, 'CI не гоняет тесты на PostgreSQL отдельным шагом'
+    job = yaml.safe_load(workflow)['jobs']['pytest']
+    runs = [step.get('run', '') for step in job['steps']]
+    assert any('apt-get install' in run and 'postgresql-15' in run for run in runs), 'CI не устанавливает PostgreSQL 15'
+    for suite in ('postgres', 'full'):
+        steps = [step for step in job['steps'] if f'tests/baseline/run.py --suite {suite} ' in step.get('run', '')]
+        assert len(steps) == 1, f'нет обязательного отдельного шага {suite}'
+        assert not steps[0].get('continue-on-error'), 'ошибка тестов не должна скрываться'
+        assert '--pg-bin /usr/lib/postgresql/15/bin' in steps[0]['run']
+
+    # The child environment is intentionally built by the owned lab harness,
+    # not inherited from a workflow TCP DSN. Require the actual env.update call.
+    runner = WORKFLOW_PATH.parents[2] / 'tests/baseline/run.py'
+    tree = ast.parse(runner.read_text(encoding='utf-8'))
+    updates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == 'env'
+        and node.func.attr == 'update'
+    ]
+    assert len(updates) == 1
+    values = {keyword.arg: keyword.value for keyword in updates[0].keywords}
+    assert isinstance(values[REQUIRE_POSTGRES_ENV], ast.Constant)
+    assert values[REQUIRE_POSTGRES_ENV].value == '1', 'CI не запрещает молчаливый пропуск PostgreSQL'
+    for key in (TEST_DATABASE_URL_ENV, 'TEST_POSTGRES_URL'):
+        assert isinstance(values[key], ast.Name) and values[key].id == 'url', (
+            'оба набора тестов должны получить lab URL'
+        )
+
+
+@pytest.mark.parametrize(('target', 'suite'), [('test-postgres', 'postgres'), ('test-all', 'full')])
+def test_make_test_targets_use_the_owned_lab(target: str, suite: str) -> None:
+    assert MAKE is not None, 'make is required to verify the documented test commands'
+    result = subprocess.run(  # noqa: S603 — make dry-run only, fixed synthetic paths; starts no database
+        [MAKE, '--no-print-directory', '-n', target, 'PG_BIN=/synthetic/pg15', 'TEST_OUTPUT=/synthetic/output'],
+        cwd=WORKFLOW_PATH.parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    argv = shlex.split(result.stdout.splitlines()[-1])
+    assert argv[:4] == ['uv', 'run', 'python', 'tests/baseline/run.py']
+    assert argv[argv.index('--suite') + 1] == suite
+    assert argv[argv.index('--pg-bin') + 1] == '/synthetic/pg15'
+    assert argv[argv.index('--output') + 1] == '/synthetic/output'
+
+
+@pytest.mark.parametrize('target', ['test-postgres', 'test-all'])
+def test_make_test_targets_require_explicit_lab_configuration(target: str) -> None:
+    assert MAKE is not None, 'make is required to verify the documented test commands'
+    result = subprocess.run(  # noqa: S603 — config guard exits before running uv or a database
+        [MAKE, '--no-print-directory', target, 'PG_BIN=', 'TEST_OUTPUT='],
+        cwd=WORKFLOW_PATH.parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert 'Укажите PG_BIN=' in result.stdout
+    assert 'uv run' not in result.stdout

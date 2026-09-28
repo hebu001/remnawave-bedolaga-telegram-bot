@@ -89,9 +89,9 @@ file plus bridge/runtime migration proofs and relevant upstream API, panel_sync,
 grace, auth/payment/gift and Telegram regressions. Paths are deduplicated across
 groups. `--suite runtime` isolates strict catalog parity and durable backup
 roundtrips for diagnosis; `--suite migration` retains the frozen bridge/DDL proof.
-`--suite full` lets pytest collect the entire configured `tests/` directory, matching the upstream CI full-suite step without selecting or excluding test files. It uses the upstream default strict asyncio mode and retains the PostgreSQL and warning gates. Selected suites retain their historical explicit auto mode.
+`--suite full` lets pytest collect the entire configured `tests/` directory, matching the upstream CI full-suite step without selecting or excluding test files. It uses the upstream default strict asyncio mode and retains the PostgreSQL and warning gates. `--suite postgres` collects the same directory with the upstream postgres marker in strict mode and prints each nodeid; other selected suites retain their historical explicit auto mode.
 
-For a full run, `check_results.py` accepts only the 17 exact optional NOT RUN tuples in `optional-not-run.json`, with byte hashes of their pinned upstream test sources. These are 12 credential-gated bschek live tests, two Apple IAP credential cases, and three manually reviewed referral static checks. They are never counted as passed: `baseline_complete` stays false; `mandatory_complete` may be true with status `passed_with_optional_not_run`. Changed/additional skips, xfail, strict XPASS, pytest failure, nonzero exit, missing/empty JUnit or no passed test fail the gate. CI invokes the same checker and supplies both PostgreSQL URL variables. Source evidence also records the staged Git tree hash and workflows/Makefile.
+For a full run, `check_results.py` accepts only the 17 exact optional NOT RUN tuples in `optional-not-run.json`, with byte hashes of their pinned upstream test sources. These are 12 credential-gated bschek live tests, two Apple IAP credential cases, and three manually reviewed referral static checks. They are never counted as passed: `baseline_complete` stays false; `mandatory_complete` may be true with status `passed_with_optional_not_run`. Changed/additional skips, xfail, strict XPASS, pytest failure, nonzero exit, missing/empty JUnit or no passed test fail the gate. CI invokes the same harness and checker, including both PostgreSQL URL variables. Source evidence also records the staged Git tree hash and workflows/Makefile.
 
 The harness supplies both TEST_POSTGRES_URL and upstream TEST_DATABASE_URL to
 its newly created Unix-only cluster and sets REQUIRE_POSTGRES_TESTS=1. Stateful
@@ -116,3 +116,34 @@ A restore with replacement is not globally atomic: its existing TRUNCATE uses
 a separate connection. A later insert failure is reported as failure, but does
 not restore the data removed by that TRUNCATE. An actual rollout still needs a
 coordinated snapshot and rehearsed recovery procedure.
+
+## CI portability and bounded runs
+
+The GitHub Tests job installs PostgreSQL 15 binaries from the signed official
+PGDG repository on an ephemeral Ubuntu 24.04 runner. It disables automatic
+system-cluster creation and never starts a Docker/TCP database service. Both
+`--suite postgres` and `--suite full` use this harness, creating a fresh private
+Unix-only cluster under canonical `/tmp` for each step. Canonical `/tmp` resolves
+to `/private/tmp` on macOS; bridge fixtures and the local-only bridge CLI require
+a direct `bot-custom-pg-*` child under that canonical root. Their URL, username,
+database, data-directory and no-TCP restrictions remain; no remote opt-in exists.
+
+The job has a 25-minute limit. Each pytest child is bounded separately (8 minutes
+for PostgreSQL, 15 for full); on timeout the harness terminates its own child
+process group, records a failure, and stops its owned PostgreSQL in `finally`.
+Pytest prints thread stacks after 60 seconds in a single test. Output is streamed
+to the CI log and `pytest.log`; PostgreSQL mode also prints the active nodeid.
+An always-run artifact step retains results, identities and diagnostic logs.
+These limits do not change test assertions or excuse incomplete coverage.
+
+The same mandatory commands are available through Make, with an explicit local
+PostgreSQL 15 binary directory and a new output directory for each invocation:
+
+```sh
+make test-postgres PG_BIN=/absolute/path/to/postgresql15/bin TEST_OUTPUT=/tmp/pg-proof-new
+make test-all PG_BIN=/absolute/path/to/postgresql15/bin TEST_OUTPUT=/tmp/full-proof-new
+```
+
+Missing parameters fail before running tests. The optional `pg-test-up` TCP
+container remains a manual diagnostic helper; `test-postgres` and `test-all`
+never reuse it or an existing database URL.

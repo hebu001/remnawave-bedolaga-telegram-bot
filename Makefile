@@ -27,12 +27,13 @@ reload-follow: ## Перезапустить контейнеры с логам�
 test: ## Запустить тесты
 	uv run pytest -v
 
-# Имя и порт совпадают с тем, что прописано в CI-workflow tests.yml, образ —
-# с docker-compose.yml. Порт 55433 выбран нестандартным, чтобы не столкнуться
-# с локальной боевой базой на 5432.
+# Необязательный контейнер для ручной диагностики PostgreSQL.
+# Обязательные test-postgres/test-all используют собственный Unix-only lab
+# через тот же harness, что и CI; этот TCP-контейнер для них не используется.
 PG_TEST_CONTAINER ?= bedolaga_test_pg
 PG_TEST_PORT ?= 55433
-PG_TEST_URL ?= postgresql+asyncpg://test:test@localhost:$(PG_TEST_PORT)/test
+PG_BIN ?=
+TEST_OUTPUT ?=
 
 .PHONY: pg-test-up
 pg-test-up: ## Поднять PostgreSQL для тестов
@@ -52,13 +53,20 @@ pg-test-down: ## Убрать PostgreSQL для тестов
 	@docker rm -f $(PG_TEST_CONTAINER) >/dev/null 2>&1 || true
 	@echo "🧹 Контейнер $(PG_TEST_CONTAINER) удалён"
 
+.PHONY: test-lab-config
+test-lab-config:
+	@if [ -z "$(PG_BIN)" ] || [ -z "$(TEST_OUTPUT)" ]; then \
+		echo "Укажите PG_BIN=/path/to/postgresql15/bin и TEST_OUTPUT=/path/to/new-output"; \
+		exit 2; \
+	fi
+
 .PHONY: test-postgres
-test-postgres: ## Только тесты, которым нужен настоящий PostgreSQL
-	TEST_DATABASE_URL=$(PG_TEST_URL) TEST_POSTGRES_URL=$(PG_TEST_URL) REQUIRE_POSTGRES_TESTS=1 uv run pytest -m postgres -q
+test-postgres: test-lab-config ## Только тесты, которым нужен настоящий PostgreSQL
+	uv run python tests/baseline/run.py --suite postgres --timeout-seconds 480 --pg-bin "$(PG_BIN)" --output "$(TEST_OUTPUT)"
 
 .PHONY: test-all
-test-all: ## Весь прогон вместе с тестами на PostgreSQL
-	TEST_DATABASE_URL=$(PG_TEST_URL) TEST_POSTGRES_URL=$(PG_TEST_URL) REQUIRE_POSTGRES_TESTS=1 uv run pytest -q
+test-all: test-lab-config ## Весь прогон вместе с тестами на PostgreSQL
+	uv run python tests/baseline/run.py --suite full --timeout-seconds 900 --pg-bin "$(PG_BIN)" --output "$(TEST_OUTPUT)"
 
 .PHONY: lint
 lint: ## Проверить код (ruff check)

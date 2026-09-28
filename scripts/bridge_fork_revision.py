@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 
+LAB_ROOT = Path('/tmp').resolve()  # noqa: S108 — canonical root, never an existing database target
 ROOT = Path(__file__).resolve().parents[1]
 # Do not execute app.database.__init__: it initializes application settings.
 spec = importlib.util.spec_from_file_location('evo_revision_bridge', ROOT / 'app/database/fork_revision_bridge.py')
@@ -38,10 +40,14 @@ def local_descriptor(path):
         or url.username != 'bot_custom_baseline'
         or url.database != 'postgres'
         or dict(url.query) != {'host': str(socket)}
+        or socket.name != 'socket'
+        or data.name != 'data'
         or socket.parent != data.parent
         or not socket.parent.name.startswith('bot-custom-pg-')
-        or not str(socket).startswith('/private/tmp/')
+        or socket.parent.parent != LAB_ROOT
         or not (data / 'PG_VERSION').is_file()
+        or socket.parent.stat().st_uid != os.getuid()
+        or socket.parent.stat().st_mode & 0o077
     ):
         raise ValueError('Only a local synthetic phase-1 cluster descriptor is supported')
     return url, data

@@ -14,8 +14,6 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-import pytest
-
 
 WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / '.github' / 'workflows'
 
@@ -106,10 +104,18 @@ def test_postgres_image_matches_production_compose() -> None:
     Разъехавшиеся версии превращают их в проверку чего-то другого.
     """
     ci_images = _collect(POSTGRES_IMAGE_RE, 1)
-    if not ci_images:
-        pytest.skip('в CI нет сервиса PostgreSQL')
 
     compose = (WORKFLOWS_DIR.parents[1] / 'docker-compose.yml').read_text(encoding='utf-8')
     compose_images = set(re.findall(r'image:\s*(postgres:[\w.-]+)', compose))
 
-    assert set(ci_images) == compose_images, f'в CI {sorted(ci_images)}, в docker-compose {sorted(compose_images)}'
+    if ci_images:
+        assert set(ci_images) == compose_images, f'в CI {sorted(ci_images)}, в docker-compose {sorted(compose_images)}'
+    else:
+        # Native Unix-only lab: compare the installed package AND selected
+        # executable major with production, without silently skipping coverage.
+        workflow = (WORKFLOWS_DIR / 'tests.yml').read_text(encoding='utf-8')
+        packages = set(re.findall(r'apt-get install[^\n]*\bpostgresql-(\d+)\b', workflow))
+        binaries = set(re.findall(r'/usr/lib/postgresql/(\d+)/bin', workflow))
+        production = {image.split(':')[1].split('-')[0].split('.')[0] for image in compose_images}
+        assert packages and binaries and production, 'версия PostgreSQL должна быть явно задана'
+        assert packages == binaries == production, f'пакеты {packages}, бинарники {binaries}, прод {production}'

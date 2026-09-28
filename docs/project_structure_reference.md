@@ -3126,6 +3126,9 @@
 - `tests/test_legacy_subscription_keyboard.py` — Python-модуль
   Классы: нет
   Функции: `test_legacy_subscription_offers_only_move_to_tariff`, `test_expired_legacy_subscription_still_moves_to_tariff` — Истёкшая старая подписка тоже переводится на тариф той же строкой, а не покупкой с нуля., `test_subscription_with_tariff_keeps_renew_and_autopay`, `test_classic_mode_subscription_keeps_renew` — В классическом режиме подписка без тарифа — обычная, продление на месте., `test_legacy_subscription_has_no_traffic_topup_even_if_classic_topup_is_on` — Классические настройки докупки трафика к старой подписке не применяются., `test_legacy_subscription_settings_offer_no_classic_addons` — В «Настройках» старой подписки нет стран, трафика и устройств по классическим ценам., `test_classic_subscription_settings_keep_classic_addons` — В классическом режиме подписка без тарифа — обычная, её настройки не трогаем., `test_subscriptions_list_hides_buy_another_while_a_legacy_subscription_exists` — Пока у человека есть старая подписка, «Купить ещё тариф» не предлагаем: сперва переход на тариф.
+- `tests/test_local_postgres_lab.py` — Python-модуль
+  Классы: нет
+  Функции: `descriptor`, `test_cli_accepts_only_its_canonical_lab_root`, `test_cli_rejects_non_lab_descriptors_before_connecting`, `test_migration_fixture_rejects_tcp_before_engine_creation`, `test_migration_fixture_rejects_symlink_to_non_lab_sibling`, `test_server_identity_is_checked_before_any_schema_mutation`, `runner`, `test_runner_preserves_failure_exit_and_streamed_evidence`, `test_runner_bounds_hung_child_and_preserves_last_progress`
 - `tests/test_locale_integrity.py` — Python-модуль
   Классы: нет
   Функции: `locales`, `test_all_locales_have_identical_keys`, `test_placeholders_consistent_across_locales` — Every {placeholder} must be identical across languages — the code calls, `test_t_calls_without_default_exist_in_ru` — texts.t('KEY') with NO fallback raises KeyError if the key is absent from ru., `test_t_calls_with_static_default_exist_in_ru` — texts.t('KEY', 'статический дефолт') с ключом вне ru.json отдаёт русский, `test_invite_only_keys_exist_in_every_locale`
@@ -3231,7 +3234,7 @@
 - `tests/baseline/optional-not-run.json` — файл
 - `tests/baseline/run.py` — Python-модуль
   Классы: нет
-  Функции: `command`, `main`
+  Функции: `command`, `run_pytest` — Stream evidence, bound hangs, and terminate only this child process group., `main`
 - `tests/baseline/runtime-contracts.json` — файл
 
 ### tests/cabinet
@@ -3791,7 +3794,7 @@
   Функции: `test_sqlite_uses_nullpool_without_kwargs` — Для SQLite пул не применяется — kwargs пустые (NullPool без пулинга)., `test_postgres_pool_kwargs_read_from_settings` — Настраиваемые знобы берутся из settings, безопасные дефолты — фиксированы., `test_pool_defaults_preserve_legacy_values` — Дефолты совпадают с прежними захардкоженными значениями (без регрессии)., `test_pool_size_clamped_to_at_least_one` — pool_size=0 у QueuePool означает «без лимита» — клампим к >= 1., `test_max_overflow_clamped_to_nonnegative`, `test_pool_timeout_clamped_to_at_least_one`, `test_invalid_values_fall_back_to_defaults` — Мусор в env не должен ронять старт — откатываемся к дефолтам., `test_custom_env_values_are_applied` — Числа из env (как строки) корректно парсятся., `test_live_engine_is_wired_with_pool_kwargs` — Боевой engine реально получает kwargs из хелпера — это и есть фикс #3000., `test_custom_pool_values_reach_a_real_engine` — End-to-end: настроенные значения долетают через create_async_engine в пул.
 - `tests/database/test_postgres_fixture_guard.py` — Python-модуль
   Классы: нет
-  Функции: `test_missing_url_skips_by_default` — Окружение без PostgreSQL не должно ронять прогон., `test_missing_url_fails_when_postgres_is_required` — С поднятым флагом отсутствие базы — падение, а не пропуск., `test_requirement_flag_accepts_usual_spellings`, `test_requirement_flag_ignores_everything_else`, `test_blank_url_counts_as_absent` — Пустая переменная — это отсутствие базы, а не адрес из пробелов., `test_ci_workflow_runs_postgres_tests_for_real` — CI обязан поднимать базу и требовать, чтобы тесты на ней прошли.
+  Функции: `test_missing_url_skips_by_default` — Окружение без PostgreSQL не должно ронять прогон., `test_missing_url_fails_when_postgres_is_required` — С поднятым флагом отсутствие базы — падение, а не пропуск., `test_requirement_flag_accepts_usual_spellings`, `test_requirement_flag_ignores_everything_else`, `test_blank_url_counts_as_absent` — Пустая переменная — это отсутствие базы, а не адрес из пробелов., `test_ci_workflow_runs_postgres_tests_for_real` — CI обязан поднимать базу и требовать, чтобы тесты на ней прошли., `test_make_test_targets_use_the_owned_lab`, `test_make_test_targets_require_explicit_lab_configuration`
 - `tests/database/test_promo_group_crud_schedules_recalculation_postgres.py` — Python-модуль
   Классы: нет
   Функции: `scheduled`, `test_creating_a_group_with_threshold_schedules_recalculation`, `test_only_a_threshold_change_schedules_recalculation_on_update`, `test_deleting_a_group_schedules_recalculation_while_thresholds_remain`, `test_refused_deletion_of_default_group_schedules_nothing`
