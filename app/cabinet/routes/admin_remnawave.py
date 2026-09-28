@@ -954,9 +954,14 @@ async def sync_to_panel(
     stats = await service.sync_users_to_panel(db)
     logger.info('Admin synced to panel', telegram_id=admin.telegram_id)
 
+    errors = stats.get('errors', 0)
+    message = (
+        f'Sync to panel completed: created {stats.get("created", 0)}, '
+        f'updated {stats.get("updated", 0)}, errors {errors}'
+    )
     return SyncResponse(
-        success=True,
-        message='Sync to panel completed',
+        success=errors == 0,
+        message=message,
         data=stats,
     )
 
