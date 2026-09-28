@@ -35,7 +35,7 @@ def make_message(text: str | None, user_id: int = 1000) -> MagicMock:
 @pytest.fixture(autouse=True)
 def _non_admin():
     # Default: nobody is an admin (so the limits actually apply).
-    with patch.object(thr.settings, 'is_admin', return_value=False):
+    with patch.object(type(thr.settings), 'is_admin', return_value=False):
         yield
 
 
@@ -138,7 +138,7 @@ class TestGlobalCeiling:
 class TestExemptions:
     @pytest.mark.asyncio
     async def test_admin_not_throttled(self):
-        with patch.object(thr.settings, 'is_admin', return_value=True):
+        with patch.object(type(thr.settings), 'is_admin', return_value=True):
             mw = thr.ThrottlingMiddleware(rate_limit=0, start_max_calls=3)
             handler = AsyncMock(return_value='ok')
             for _ in range(10):

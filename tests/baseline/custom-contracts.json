@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "4b06edcdce26850c03ca474e8d195ef94ddb347e",
+  "upstream_commit": "877690a7039d1326b2c00eda3e297879b80c0678",
+  "python": "3.13",
+  "test_only_packages": [
+    "greenlet==3.5.5"
+  ],
+  "notes": [
+    "Existing fork regression suites plus directly related external contracts, not all upstream tests.",
+    "No business-policy choice is resolved by this baseline. RESET_TRAFFIC_ON_PAYMENT is recorded as current behavior only, pending user decision.",
+    "Source-shape assertions (rich menu pins/runtime-name checks) may need fixture/assertion adaptation after merge; business behavior must remain reviewed.",
+    "All PostgreSQL tests must run. Any skipped test makes the baseline result incomplete.",
+    "External providers are mocked by existing tests; the baseline plugin rejects all non-Unix socket connections."
+  ],
+  "groups": {
+    "payments_and_recovery": [
+      "tests/integration/test_purchase_atomicity.py",
+      "tests/integration/test_menu_activation_atomicity.py",
+      "tests/integration/test_subpage_recovery.py",
+      "tests/integration/test_renewal_sync_recovery.py",
+      "tests/integration/test_payment_recovery_migration.py",
+      "tests/cabinet/test_subpage_bff_auth.py",
+      "tests/cabinet/test_subpage_payment_methods.py",
+      "tests/handlers/test_tariff_purchase_extra_device_prices.py",
+      "tests/test_miniapp_payments.py",
+      "tests/test_pricing_engine.py",
+      "tests/cabinet/test_device_addon_prorate.py",
+      "tests/cabinet/test_purchase_tariff_expired_trial_reuse.py",
+      "tests/cabinet/test_purchase_tariff_refund_on_failure.py"
+    ],
+    "session_and_password_security": [
+      "tests/integration/test_cabinet_auth_migration.py",
+      "tests/integration/test_cabinet_session_security.py",
+      "tests/cabinet/test_password_contract.py",
+      "tests/cabinet/test_password_executor.py",
+      "tests/cabinet/test_refresh_token_rotation.py",
+      "tests/cabinet/test_support_ws_contract.py",
+      "tests/services/test_guest_purchase_password_work.py"
+    ],
+    "panel_and_traffic": [
+      "tests/integration/test_traffic_threshold_notifications.py",
+      "tests/services/test_remnawave_service_sync.py",
+      "tests/cabinet/test_device_delete_errors.py",
+      "tests/external/test_remnawave_remove_device.py",
+      "tests/cabinet/test_device_ownership.py",
+      "tests/integration/test_notification_lookup.py",
+      "tests/services/test_monitoring_notification_batches.py",
+      "tests/cabinet/test_admin_remnawave_sync_result.py"
+    ],
+    "gifts_and_telegram_contracts": [
+      "tests/services/test_gift_claim_code.py",
+      "tests/services/test_gift_claim_notify.py",
+      "tests/services/test_gift_token_prefix_threshold.py",
+      "tests/handlers/test_partner_start_deeplink.py",
+      "tests/handlers/test_referral_info_compact.py",
+      "tests/handlers/test_referral_invite.py",
+      "tests/handlers/test_referral_qr.py",
+      "tests/handlers/test_start_subid.py",
+      "tests/handlers/test_start_subid_drain.py",
+      "tests/keyboards/test_referral_keyboard_custom_emoji.py",
+      "tests/middlewares/test_back_button.py",
+      "tests/middlewares/test_throttling.py",
+      "tests/test_rich_menu_pins.py",
+      "tests/utils/test_cabinet_menu_callback_buttons.py",
+      "tests/utils/test_message_effect_isolation.py",
+      "tests/utils/test_rich_menu.py",
+      "tests/utils/test_rich_menu_quote_compat.py",
+      "tests/webserver/test_telegram_rich_compat.py",
+      "tests/utils/test_incy_crypto_contract.py"
+    ],
+    "performance_and_runtime": [
+      "tests/services/test_backup_consumers.py",
+      "tests/services/test_backup_io.py",
+      "tests/services/test_backup_publication.py",
+      "tests/services/test_backup_service_list.py",
+      "tests/test_runtime_name_resolution.py",
+      "tests/webserver/test_unified_app.py"
+    ]
+  }
+}
