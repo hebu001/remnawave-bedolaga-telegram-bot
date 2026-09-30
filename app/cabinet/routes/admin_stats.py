@@ -15,7 +15,7 @@ from app.database.crud.campaign import get_campaign_statistics, get_campaigns_co
 from app.database.crud.referral import not_referee_directed
 from app.database.crud.server_squad import get_server_statistics
 from app.database.crud.subscription import get_subscriptions_statistics
-from app.database.crud.transaction import REAL_PAYMENT_METHODS, get_revenue_by_period, get_transactions_statistics
+from app.database.crud.transaction import get_income_total, get_revenue_by_period, get_transactions_statistics
 from app.database.models import (
     ReferralEarning,
     Subscription,
@@ -942,29 +942,8 @@ async def get_recent_payments(
         )
         total_count = total_count_result.scalar() or 0
 
-        today_total_result = await db.execute(
-            select(func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0)).where(
-                and_(
-                    Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
-                    Transaction.is_completed == True,
-                    Transaction.created_at >= today_start,
-                    Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
-                )
-            )
-        )
-        total_today = today_total_result.scalar() or 0
-
-        week_total_result = await db.execute(
-            select(func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0)).where(
-                and_(
-                    Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
-                    Transaction.is_completed == True,
-                    Transaction.created_at >= week_ago,
-                    Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
-                )
-            )
-        )
-        total_week = week_total_result.scalar() or 0
+        total_today = await get_income_total(db, today_start, now)
+        total_week = await get_income_total(db, week_ago, now)
 
         return RecentPaymentsResponse(
             payments=payment_items,

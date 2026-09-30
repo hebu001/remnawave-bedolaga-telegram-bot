@@ -74,6 +74,13 @@
       "tests/services/test_backup_service_list.py",
       "tests/test_runtime_name_resolution.py",
       "tests/webserver/test_unified_app.py"
+    ],
+    "income_statistics": [
+      "tests/database/test_income_statistics.py",
+      "tests/cabinet/test_income_receipts_endpoints.py",
+      "tests/crud/test_transactions_today_local_day.py",
+      "tests/cabinet/test_admin_stats_today_local_day.py",
+      "tests/database/test_local_date_expr_postgres.py"
     ]
   }
 }

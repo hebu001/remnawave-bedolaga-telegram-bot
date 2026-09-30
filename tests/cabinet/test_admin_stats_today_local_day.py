@@ -16,14 +16,14 @@ import pytest
 
 from app.cabinet.routes import admin_stats
 from app.database.crud.transaction import REAL_PAYMENT_METHODS
-from app.database.models import Transaction, TransactionType, User
+from app.database.models import Transaction, TransactionType, User, WataPayment, YooKassaPayment
 from tests.fixtures.local_day import reset_local_timezone_cache, use_timezone  # noqa: F401
 from tests.fixtures.sqlite_memory import memory_session
 
 
 ADMIN = SimpleNamespace(id=1, username='admin')
-TABLES = [User.__table__, Transaction.__table__]
-GATEWAY = REAL_PAYMENT_METHODS[0]
+TABLES = [User.__table__, Transaction.__table__, WataPayment.__table__, YooKassaPayment.__table__]
+GATEWAY = next(method for method in REAL_PAYMENT_METHODS if method not in ('wata', 'yookassa'))
 
 
 async def _seed_moscow_day(db, monkeypatch):

@@ -1,12 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database.local_date import as_date, local_date_expr
-from app.database.models import PaymentMethod, Transaction, TransactionType, User
+from app.database.models import PaymentMethod, Transaction, TransactionType, User, WataPayment, YooKassaPayment
 from app.utils.timezone import local_day_bounds, local_day_start, local_month_start
 
 
@@ -30,6 +30,56 @@ _NON_GATEWAY_METHODS = frozenset(
     }
 )
 REAL_PAYMENT_METHODS = [m.value for m in PaymentMethod if m.value not in _NON_GATEWAY_METHODS]
+
+
+def income_payments_query():
+    """One row per received payment, never both its deposit and subscription debit.
+
+    WATA/YooKassa records also cover gifts and subpage purchases without a linked
+    transaction. Other gateways retain their existing transaction-based source.
+    Old YooKassa records without captured_at use the completed ledger entry.
+    """
+    wata = select(
+        WataPayment.amount_kopeks.label('amount_kopeks'),
+        WataPayment.paid_at.label('paid_at'),
+        literal(PaymentMethod.WATA.value).label('payment_method'),
+    ).where(WataPayment.is_paid.is_(True), WataPayment.currency == 'RUB')
+    yookassa = (
+        select(
+            YooKassaPayment.amount_kopeks.label('amount_kopeks'),
+            func.coalesce(YooKassaPayment.captured_at, Transaction.completed_at).label('paid_at'),
+            literal(PaymentMethod.YOOKASSA.value).label('payment_method'),
+        )
+        .outerjoin(Transaction, Transaction.id == YooKassaPayment.transaction_id)
+        .where(
+            YooKassaPayment.is_paid.is_(True),
+            YooKassaPayment.status == 'succeeded',
+            YooKassaPayment.test_mode.is_not(True),
+            YooKassaPayment.currency == 'RUB',
+        )
+    )
+    other_gateways = select(
+        func.abs(Transaction.amount_kopeks).label('amount_kopeks'),
+        func.coalesce(Transaction.completed_at, Transaction.created_at).label('paid_at'),
+        Transaction.payment_method.label('payment_method'),
+    ).where(
+        Transaction.is_completed.is_(True),
+        Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
+        Transaction.payment_method.in_(
+            [m for m in REAL_PAYMENT_METHODS if m not in (PaymentMethod.WATA.value, PaymentMethod.YOOKASSA.value)]
+        ),
+    )
+    return union_all(wata, yookassa, other_gateways).subquery('income_payments')
+
+
+async def get_income_total(db: AsyncSession, start_date: datetime, end_date: datetime) -> int:
+    payments = income_payments_query()
+    result = await db.execute(
+        select(func.coalesce(func.sum(payments.c.amount_kopeks), 0)).where(
+            payments.c.paid_at >= start_date.astimezone(UTC), payments.c.paid_at <= end_date.astimezone(UTC)
+        )
+    )
+    return result.scalar() or 0
 
 
 # ── Доп. услуги (докупка трафика / устройств) ──────────────────────────────────
@@ -367,24 +417,13 @@ async def get_pending_transactions(db: AsyncSession) -> list[Transaction]:
 async def get_transactions_statistics(
     db: AsyncSession, start_date: datetime | None = None, end_date: datetime | None = None
 ) -> dict:
+    now = datetime.now(UTC)
     if not start_date:
-        start_date = local_month_start()
+        start_date = local_month_start(now)
     if not end_date:
-        end_date = datetime.now(UTC)
+        end_date = now
 
-    # Доход считаем по реальным платежам + прямые покупки подписок (лендинги)
-    income_result = await db.execute(
-        select(func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0)).where(
-            and_(
-                Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
-                Transaction.is_completed == True,
-                Transaction.created_at >= start_date,
-                Transaction.created_at <= end_date,
-                Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
-            )
-        )
-    )
-    total_income = income_result.scalar()
+    total_income = await get_income_total(db, start_date, end_date)
 
     expenses_result = await db.execute(
         select(func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0)).where(
@@ -429,28 +468,25 @@ async def get_transactions_statistics(
         row.type: {'count': row.count, 'amount': row.total_amount} for row in transactions_count_result
     }
 
+    payments = income_payments_query()
     payment_methods_result = await db.execute(
         select(
-            Transaction.payment_method,
-            func.count(Transaction.id).label('count'),
-            func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0).label('total_amount'),
+            payments.c.payment_method,
+            func.count().label('count'),
+            func.coalesce(func.sum(payments.c.amount_kopeks), 0).label('total_amount'),
         )
         .where(
-            and_(
-                Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
-                Transaction.is_completed == True,
-                Transaction.created_at >= start_date,
-                Transaction.created_at <= end_date,
-            )
+            payments.c.paid_at >= start_date,
+            payments.c.paid_at <= end_date,
         )
-        .group_by(Transaction.payment_method)
+        .group_by(payments.c.payment_method)
     )
     payment_methods = {
         row.payment_method: {'count': row.count, 'amount': row.total_amount} for row in payment_methods_result
     }
 
     # «Сегодня» — календарный день settings.TIMEZONE, границы в UTC (#3136).
-    today_start, today_end = local_day_bounds()
+    today_start, today_end = local_day_bounds(now)
     today_result = await db.execute(
         select(func.count(Transaction.id)).where(
             and_(
@@ -462,19 +498,7 @@ async def get_transactions_statistics(
     )
     transactions_today = today_result.scalar()
 
-    # Доход за сегодня — реальные платежи + прямые покупки подписок (лендинги)
-    today_income_result = await db.execute(
-        select(func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0)).where(
-            and_(
-                Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
-                Transaction.is_completed == True,
-                Transaction.created_at >= today_start,
-                Transaction.created_at < today_end,
-                Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
-            )
-        )
-    )
-    income_today = today_income_result.scalar()
+    income_today = await get_income_total(db, today_start, now)
 
     return {
         'period': {'start_date': start_date, 'end_date': end_date},
@@ -491,31 +515,21 @@ async def get_transactions_statistics(
 
 
 async def get_revenue_by_period(db: AsyncSession, days: int = 30) -> list[dict]:
-    """Доход по календарным дням settings.TIMEZONE за последние ``days`` дней, включая сегодня.
-
-    Реальные платежи + прямые покупки подписок (лендинги). ``date`` в строках —
-    всегда ``date``, на любой БД.
-    """
-    start_date = local_day_start(days_back=max(days, 1) - 1)
-    day = local_date_expr(Transaction.created_at, db)
+    """Received payments once per local calendar day, including today."""
+    now = datetime.now(UTC)
+    start_date = local_day_start(now, days_back=max(days, 1) - 1)
+    payments = income_payments_query()
+    day = local_date_expr(payments.c.paid_at, db)
 
     result = await db.execute(
         select(
             day.label('date'),
-            func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0).label('amount'),
+            func.coalesce(func.sum(payments.c.amount_kopeks), 0).label('amount'),
         )
-        .where(
-            and_(
-                Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
-                Transaction.is_completed == True,
-                Transaction.created_at >= start_date,
-                Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
-            )
-        )
+        .where(payments.c.paid_at >= start_date, payments.c.paid_at <= now)
         .group_by(day)
         .order_by(day)
     )
-
     return [{'date': as_date(row.date), 'amount_kopeks': row.amount} for row in result]
 
 

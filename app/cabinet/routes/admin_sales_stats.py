@@ -13,6 +13,7 @@ from app.database.crud.transaction import (
     REAL_PAYMENT_METHODS,
     addon_description_clause,
     device_addon_clause,
+    get_income_total,
     traffic_addon_clause,
 )
 from app.database.local_date import local_date_expr
@@ -125,30 +126,17 @@ async def get_sales_summary(
     try:
         period_start, period_end = _parse_period(days, start_date, end_date)
 
-        # Total revenue (deposits + direct subscription payments with real payment methods)
-        revenue_result = await db.execute(
-            select(func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0)).where(
-                and_(
-                    Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
-                    Transaction.is_completed == True,
-                    Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
-                    Transaction.created_at >= period_start,
-                    Transaction.created_at <= period_end,
-                )
-            )
-        )
-        total_revenue = revenue_result.scalar() or 0
+        # Gateway receipts include both balance top-ups and direct purchases once.
+        total_revenue = await get_income_total(db, period_start, period_end)
 
-        # Gateway-funded gifts never create a Transaction (the recipient "didn't
-        # pay"), so the buyer's real payment was otherwise invisible to revenue.
-        # Count it from GuestPurchase. Balance-funded gifts carry payment_method
-        # 'balance' and are excluded here — they're already counted via the deposit
-        # that funded the balance.
+        # WATA/YooKassa gifts are already included by their gateway receipt.
+        # Preserve upstream's unlinked-gift fallback only for other gateways.
         gift_revenue_result = await db.execute(
             select(func.coalesce(func.sum(GuestPurchase.amount_kopeks), 0)).where(
                 and_(
                     GuestPurchase.is_gift.is_(True),
                     GuestPurchase.payment_method.in_(REAL_PAYMENT_METHODS),
+                    GuestPurchase.payment_method.notin_([PaymentMethod.WATA.value, PaymentMethod.YOOKASSA.value]),
                     GuestPurchase.paid_at >= period_start,
                     GuestPurchase.paid_at <= period_end,
                 )
