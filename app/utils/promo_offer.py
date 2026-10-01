@@ -25,7 +25,7 @@ def get_user_active_promo_discount_percent(user: User | None) -> int:
 
     try:
         percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
     expires_at = getattr(user, 'promo_offer_discount_expires_at', None)
@@ -146,7 +146,7 @@ async def build_promo_offer_timer_line(
         try:
             if raw_duration:
                 total_seconds = int(float(raw_duration) * 3600)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             total_seconds = None
 
     if total_seconds is None or total_seconds <= 0:

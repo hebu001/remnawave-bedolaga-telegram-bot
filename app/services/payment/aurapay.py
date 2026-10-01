@@ -132,7 +132,7 @@ class AuraPayPaymentMixin:
                     expires_at = datetime.fromisoformat(expires_at_str)
                     if expires_at.tzinfo is None:
                         expires_at = expires_at.replace(tzinfo=UTC)
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     expires_at = datetime.now(UTC) + timedelta(minutes=lifetime)
             else:
                 expires_at = datetime.now(UTC) + timedelta(minutes=lifetime)

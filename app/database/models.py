@@ -22,17 +22,20 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Table,
     Text,
     Time,
     TypeDecorator,
     UniqueConstraint,
+    inspect,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
+from sqlalchemy.orm.attributes import NO_VALUE
 from sqlalchemy.sql import func
 
 
@@ -182,6 +185,7 @@ class PaymentMethod(Enum):
     PARITYPAY = 'paritypay'
     DONUT = 'donut'
     LAVA = 'lava'
+    CASHERA = 'cashera'
     MANUAL = 'manual'
     BALANCE = 'balance'
 
@@ -326,7 +330,7 @@ class CryptoBotPayment(Base):
     def amount_float(self) -> float:
         try:
             return float(self.amount)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return 0.0
 
     @property
@@ -489,7 +493,7 @@ class HeleketPayment(Base):
     def amount_float(self) -> float:
         try:
             return float(self.amount)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0.0
 
     @property
@@ -500,7 +504,7 @@ class HeleketPayment(Base):
     def payer_amount_float(self) -> float:
         try:
             return float(self.payer_amount) if self.payer_amount is not None else 0.0
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0.0
 
     @property
@@ -788,6 +792,66 @@ class LavaSubscription(Base):
         # IntegrityError и возвращает победителя (зеркало Platega).
         Index(
             'uq_lava_subscriptions_alive',
+            'subscription_id',
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'ACTIVE', 'PAST_DUE')"),
+            sqlite_where=text("status IN ('PENDING', 'ACTIVE', 'PAST_DUE')"),
+        ),
+    )
+
+    @property
+    def amount_rubles(self) -> float:
+        return self.amount_kopeks / 100
+
+
+class CasheraSubscription(Base):
+    """Подписка Cashera (sbp_recurring), привязанная к подписке бота.
+
+    Push-модель, как у :class:`PlategaSubscription`: клиент один раз подтверждает
+    подписку по ``redirect_url``, дальше Cashera списывает сама по интервалу, а
+    каждое списание приходит вебхуком ``transaction.status_updated`` с объектом
+    ``subscription``. Сумма и интервал задаются нами при оформлении.
+    """
+
+    __tablename__ = 'cashera_subscriptions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False, index=True)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id'), nullable=True)
+
+    cashera_subscription_uuid = Column(String(64), nullable=True)
+    # Наш external_id подписки (ключ идемпотентности создания у Cashera)
+    external_id = Column(String(255), nullable=False)
+    interval = Column(String(16), nullable=False)  # daily / weekly / monthly / yearly
+    charge_days = Column(Integer, nullable=False)  # шаг продления за одно списание
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default='RUB', server_default='RUB')
+
+    status = Column(
+        String(20), nullable=False, default='PENDING', server_default='PENDING'
+    )  # PENDING/ACTIVE/PAST_DUE/CANCELLED/FAILED
+    remote_status = Column(String(32), nullable=True)  # последний статус подписки у Cashera
+    redirect_url = Column(Text, nullable=True)
+    next_charge_at = Column(AwareDateTime(), nullable=True)
+    last_charge_at = Column(AwareDateTime(), nullable=True)
+    last_charge_external_id = Column(String(255), nullable=True)  # uuid последнего списания
+    charges_success = Column(Integer, nullable=False, default=0, server_default='0')
+    charges_failed = Column(Integer, nullable=False, default=0, server_default='0')
+
+    created_at = Column(AwareDateTime(), default=func.now(), server_default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now(), server_default=func.now())
+
+    user = relationship('User', backref='cashera_subscriptions')
+    subscription = relationship('Subscription', backref='cashera_subscriptions')
+
+    __table_args__ = (
+        UniqueConstraint('cashera_subscription_uuid', name='uq_cashera_subscriptions_uuid'),
+        UniqueConstraint('external_id', name='uq_cashera_subscriptions_external_id'),
+        Index('ix_cashera_subscriptions_user_active', 'user_id', 'status'),
+        # Одна живая привязка на подписку: проигравший гонку enable ловит IntegrityError.
+        Index(
+            'uq_cashera_subscriptions_alive',
             'subscription_id',
             unique=True,
             postgresql_where=text("status IN ('PENDING', 'ACTIVE', 'PAST_DUE')"),
@@ -1743,6 +1807,72 @@ class CisPayPayment(Base):
         )
 
 
+class CasheraPayment(Base):
+    """Платежи через Cashera (api.cashera.cash): СБП, карты, крипта, CryptoBot."""
+
+    __tablename__ = 'cashera_payments'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+
+    # Идентификаторы: наш external_id (ключ идемпотентности Cashera) и uuid транзакции Cashera
+    order_id = Column(String(64), unique=True, nullable=False, index=True)
+    cashera_uuid = Column(String(64), unique=True, nullable=True, index=True)
+
+    # Суммы — копейки (минорные единицы RUB)
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default='RUB', server_default='RUB')
+    description = Column(Text, nullable=True)
+
+    # Статусы: наш внутренний и последний сырой статус Cashera (идемпотентность вебхуков)
+    status = Column(String(32), nullable=False, default='pending', server_default='pending')
+    cashera_status = Column(String(32), nullable=True)
+    is_paid = Column(Boolean, default=False, nullable=False, server_default=text('false'))
+
+    # Данные платежа
+    payment_url = Column(Text, nullable=True)
+    payment_method = Column(String(32), nullable=True)  # sbp / card / mastercard / crypto / cryptobot
+
+    # Метаданные
+    metadata_json = Column(JSON, nullable=True)
+    callback_payload = Column(JSON, nullable=True)
+
+    # Временные метки
+    paid_at = Column(AwareDateTime(), nullable=True)
+    expires_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), default=func.now(), server_default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now(), server_default=func.now())
+
+    # Связь с транзакцией
+    transaction_id = Column(Integer, ForeignKey('transactions.id'), nullable=True)
+
+    # Relationships
+    user = relationship('User', backref='cashera_payments')
+    transaction = relationship('Transaction', backref='cashera_payment')
+
+    @property
+    def amount_rubles(self) -> float:
+        return self.amount_kopeks / 100
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == 'pending'
+
+    @property
+    def is_success(self) -> bool:
+        return self.status == 'success' and self.is_paid
+
+    @property
+    def is_failed(self) -> bool:
+        return self.status in ['failed', 'expired', 'refunded', 'chargeback', 'amount_mismatch', 'error']
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return (
+            f'<CasheraPayment(id={self.id}, order_id={self.order_id}, '
+            f'amount={self.amount_rubles}₽, status={self.status})>'
+        )
+
+
 class TabPayPayment(Base):
     """Платежи через TabPay (tabpay.org, СБП и карты с 3-D Secure)."""
 
@@ -1928,7 +2058,7 @@ class PromoGroup(Base):
             try:
                 period = int(key)
                 percent = int(value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
 
             normalized[period] = max(0, min(100, percent))
@@ -2325,7 +2455,7 @@ class User(Base):
     subscriptions = relationship('Subscription', back_populates='user', order_by='Subscription.created_at.desc()')
 
     @property
-    def subscription(self) -> 'Subscription | None':
+    def subscription(self) -> Subscription | None:
         """Deprecated: returns the first active subscription or most recent one.
 
         Use user.subscriptions directly for multi-tariff support.
@@ -2447,27 +2577,61 @@ class User(Base):
         return self.telegram_id is None
 
     def get_primary_promo_group(self):
-        """Возвращает промогруппу с максимальным приоритетом."""
-        try:
-            if not self.user_promo_groups:
-                return getattr(self, 'promo_group', None)
+        """Выбирает загруженную промогруппу без неявного запроса к БД.
 
-            # Сортируем по приоритету группы (убывание), затем по ID группы
-            # Используем getattr для защиты от ленивой загрузки
-            sorted_groups = sorted(
-                self.user_promo_groups,
-                key=lambda upg: (getattr(upg.promo_group, 'priority', 0) if upg.promo_group else 0, upg.promo_group_id),
-                reverse=True,
-            )
+        Async callers must preload both relationships before pricing. Accessing
+        a lazy relationship and catching MissingGreenlet still starts driver I/O.
+        """
+        state = inspect(self)
+        pricing_fields = (
+            'id',
+            'priority',
+            'period_discounts',
+            'server_discount_percent',
+            'traffic_discount_percent',
+            'device_discount_percent',
+            'apply_discounts_to_addons',
+            'is_default',
+        )
 
-            if sorted_groups and sorted_groups[0].promo_group:
-                return sorted_groups[0].promo_group
-        except Exception:
-            # Если возникла ошибка (например, ленивая загрузка в async), fallback на старую связь
-            pass
+        def require_loaded_pricing(group):
+            group_state = inspect(group)
+            if group_state.identity is not None and any(
+                group_state.attrs[name].loaded_value is NO_VALUE for name in pricing_fields
+            ):
+                raise RuntimeError('Promo group pricing data must be explicitly loaded before pricing')
+            return group_state
 
-        # Fallback на старую связь если новая пустая или возникла ошибка
-        return getattr(self, 'promo_group', None)
+        links = state.attrs.user_promo_groups.loaded_value
+        if links is NO_VALUE and state.identity is not None and state.attrs.promo_group.loaded_value is not NO_VALUE:
+            raise RuntimeError('Promo group memberships must be explicitly loaded before pricing')
+        if links is not NO_VALUE and links:
+            candidates = []
+            for link in links:
+                link_state = inspect(link)
+                group = link_state.attrs.promo_group.loaded_value
+                if group is NO_VALUE:
+                    raise RuntimeError('Promo group relationships must be explicitly loaded before pricing')
+                group_state = require_loaded_pricing(group) if group is not None else None
+                priority = group_state.attrs.priority.loaded_value if group_state is not None else 0
+                group_id = link_state.attrs.promo_group_id.loaded_value
+                if group_id is NO_VALUE:
+                    if link_state.identity is not None:
+                        raise RuntimeError('Promo group link keys must be explicitly loaded before pricing')
+                    # New pending links can refer to a group before FK propagation.
+                    group_id = group_state.attrs.id.loaded_value if group_state is not None else 0
+                if group_id is NO_VALUE or group_id is None:
+                    group_id = 0
+                candidates.append((0 if priority is NO_VALUE else priority or 0, group_id, group))
+            if candidates:
+                group = max(candidates, key=lambda item: (item[0], item[1]))[2]
+                if group is not None:
+                    return group
+
+        legacy_group = state.attrs.promo_group.loaded_value
+        if legacy_group is not NO_VALUE and legacy_group is not None:
+            require_loaded_pricing(legacy_group)
+        return None if legacy_group is NO_VALUE else legacy_group
 
     def get_promo_discount(self, category: str, period_days: int | None = None) -> int:
         primary_group = self.get_primary_promo_group()
@@ -3805,6 +3969,7 @@ class BroadcastHistory(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     target_type = Column(String(100), nullable=False)
+    audience = Column(JSON, nullable=True)  # Conditions used by cabinet broadcasts.
     message_text = Column(Text, nullable=True)  # Nullable for email-only broadcasts
     has_media = Column(Boolean, default=False)
     media_type = Column(String(20), nullable=True)
@@ -5332,6 +5497,45 @@ class ReachabilityTargetPref(Base):
     excluded = Column(Boolean, nullable=False, default=False, server_default=text('false'))
     note = Column(Text, nullable=True)
     updated_by_user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now(), server_default=func.now())
+
+
+class DpiCheckerAction(Base):
+    """Действие админа в DPI//CHECKER из кабинета: проверка, Зонд, Соседи или монитор.
+
+    Результаты не копируются — они у сервиса по ``remote_id``. Здесь только то, чего у сервиса нет:
+    кто запустил, что проверяли (источник в панели и имена ключей), сколько списано и вернули.
+    """
+
+    __tablename__ = 'dpichecker_actions'
+    __table_args__ = (
+        UniqueConstraint('kind', 'remote_id', name='uq_dpichecker_actions_kind_remote'),
+        Index('ix_dpichecker_actions_kind_created', 'kind', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String(16), nullable=False)  # check | probe | noisy | monitor
+    check_type = Column(String(16), nullable=True)  # vpn | ip | mtproto
+    remote_id = Column(Integer, nullable=True)
+    status = Column(String(16), nullable=False, default='submitting', server_default='submitting')
+    admin_user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    location = Column(String(16), nullable=True)
+    pop_count = Column(Integer, nullable=False, default=0, server_default='0')
+    resource_count = Column(Integer, nullable=False, default=0, server_default='0')
+    source = Column(
+        String(24), nullable=False, default='paste', server_default='paste'
+    )  # paste | panel_subscription | panel_hosts | panel_nodes | site (монитор взят с сайта)
+    source_ref = Column(String(128), nullable=True)
+    label = Column(String(255), nullable=False, default='', server_default='')
+    targets = Column(JSON, nullable=False, default=list)  # [{"value": ..., "name": ...}]
+    request = Column(JSON, nullable=False, default=dict)
+    idempotency_key = Column(String(64), nullable=False, unique=True)
+    cost_usd = Column(Numeric(12, 4), nullable=True)
+    refunded_usd = Column(Numeric(12, 4), nullable=True)
+    error_code = Column(String(64), nullable=True)
+    delivery_ids = Column(JSON, nullable=False, default=list)  # последние обработанные X-DPIChecker-Delivery
+    last_run_id = Column(Integer, nullable=True)  # монитор: последний прогон, о котором уже решено, сообщать ли
+    created_at = Column(AwareDateTime(), default=func.now(), server_default=func.now())
     updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now(), server_default=func.now())
 
 

@@ -1266,7 +1266,7 @@ async def handle_simple_subscription_payment_method(
             if discount_percent is not None:
                 try:
                     markup_percent = -int(discount_percent)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     markup_percent = None
 
             keyboard = types.InlineKeyboardMarkup(
@@ -1300,7 +1300,7 @@ async def handle_simple_subscription_payment_method(
                     if payer_amount_float > 0:
                         rub_per_currency = amount_rubles / payer_amount_float
                         message_lines.append(f'💱 Курс: 1 {payer_currency} ≈ {rub_per_currency:.2f} ₽')
-                except (TypeError, ValueError, ZeroDivisionError):
+                except TypeError, ValueError, ZeroDivisionError:
                     pass
 
             if markup_percent:
@@ -1838,7 +1838,7 @@ async def check_simple_mulenpay_payment_status(
 ):
     try:
         local_payment_id = int(callback.data.rsplit('_', 1)[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Некорректный идентификатор платежа', show_alert=True)
         return
 
@@ -1915,7 +1915,7 @@ async def check_simple_cryptobot_payment_status(
 ):
     try:
         local_payment_id = int(callback.data.rsplit('_', 1)[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Некорректный идентификатор платежа', show_alert=True)
         return
 
@@ -1985,7 +1985,7 @@ async def check_simple_heleket_payment_status(
 ):
     try:
         local_payment_id = int(callback.data.rsplit('_', 1)[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Некорректный идентификатор платежа', show_alert=True)
         return
 
@@ -2071,7 +2071,7 @@ async def check_simple_wata_payment_status(
 ):
     try:
         local_payment_id = int(callback.data.rsplit('_', 1)[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Некорректный идентификатор платежа', show_alert=True)
         return
 

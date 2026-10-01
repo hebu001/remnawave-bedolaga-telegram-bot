@@ -717,7 +717,7 @@ async def broadcast_offer(
                     test_duration_hours=extra.get('test_duration_hours') or 0,
                     server_name=extra.get('server_name', ''),
                 )
-            except (KeyError, ValueError, IndexError):
+            except KeyError, ValueError, IndexError:
                 logger.warning('Failed to render promo message placeholders')
 
         if notify_targets:

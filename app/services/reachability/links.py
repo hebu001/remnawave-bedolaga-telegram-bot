@@ -82,7 +82,7 @@ def _parse_url_like(protocol: str, raw: str) -> ParsedLink | None:
 def _b64(value: str) -> bytes | None:
     try:
         return base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
-    except (binascii.Error, ValueError):
+    except binascii.Error, ValueError:
         return None
 
 
@@ -90,13 +90,13 @@ def _parse_vmess(raw: str) -> ParsedLink | None:
     payload = _b64(raw.split('://', 1)[1].split('#', 1)[0])
     try:
         data = json.loads(payload or b'')
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except json.JSONDecodeError, UnicodeDecodeError:
         return None
     if not isinstance(data, dict) or not data.get('add'):
         return None
     try:
         port = int(data.get('port'))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     sni = data.get('sni') or data.get('host') or None
     return ParsedLink('vmess', str(data['add']), port, sni, str(data.get('ps') or ''), raw)

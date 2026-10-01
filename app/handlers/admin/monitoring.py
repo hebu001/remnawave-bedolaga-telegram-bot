@@ -1677,7 +1677,7 @@ async def process_notification_value_input(message: Message, state: FSMContext):
     raw_value = (message.text or '').strip()
     try:
         value = int(raw_value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         language = data.get('settings_language') or message.from_user.language_code or settings.DEFAULT_LANGUAGE
         texts = get_texts(language)
         await message.answer(texts.get('NOTIFICATION_VALUE_INVALID', '❌ Введите целое число.'))

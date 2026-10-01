@@ -259,7 +259,7 @@ class ReferralContestService:
 
             try:
                 await self.bot.send_message(user.telegram_id, text, disable_web_page_preview=True)
-            except (TelegramForbiddenError, TelegramNotFound):
+            except TelegramForbiddenError, TelegramNotFound:
                 logger.info(
                     'Не удалось отправить сообщение участнику (вероятно, блокировка)', telegram_id=user.telegram_id
                 )
@@ -364,7 +364,7 @@ class ReferralContestService:
                 text='\n'.join(lines),
                 disable_web_page_preview=True,
             )
-        except (TelegramForbiddenError, TelegramNotFound):
+        except TelegramForbiddenError, TelegramNotFound:
             logger.info('Не удалось отправить сводку конкурса в канал', channel_id=channel_id)
         except Exception as exc:
             logger.error('Ошибка отправки сводки конкурса в канал', channel_id=channel_id, exc=exc)

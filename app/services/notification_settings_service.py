@@ -55,7 +55,7 @@ def _clamped(value: Any, bounds: tuple[int, int], default: int) -> int:
     """Число в границах; мусор — значение по умолчанию."""
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
     return max(bounds[0], min(bounds[1], number))
 
@@ -64,7 +64,7 @@ def _bounded(value: Any, bounds: tuple[int, int]) -> int | None:
     """Число в границах для записи; мусор — None (запись отклоняется)."""
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return max(bounds[0], min(bounds[1], number))
 
@@ -76,7 +76,7 @@ def _coerce_legacy(kind: type, value: Any) -> Any | None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

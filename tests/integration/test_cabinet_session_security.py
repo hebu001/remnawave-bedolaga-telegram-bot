@@ -18,7 +18,7 @@ from sqlalchemy.exc import DBAPIError
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 
-from app.cabinet import dependencies
+from app.cabinet import dependencies, ws_manager as ws_sessions
 from app.cabinet.auth import jwt_handler, password_utils, session_security, ws_tickets
 from app.cabinet.routes import auth, support_ws, websocket as ws_routes
 from app.cabinet.schemas.auth import (
@@ -372,7 +372,7 @@ async def test_slow_websocket_is_closed_without_blocking_other_users(sessions, a
     async def stalled(_data):
         await asyncio.sleep(60)
 
-    monkeypatch.setattr(ws_routes, 'SEND_TIMEOUT_SECONDS', 0.15)
+    monkeypatch.setattr(ws_sessions, 'SEND_TIMEOUT_SECONDS', 0.15)
     manager = ws_routes.cabinet_ws_manager
     fast = SimpleNamespace(send_text=AsyncMock(), close=AsyncMock())
     slow = SimpleNamespace(send_text=AsyncMock(side_effect=stalled), close=AsyncMock())
@@ -653,7 +653,7 @@ async def test_live_socket_rejects_legacy_bearer_url_and_replayed_ticket(session
 
 
 async def test_connection_limits_are_atomic(sessions, account, monkeypatch):
-    monkeypatch.setattr(ws_routes, 'MAX_CONNECTIONS_PER_USER', 1)
+    monkeypatch.setattr(ws_sessions, 'MAX_CONNECTIONS_PER_USER', 1)
     manager = ws_routes.cabinet_ws_manager
     payload = jwt_handler.get_token_payload(account.pair.access_token)
     attempts = [ws_routes.CabinetWsSession(SimpleNamespace(), payload) for _ in range(4)]

@@ -11,9 +11,19 @@ permissions:
 
 jobs:
   pytest:
-    name: pytest (PostgreSQL 15)
+    name: pytest (PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The first application 5.0.0 release keeps the existing PostgreSQL 15.
+          # PostgreSQL 18 is also exercised before its separate data migration.
+          - postgres: '15'
+            full_suite: true
+          - postgres: '18'
+            full_suite: true
 
     steps:
       - name: Checkout code
@@ -25,14 +35,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.13'
+          python-version: '3.14'
 
       - name: Sync dependencies (locked)
         run: uv sync --frozen --group dev
 
       # The same native, runner-owned Unix-only lab as local verification.
       # Do not point migration/bridge tests at an existing TCP service database.
-      - name: Install PostgreSQL 15 binaries
+      - name: Install PostgreSQL ${{ matrix.postgres }} binaries
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg /etc/postgresql-common
           sudo curl --fail --silent --show-error --location https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
@@ -40,22 +50,23 @@ jobs:
           # Package installation must not create/start a system TCP cluster.
           echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.conf
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends postgresql-15
-          /usr/lib/postgresql/15/bin/postgres --version
+          sudo apt-get install --yes --no-install-recommends postgresql-${{ matrix.postgres }}
+          /usr/lib/postgresql/${{ matrix.postgres }}/bin/postgres --version
 
       # First isolate PostgreSQL failures, then run the complete suite.
       # Every invocation creates and stops its own fresh synthetic cluster.
       - name: Run PostgreSQL tests
-        run: uv run python tests/baseline/run.py --suite postgres --timeout-seconds 480 --pg-bin /usr/lib/postgresql/15/bin --output "$RUNNER_TEMP/pytest-postgres"
+        run: uv run python tests/baseline/run.py --suite postgres --timeout-seconds 480 --pg-bin /usr/lib/postgresql/${{ matrix.postgres }}/bin --output "$RUNNER_TEMP/pytest-postgres"
 
       - name: Run full test suite
-        run: uv run python tests/baseline/run.py --suite full --timeout-seconds 900 --pg-bin /usr/lib/postgresql/15/bin --output "$RUNNER_TEMP/pytest-full"
+        if: matrix.full_suite
+        run: uv run python tests/baseline/run.py --suite full --timeout-seconds 900 --pg-bin /usr/lib/postgresql/${{ matrix.postgres }}/bin --output "$RUNNER_TEMP/pytest-full"
 
       - name: Retain test evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-postgresql-evidence
+          name: pytest-postgresql-${{ matrix.postgres }}-evidence
           path: |
             ${{ runner.temp }}/pytest-postgres
             ${{ runner.temp }}/pytest-full

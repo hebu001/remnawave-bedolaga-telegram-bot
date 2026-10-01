@@ -1,4 +1,4 @@
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
@@ -17,18 +17,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     uv sync --frozen --no-dev
 
-FROM python:3.13-slim
+FROM python:3.14-slim-bookworm
 
-ARG VERSION="v4.15.0" # x-release-please-version
+ARG VERSION="v5.0.0" # x-release-please-version
 ARG BUILD_DATE
 ARG VCS_REF
 
 COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Keep system security updates and the fork's out-of-process PostgreSQL backup client.
+# Keep system security updates and the PostgreSQL 15 client for same-major restore.
+# Bookworm keeps builder/runtime ABI aligned while the database remains on 15.
 RUN apt-get update && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends postgresql-client \
+    && apt-get install -y --no-install-recommends postgresql-client-15 \
     && rm -rf /var/lib/apt/lists/*
 
 # The application uses .venv; unused system packaging tools are removed as upstream does.

@@ -1104,7 +1104,7 @@ async def process_virtual_participant_count(
         count = int(message.text.strip())
         if count < 1:
             raise ValueError
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer('Введите положительное целое число:')
         return
 
@@ -1396,7 +1396,7 @@ async def process_edit_virtual_participant_count(
         count = int(message.text.strip())
         if count < 1:
             raise ValueError
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer('Введите положительное целое число:')
         return
 

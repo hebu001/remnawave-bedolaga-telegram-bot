@@ -61,7 +61,7 @@ async def handle_gift_activate(callback: types.CallbackQuery) -> None:
                 claimant_user_id=user.id,
                 purchase_id=purchase_id,
             )
-        except (GiftClaimNotFoundError, GiftClaimAlreadyOwnedError):
+        except GiftClaimNotFoundError, GiftClaimAlreadyOwnedError:
             await callback.message.edit_text(
                 texts.t('GIFT_ACTIVATION_NOT_FOUND', _GIFT_NOT_FOUND),
                 parse_mode=None,

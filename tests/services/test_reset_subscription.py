@@ -21,7 +21,9 @@ from app.database.models import SubscriptionStatus
 
 def _db():
     db = AsyncMock()
-    db.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+    result = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+    result.scalars.return_value.first.return_value = None
+    db.execute.return_value = result
     return db
 
 
@@ -220,9 +222,10 @@ async def test_user_level_reset_deletes_all_three_current_subscriptions(monkeypa
     """The user reset remains one user-scoped operation, not a selected-sub reset."""
     subscriptions = [_sub(id=sub_id, remnawave_id=7000 + sub_id) for sub_id in (7, 8, 9)]
     user = SimpleNamespace(id=1, subscriptions=subscriptions, updated_at=None, remnawave_id=None)
-    db = AsyncMock()
+    db = _db()
     grace_checks: list[tuple[int, ...]] = []
     cancelled: list[int] = []
+    cashera_cancel = AsyncMock()
 
     monkeypatch.setattr(admin_users, 'get_user_by_id', AsyncMock(return_value=user))
 
@@ -237,6 +240,9 @@ async def test_user_level_reset_deletes_all_three_current_subscriptions(monkeypa
     )
     monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', cancel_recurrent)
     monkeypatch.setattr('app.services.payment.lava.cancel_lava_recurring_for_subscription_safe', cancel_recurrent)
+    monkeypatch.setattr(
+        'app.services.cashera_recurring_cancel.cancel_cashera_recurring_for_subscription_safe', cashera_cancel
+    )
 
     result = await admin_users.reset_user_subscription(
         1,
@@ -250,6 +256,7 @@ async def test_user_level_reset_deletes_all_three_current_subscriptions(monkeypa
     # Отменяются оба рекуррента (Platega и Lava) по каждой подписке — иначе живая
     # привязка спишет деньги и воскресит только что сброшенную подписку.
     assert cancelled == [7, 7, 8, 8, 9, 9]
+    assert [call.args for call in cashera_cancel.await_args_list] == [(db, 7), (db, 8), (db, 9)]
     deletes = [call.args[0] for call in db.execute.await_args_list if str(call.args[0]).startswith('DELETE')]
     assert len(deletes) == 4  # three server cleanups plus one user-scoped subscription deletion
     delete_statement = deletes[-1]
@@ -268,7 +275,7 @@ async def test_user_level_reset_deletes_all_three_current_subscriptions(monkeypa
 async def test_user_level_reset_panel_failure_preserves_all_subscription_retry_identities(monkeypatch, outcomes):
     subscriptions = [_sub(id=sub_id, remnawave_id=7000 + sub_id) for sub_id in (7, 8)]
     user = SimpleNamespace(id=1, subscriptions=subscriptions, updated_at=None, remnawave_id=9001)
-    db = AsyncMock()
+    db = _db()
     panel_calls: list[int] = []
     configured_outcomes = iter(outcomes)
 

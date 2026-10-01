@@ -270,7 +270,7 @@ def _extract_offer_active_hours(offer, template: PromoOfferTemplate | None) -> i
     if active_hours:
         try:
             return int(active_hours)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass
 
     if template and template.active_discount_hours:
@@ -295,7 +295,7 @@ def _extract_template_id_from_notification(notification_type: str | None) -> int
 
     try:
         return int(match.group('template_id'))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -756,7 +756,7 @@ async def show_promo_offers_menu(callback: CallbackQuery, db_user: User, db: Asy
 async def show_promo_offer_details(callback: CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     try:
         template_id = int(callback.data.split('_')[-1])
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Неверный идентификатор', show_alert=True)
         return
 
@@ -789,7 +789,7 @@ async def show_promo_offer_logs(callback: CallbackQuery, db_user: User, db: Asyn
             page = int(callback.data.split('_page_')[-1])
         else:
             page = 1
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         page = 1
 
     page = max(page, 1)
@@ -1207,7 +1207,7 @@ async def show_send_user_list(callback: CallbackQuery, db_user: User, db: AsyncS
             raise ValueError('invalid payload')
         template_id = int(template_id_str)
         page = int(page_str)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -1242,7 +1242,7 @@ async def show_send_user_list(callback: CallbackQuery, db_user: User, db: AsyncS
 async def prompt_send_user_search(callback: CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     try:
         template_id = int(callback.data.split('_')[-1])
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -1276,7 +1276,7 @@ async def prompt_send_user_search(callback: CallbackQuery, db_user: User, db: As
 async def reset_send_user_search(callback: CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     try:
         template_id = int(callback.data.split('_')[-1])
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -1306,7 +1306,7 @@ async def reset_send_user_search(callback: CallbackQuery, db_user: User, db: Asy
 async def back_to_user_list(callback: CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     try:
         template_id = int(callback.data.split('_')[-1])
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -1362,7 +1362,7 @@ async def process_send_user_search(
 
     try:
         template_id = int(template_id)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         await message.answer('❌ Некорректные данные поиска')
         await _safe_delete_message(message)
         return
@@ -1419,7 +1419,7 @@ async def show_selected_user_details(
         template_id_str, user_id_str = payload.split('_', 1)
         template_id = int(template_id_str)
         user_id = int(user_id_str)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -1557,7 +1557,7 @@ async def show_selected_user_details(
     percent = 0
     try:
         percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         percent = 0
     expires_at = getattr(user, 'promo_offer_discount_expires_at', None)
     if percent > 0 and (not expires_at or expires_at > now):
@@ -2129,7 +2129,7 @@ async def send_offer_to_segment(callback: CallbackQuery, db_user: User, db: Asyn
         data = callback.data[len(prefix) :]
         template_id_str, segment = data.split('_', 1)
         template_id = int(template_id_str)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -2232,7 +2232,7 @@ async def send_offer_to_user(callback: CallbackQuery, db_user: User, db: AsyncSe
         template_id_str, user_id_str = payload.split('_', 1)
         template_id = int(template_id_str)
         user_id = int(user_id_str)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -2381,7 +2381,7 @@ async def paginate_squad_selection(callback: CallbackQuery, db_user: User, db: A
         template_id_str, page_str = payload.split('_', 1)
         template_id = int(template_id_str)
         page = int(page_str)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -2407,7 +2407,7 @@ async def select_squad_for_template(callback: CallbackQuery, db_user: User, db: 
         template_id = int(template_id_str)
         server_id = int(server_id_str)
         page = int(page_str)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -2452,7 +2452,7 @@ async def clear_squad_for_template(callback: CallbackQuery, db_user: User, db: A
         template_id_str, page_str = payload.split('_', 1)
         template_id = int(template_id_str)
         page = int(page_str)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 
@@ -2480,7 +2480,7 @@ async def clear_squad_for_template(callback: CallbackQuery, db_user: User, db: A
 async def back_to_offer_from_squads(callback: CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     try:
         template_id = int(callback.data.split('_')[-1])
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 

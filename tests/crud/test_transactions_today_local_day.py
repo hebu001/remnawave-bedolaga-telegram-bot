@@ -16,12 +16,26 @@ from app.database.crud.transaction import (
     get_revenue_by_period,
     get_transactions_statistics,
 )
-from app.database.models import PaymentMethod, Transaction, TransactionType, User, WataPayment, YooKassaPayment
+from app.database.models import (
+    CasheraPayment,
+    PaymentMethod,
+    Transaction,
+    TransactionType,
+    User,
+    WataPayment,
+    YooKassaPayment,
+)
 from tests.fixtures.local_day import reset_local_timezone_cache, use_timezone  # noqa: F401
 from tests.fixtures.sqlite_memory import memory_session
 
 
-TABLES = [User.__table__, Transaction.__table__, WataPayment.__table__, YooKassaPayment.__table__]
+TABLES = [
+    User.__table__,
+    Transaction.__table__,
+    WataPayment.__table__,
+    YooKassaPayment.__table__,
+    CasheraPayment.__table__,
+]
 GATEWAY = next(method for method in REAL_PAYMENT_METHODS if method not in ('wata', 'yookassa'))
 
 

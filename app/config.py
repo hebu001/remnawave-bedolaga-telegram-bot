@@ -212,12 +212,26 @@ class Settings(BaseSettings):
     DATABASE_POOL_TIMEOUT: int = 30
 
     REDIS_URL: str = 'redis://localhost:6379/0'
+    # Размер пула соединений КАЖДОГО клиента Redis (FSM aiogram, кэш, корзины…).
+    # redis-py 8 по умолчанию даёт 100, и всплеск параллельных апдейтов его выбирал:
+    # «MaxConnectionsError: Too many connections». Держите ниже maxclients Redis.
+    REDIS_MAX_CONNECTIONS: int = 200
+    # Сколько секунд ждать свободное соединение, когда пул занят, прежде чем
+    # вернуть ошибку. Всплеск переживается ожиданием, а не падением апдейта.
+    REDIS_POOL_TIMEOUT: float = 10.0
     CART_TTL_SECONDS: int = 3600  # Время жизни корзины пользователя в Redis (1 час)
     # «Свежее намерение» пополнить ради сохранённой корзины. Тихая авто-покупка из
     # корзины после пополнения срабатывает ТОЛЬКО если в течение этого окна юзер
     # явно нажал «Корзина сохранена → выбрать оплату» (return_to_cart). Иначе
     # пополнение ради подарка / просто денег не должно молча тратиться на подписку.
     CART_AUTOPURCHASE_INTENT_TTL_SECONDS: int = 1800  # 30 минут (хватает на оплату, но не на «забытую» корзину)
+
+    # Внешний антифрод: бот не видит подключений и сам ничего не считает,
+    # только спрашивает и показывает. Не настроен — вопросов к клиенту нет.
+    ABUSE_API_ENABLED: bool = False
+    ABUSE_API_URL: str | None = None
+    ABUSE_API_KEY: str | None = None
+    ABUSE_API_TIMEOUT: int = 5
 
     REMNAWAVE_API_URL: str | None = None
     REMNAWAVE_API_KEY: str | None = None
@@ -1100,6 +1114,30 @@ class Settings(BaseSettings):
     CISPAY_SBP_ENABLED: bool = False
     CISPAY_SBP_DISPLAY_NAME: str = 'СБП (CisPay)'
 
+    # Cashera (api.cashera.cash, server-to-server; расчёты мерчанту в USDT, приём — только RUB)
+    CASHERA_ENABLED: bool = False
+    CASHERA_API_KEY: str | None = None  # X-Api-Key — публичный ключ (pk_...)
+    CASHERA_API_SECRET: str | None = None  # секрет (sk_...) — сверяется с X-Secret вебхука
+    CASHERA_BASE_URL: str = 'https://api.cashera.cash/api/v1'
+    CASHERA_DISPLAY_NAME: str = 'Cashera'
+    # Коды методов через запятую: sbp, card, mastercard, crypto, cryptobot. Набор должен
+    # совпадать с «Методами приёма» в кабинете Cashera — выключенный там метод даст 422.
+    CASHERA_ACTIVE_METHODS: str = 'sbp,card'
+    # Методы кнопками прямо на экране способов пополнения (иначе — одна кнопка и выбор внутри)
+    CASHERA_INLINE_METHODS: bool = False
+    # Свой экран оплаты (H2H): QR СБП / реквизиты прямо в боте и кабинете вместо перехода
+    # на страницу Cashera. Только для sbp, card и crypto; остальные методы — всегда ссылкой.
+    CASHERA_H2H_ENABLED: bool = False
+    # Автопродление подписки через подписки Cashera (sbp_recurring: клиент один раз
+    # подтверждает, дальше Cashera списывает сама). Метод sbp_recurring должен быть
+    # подключён к мерчанту в кабинете Cashera.
+    CASHERA_RECURRENT_ENABLED: bool = False
+    CASHERA_MIN_AMOUNT_KOPEKS: int = 10000  # 100₽ — минимум Cashera для карт
+    CASHERA_MAX_AMOUNT_KOPEKS: int = 10000000  # 100 000₽
+    CASHERA_WEBHOOK_PATH: str = '/cashera-webhook'
+    CASHERA_RETURN_URL: str | None = None
+    CASHERA_FAILED_URL: str | None = None
+
     # TabPay (tabpay.org, СБП и карты с 3-D Secure)
     TABPAY_ENABLED: bool = False
     # X-Api-Key магазина (tp_...). Показывается в кабинете один раз, перевыпуск отзывает старый.
@@ -1195,6 +1233,9 @@ class Settings(BaseSettings):
     # Bot API 10.3: кнопки живут внутри полотна rich-сообщения (<tg-button-row>),
     # а не отдельной клавиатурой под ним. Клавиатура при этом не дублируется.
     MAIN_MENU_RICH_INLINE_BUTTONS: bool = False
+    # Живое меню: фон перерисовывает последнее rich-меню пользователя, когда меняются
+    # трафик (из панели), статус, лимит устройств или баланс. Раз в 15 мин, при нагрузке реже (до 360).
+    MAIN_MENU_LIVE_ENABLED: bool = False
     # Пользовательские уведомления rich-сообщением. Действует только при
     # включённом rich-меню: иначе сервер про rich может не знать вовсе.
     USER_NOTIFICATIONS_RICH_ENABLED: bool = True
@@ -1593,6 +1634,15 @@ class Settings(BaseSettings):
     BSCHEK_REFERENCE_SUBSCRIPTION: str | None = None  # shortUuid эталонной подписки панели
     BSCHEK_JOB_COST_LIMIT_KOPEKS: int = 0  # потолок цены одной задачи, 0 — без потолка
 
+    # DPI//CHECKER (dpichecker.st): проверки VPN/IP/MTProto из сетей РФ, Китая, Ирана, Туркменистана — только кабинет
+    DPICHECKER_ENABLED: bool = False
+    DPICHECKER_API_URL: str = 'https://dpichecker.st/api/v1'
+    DPICHECKER_API_KEY: str | None = (
+        None  # X-API-Key; выпускается в боте DPI//CHECKER (Главное меню → API) или на сайте
+    )
+    DPICHECKER_REQUEST_TIMEOUT: int = 30  # обычный запрос; long-poll ожидания результата — свой, длиннее
+    DPICHECKER_REFERENCE_SUBSCRIPTION: str | None = None  # VPN «из панели»: ссылка подписки или shortUuid панели
+
     # SOCKS5 proxy for routing bot traffic to Telegram API
     # Format: socks5://user:password@host:port or socks5://host:port
     PROXY_URL: str | None = None
@@ -1713,7 +1763,7 @@ class Settings(BaseSettings):
                 return 10
             value_int = int(value)
             return max(1, value_int)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 10
 
     @field_validator('SERVER_STATUS_REQUEST_TIMEOUT', mode='before')
@@ -1724,8 +1774,28 @@ class Settings(BaseSettings):
                 return 10
             value_int = int(value)
             return max(1, value_int)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 10
+
+    @field_validator('REDIS_MAX_CONNECTIONS', mode='before')
+    @classmethod
+    def ensure_positive_redis_max_connections(cls, value: int | None) -> int:
+        try:
+            if value is None or value == '':
+                return 200
+            return max(1, int(value))
+        except TypeError, ValueError:
+            return 200
+
+    @field_validator('REDIS_POOL_TIMEOUT', mode='before')
+    @classmethod
+    def ensure_positive_redis_pool_timeout(cls, value: float | None) -> float:
+        try:
+            if value is None or value == '':
+                return 10.0
+            return max(0.1, float(value))
+        except TypeError, ValueError:
+            return 10.0
 
     @field_validator('DATABASE_POOL_SIZE', mode='before')
     @classmethod
@@ -1736,7 +1806,7 @@ class Settings(BaseSettings):
             if value is None or value == '':
                 return 20
             return max(1, int(value))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 20
 
     @field_validator('DATABASE_MAX_OVERFLOW', mode='before')
@@ -1746,7 +1816,7 @@ class Settings(BaseSettings):
             if value is None or value == '':
                 return 20
             return max(0, int(value))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 20
 
     @field_validator('DATABASE_POOL_TIMEOUT', mode='before')
@@ -1756,7 +1826,7 @@ class Settings(BaseSettings):
             if value is None or value == '':
                 return 30
             return max(1, int(value))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 30
 
     @field_validator('LOG_FILE', mode='before')
@@ -1849,7 +1919,7 @@ class Settings(BaseSettings):
 
             return []
 
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return []
 
     def get_admin_emails(self) -> list[str]:
@@ -1864,7 +1934,7 @@ class Settings(BaseSettings):
 
             return []
 
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return []
 
     def get_test_email(self) -> str | None:
@@ -2117,7 +2187,7 @@ class Settings(BaseSettings):
                 hours_str, minutes_str = segment.split(':', 1)
                 hours = int(hours_str)
                 minutes = int(minutes_str)
-            except (ValueError, AttributeError):
+            except ValueError, AttributeError:
                 continue
 
             if not (0 <= hours < 24 and 0 <= minutes < 60):
@@ -2239,7 +2309,7 @@ class Settings(BaseSettings):
                     return [3, 1]
                 return [int(x.strip()) for x in days.split(',') if x.strip()]
             return [3, 1]
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return [3, 1]
 
     def is_autopay_enabled_by_default(self) -> bool:
@@ -2351,7 +2421,7 @@ class Settings(BaseSettings):
             if not (0 <= hours <= 23 and 0 <= minutes <= 59):
                 raise ValueError
             return time(hour=hours, minute=minutes)
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             logger.warning('Некорректное значение ADMIN_REPORTS_SEND_TIME', send_time_value=value)
             return None
 
@@ -2546,7 +2616,7 @@ class Settings(BaseSettings):
                     price = int(parts[1])
                     enabled = parts[2].lower() == 'true' if len(parts) > 2 else True
                     packages.append({'gb': gb, 'price': price, 'enabled': enabled})
-                except (ValueError, IndexError):
+                except ValueError, IndexError:
                     continue
 
         return packages or self.get_traffic_packages()
@@ -2584,7 +2654,7 @@ class Settings(BaseSettings):
 
         try:
             value = int(raw_value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.warning('Некорректное значение DEVICES_SELECTION_DISABLED_AMOUNT', raw_value=raw_value)
             return None
 
@@ -2635,7 +2705,7 @@ class Settings(BaseSettings):
     def get_trial_activation_price(self) -> int:
         try:
             value = int(self.TRIAL_ACTIVATION_PRICE)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.warning(
                 'Некорректное значение TRIAL_ACTIVATION_PRICE', TRIAL_ACTIVATION_PRICE=self.TRIAL_ACTIVATION_PRICE
             )
@@ -2994,13 +3064,13 @@ class Settings(BaseSettings):
             for product_id, amount_kopeks in products.items():
                 try:
                     amount = int(amount_kopeks)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
                 product = str(product_id).strip()
                 if product and amount > 0:
                     normalized[product] = amount
             return normalized
-        except (TypeError, _json.JSONDecodeError):
+        except TypeError, _json.JSONDecodeError:
             return {}
 
     def get_apple_iap_private_key(self) -> str | None:
@@ -3244,6 +3314,81 @@ class Settings(BaseSettings):
     def get_cispay_sbp_display_name_html(self) -> str:
         return html.escape(self.get_cispay_sbp_display_name())
 
+    def is_cashera_configured(self) -> bool:
+        """Есть ли учётные данные провайдера — без учёта флага включения."""
+        return bool(self.CASHERA_API_KEY and self.CASHERA_API_SECRET)
+
+    def is_cashera_enabled(self) -> bool:
+        # Секрет обязателен наравне с ключом: вебхук подтверждается сравнением X-Secret,
+        # и с пустым секретом его подделал бы кто угодно.
+        return bool(self.CASHERA_ENABLED and self.CASHERA_API_KEY and self.CASHERA_API_SECRET)
+
+    def get_cashera_display_name(self) -> str:
+        name = (self.CASHERA_DISPLAY_NAME or '').strip()
+        return name or 'Cashera'
+
+    def get_cashera_display_name_html(self) -> str:
+        return html.escape(self.get_cashera_display_name())
+
+    def is_cashera_recurrent_enabled(self) -> bool:
+        return self.is_cashera_enabled() and self.CASHERA_RECURRENT_ENABLED
+
+    @staticmethod
+    def get_cashera_method_definitions() -> dict[str, dict[str, str]]:
+        return {
+            'sbp': {'name': 'СБП', 'title': '🏦 СБП'},
+            'card': {'name': 'Банковская карта', 'title': '💳 Банковская карта'},
+            'mastercard': {'name': 'Зарубежная карта', 'title': '🌍 Зарубежная карта'},
+            'crypto': {'name': 'Криптовалюта', 'title': '🪙 Криптовалюта'},
+            'cryptobot': {'name': 'CryptoBot', 'title': '🤖 CryptoBot'},
+        }
+
+    def get_cashera_active_methods(self) -> list[str]:
+        known = self.get_cashera_method_definitions()
+        methods: list[str] = []
+        for part in str(self.CASHERA_ACTIVE_METHODS or '').replace(';', ',').split(','):
+            code = part.strip().lower()
+            if not code:
+                continue
+            if code not in known:
+                logger.warning('Некорректный код метода Cashera', part=part)
+                continue
+            if code not in methods:
+                methods.append(code)
+        return methods or ['sbp']
+
+    def get_cashera_method_display_name(self, method_code: str) -> str:
+        info = self.get_cashera_method_definitions().get(method_code)
+        return info['name'] if info else method_code
+
+    def get_cashera_method_display_title(self, method_code: str) -> str:
+        info = self.get_cashera_method_definitions().get(method_code)
+        return info['title'] if info else f'Cashera {method_code}'
+
+    def get_cashera_return_url(self) -> str | None:
+        if self.CASHERA_RETURN_URL:
+            return self.CASHERA_RETURN_URL
+        if self.WEBHOOK_URL:
+            return f'{self.WEBHOOK_URL}/payment-success'
+        return None
+
+    def get_cashera_failed_url(self) -> str | None:
+        if self.CASHERA_FAILED_URL:
+            return self.CASHERA_FAILED_URL
+        if self.WEBHOOK_URL:
+            return f'{self.WEBHOOK_URL}/payment-failed'
+        return None
+
+    def get_cashera_callback_url(self) -> str | None:
+        """Адрес вебхука: Cashera требует HTTPS на публичном хосте, иначе 422.
+
+        Без WEBHOOK_URL не передаём ничего — тогда Cashera берёт адрес из настроек
+        мерчанта (если и там пусто, платёж не создастся: 403).
+        """
+        if not self.WEBHOOK_URL:
+            return None
+        return f'{self.WEBHOOK_URL.rstrip("/")}{self.CASHERA_WEBHOOK_PATH}'
+
     def is_tabpay_configured(self) -> bool:
         """Есть ли учётные данные провайдера — без учёта флага включения."""
         return bool(self.TABPAY_API_KEY and self.TABPAY_WEBHOOK_SECRET)
@@ -3483,7 +3628,7 @@ class Settings(BaseSettings):
     def get_payment_verification_auto_check_interval(self) -> int:
         try:
             minutes = int(self.PAYMENT_VERIFICATION_AUTO_CHECK_INTERVAL_MINUTES)
-        except (TypeError, ValueError):  # pragma: no cover - защитная проверка конфигурации
+        except TypeError, ValueError:  # pragma: no cover - защитная проверка конфигурации
             minutes = 10
 
         if minutes <= 0:
@@ -3506,7 +3651,7 @@ class Settings(BaseSettings):
             if not assets:
                 return ['USDT', 'TON']
             return [asset.strip() for asset in assets.split(',') if asset.strip()]
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return ['USDT', 'TON']
 
     def get_cryptobot_invoice_expires_seconds(self) -> int:
@@ -3515,13 +3660,13 @@ class Settings(BaseSettings):
     def get_heleket_markup_percent(self) -> float:
         try:
             return float(self.HELEKET_MARKUP_PERCENT)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0.0
 
     def get_heleket_lifetime(self) -> int:
         try:
             value = int(self.HELEKET_INVOICE_LIFETIME)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             value = 3600
         return max(300, min(43200, value))
 
@@ -3590,7 +3735,7 @@ class Settings(BaseSettings):
     def get_maintenance_retry_attempts(self) -> int:
         try:
             attempts = int(self.MAINTENANCE_RETRY_ATTEMPTS)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             attempts = 1
         return max(1, attempts)
 
@@ -3657,7 +3802,7 @@ class Settings(BaseSettings):
                     period_str = period_str.strip()
                     if period_str:
                         allowed_periods.add(int(period_str))
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             allowed_periods = {14, 30, 60, 90, 180, 360}
 
         # Возвращаем только разрешённые периоды (без фильтрации по цене,
@@ -3683,7 +3828,7 @@ class Settings(BaseSettings):
                     period_str = period_str.strip()
                     if period_str:
                         allowed_periods.add(int(period_str))
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             allowed_periods = {30, 60, 90, 180, 360}
 
         # Возвращаем только разрешённые периоды (без фильтрации по цене)
@@ -3707,7 +3852,7 @@ class Settings(BaseSettings):
                 if period_str:
                     periods.append(int(period_str))
             return sorted(periods) if periods else [14, 30, 60, 90, 180, 360]
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return [14, 30, 60, 90, 180, 360]
 
     def get_configured_renewal_periods(self) -> list[int]:
@@ -3726,7 +3871,7 @@ class Settings(BaseSettings):
                 if period_str:
                     periods.append(int(period_str))
             return sorted(periods) if periods else [30, 60, 90, 180, 360]
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return [30, 60, 90, 180, 360]
 
     def get_balance_payment_description(
@@ -3775,7 +3920,7 @@ class Settings(BaseSettings):
 
         try:
             return int(self.ADMIN_NOTIFICATIONS_CHAT_ID)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
 
     def is_admin_notifications_enabled(self) -> bool:
@@ -3787,7 +3932,7 @@ class Settings(BaseSettings):
 
         try:
             return int(self.BACKUP_SEND_CHAT_ID)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
 
     def is_backup_send_enabled(self) -> bool:
@@ -3814,7 +3959,7 @@ class Settings(BaseSettings):
 
         try:
             return int(chat_id)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
 
     def get_log_rotation_topic_id(self) -> int | None:
@@ -4213,28 +4358,28 @@ class Settings(BaseSettings):
     def get_webhook_queue_maxsize(self) -> int:
         try:
             size = int(self.WEBHOOK_MAX_QUEUE_SIZE)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             size = 1024
         return max(1, size)
 
     def get_webhook_worker_count(self) -> int:
         try:
             workers = int(self.WEBHOOK_WORKERS)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             workers = 1
         return max(1, workers)
 
     def get_webhook_enqueue_timeout(self) -> float:
         try:
             timeout = float(self.WEBHOOK_ENQUEUE_TIMEOUT)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             timeout = 0.0
         return max(0.0, timeout)
 
     def get_webhook_shutdown_timeout(self) -> float:
         try:
             timeout = float(self.WEBHOOK_WORKER_SHUTDOWN_TIMEOUT)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             timeout = 30.0
         return max(1.0, timeout)
 
@@ -4405,6 +4550,18 @@ class Settings(BaseSettings):
 
     def is_bschek_configured(self) -> bool:
         return bool(self.BSCHEK_API_KEY)
+
+    def is_dpichecker_enabled(self) -> bool:
+        return bool(self.DPICHECKER_ENABLED)
+
+    def is_dpichecker_configured(self) -> bool:
+        return bool(self.DPICHECKER_API_KEY)
+
+    def get_dpichecker_webhook_url(self) -> str | None:
+        """Куда DPI//CHECKER шлёт события; без внешнего адреса бота — никуда."""
+        if not self.WEBHOOK_URL:
+            return None
+        return f'{self.WEBHOOK_URL.rstrip("/")}/dpichecker/webhook'
 
     def get_bschek_api_url(self) -> str:
         return (self.BSCHEK_API_URL or 'https://bsbord.com/v1').rstrip('/')

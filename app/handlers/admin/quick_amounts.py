@@ -196,7 +196,7 @@ async def process_quick_amounts(message: Message, state: FSMContext, **kwargs) -
             amounts_kopeks.append(kopeks)
         if not amounts_kopeks or len(amounts_kopeks) > MAX_QUICK_AMOUNTS:
             raise ValueError(message.text)
-    except (ValueError, OverflowError):
+    except ValueError, OverflowError:
         await message.answer(
             f'❌ Неверный формат. Отправьте до {MAX_QUICK_AMOUNTS} положительных сумм в рублях через запятую '
             f'(не более {MAX_QUICK_AMOUNT_KOPEKS // 100} ₽ каждая), '

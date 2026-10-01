@@ -57,7 +57,7 @@ def _mask_email(value: str | None) -> str:
 # email в OAuth-ответе, но провайдер не выдаёт cryptographic proof of ownership.
 # Email используется для UX (recovery, linking, panel sync), но не доверяется
 # для match с ADMIN_EMAILS.
-TRUSTED_EMAIL_VERIFICATION_SOURCES: 'frozenset[str]' = frozenset(
+TRUSTED_EMAIL_VERIFICATION_SOURCES: frozenset[str] = frozenset(
     {'cabinet', 'oauth_google', 'oauth_discord', 'admin_override'}
 )
 
@@ -103,7 +103,7 @@ def is_user_admin_by_env(user: User) -> AdminEnvCheck:
 
     try:
         telegram_id_int = int(user.telegram_id) if user.telegram_id is not None else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         telegram_id_int = None
     is_telegram_admin = telegram_id_int is not None and telegram_id_int > 0 and telegram_id_int in admin_ids
 
@@ -188,6 +188,7 @@ _PRESET_ROLES: list[dict] = [
             'channels:*',
             'ban_system:*',
             'reachability:*',
+            'dpichecker:*',
             'wheel:*',
             'apps:*',
             'email_templates:*',

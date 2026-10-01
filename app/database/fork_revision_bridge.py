@@ -55,6 +55,8 @@ def snapshot_schema(connection, schema='public'):
     schema references remain visible; only our selected schema is normalized.
     Constraint/index semantics, defaults, validity, RLS, routines and triggers
     are all part of the fingerprint. alembic_version contents are read separately.
+    PostgreSQL 18's ordinary NOT NULL catalog rows are represented by the
+    existing column not_null field, after verifying they add no other semantics.
     """
     _schema(connection, schema)
     relation = """c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname=:schema)
@@ -85,6 +87,9 @@ def snapshot_schema(connection, schema='public'):
     """,
         schema,
     )
+    # PG18 records NOT NULL in both catalogs. Remove only a proven ordinary
+    # mirror; IS TRUE keeps missing/unknown metadata visible. JSON field access
+    # lets this same query run on PG15, which lacks conenforced/conperiod.
     result['constraints'] = _rows(
         connection,
         f"""
@@ -94,7 +99,22 @@ def snapshot_schema(connection, schema='public'):
                CASE WHEN co.confrelid=0 THEN NULL ELSE rn.nspname END AS referenced_schema
         FROM pg_class c JOIN pg_constraint co ON co.conrelid=c.oid
         LEFT JOIN pg_class rc ON rc.oid=co.confrelid LEFT JOIN pg_namespace rn ON rn.oid=rc.relnamespace
-        WHERE {relation} ORDER BY c.relname,co.contype,pg_get_constraintdef(co.oid,true)
+        LEFT JOIN pg_attribute a ON co.contype='n' AND a.attrelid=c.oid AND a.attnum=co.conkey[1]
+        WHERE {relation} AND NOT ((
+          co.contype='n' AND c.relkind IN ('r','p') AND co.connamespace=c.relnamespace
+          AND a.attnum>0 AND NOT a.attisdropped AND a.attnotnull AND co.conkey=ARRAY[a.attnum]
+          AND co.convalidated AND NOT co.condeferrable AND NOT co.condeferred
+          AND to_jsonb(co)->>'conenforced'='true' AND to_jsonb(co)->>'conperiod'='false'
+          AND co.conislocal AND co.coninhcount=0 AND NOT co.connoinherit AND co.conparentid=0
+          AND co.contypid=0 AND co.conindid=0 AND co.confrelid=0 AND co.conbin IS NULL
+          AND co.confupdtype=' ' AND co.confdeltype=' ' AND co.confmatchtype=' '
+          AND co.confkey IS NULL AND co.conpfeqop IS NULL AND co.conppeqop IS NULL
+          AND co.conffeqop IS NULL AND co.confdelsetcols IS NULL AND co.conexclop IS NULL
+          AND pg_get_constraintdef(co.oid,true)='NOT NULL ' || quote_ident(a.attname)
+          AND NOT EXISTS (SELECT 1 FROM pg_constraint other WHERE other.oid<>co.oid
+            AND other.conrelid=co.conrelid AND other.contype='n' AND other.conkey=co.conkey)
+        ) IS TRUE)
+        ORDER BY c.relname,co.contype,pg_get_constraintdef(co.oid,true)
     """,
         schema,
     )

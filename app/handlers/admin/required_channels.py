@@ -87,7 +87,7 @@ async def show_channels_list(callback: CallbackQuery, **kwargs) -> None:
 async def view_channel(callback: CallbackQuery, **kwargs) -> None:
     try:
         channel_db_id = int(callback.data.split(':')[2])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('Неверный ID канала', show_alert=True)
         return
     async with AsyncSessionLocal() as db:
@@ -118,7 +118,7 @@ async def view_channel(callback: CallbackQuery, **kwargs) -> None:
 async def toggle_channel_handler(callback: CallbackQuery, **kwargs) -> None:
     try:
         channel_db_id = int(callback.data.split(':')[2])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('Неверный ID канала', show_alert=True)
         return
     async with AsyncSessionLocal() as db:
@@ -143,7 +143,7 @@ async def toggle_channel_handler(callback: CallbackQuery, **kwargs) -> None:
 async def delete_channel_handler(callback: CallbackQuery, **kwargs) -> None:
     try:
         channel_db_id = int(callback.data.split(':')[2])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('Неверный ID канала', show_alert=True)
         return
     async with AsyncSessionLocal() as db:

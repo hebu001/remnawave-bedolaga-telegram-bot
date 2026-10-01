@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy.exc import MissingGreenlet
+from sqlalchemy.exc import MissingGreenlet, StatementError
 
 import app.cabinet.routes.admin_bulk_actions as bulk
 
@@ -145,7 +145,9 @@ async def test_delete_subscription_survives_unloaded_collection():
     user = _LazyUser()
     sub = _expired_trial_sub(user)
     db = MagicMock()
-    db.execute = AsyncMock()
+    query_result = MagicMock()
+    query_result.scalars.return_value.first.return_value = None
+    db.execute = AsyncMock(return_value=query_result)
     db.commit = AsyncMock()
     params = SimpleNamespace(force_delete_active_paid=False)
 
@@ -153,9 +155,29 @@ async def test_delete_subscription_survives_unloaded_collection():
         patch('app.services.grace_access_runtime.ensure_no_open_grace_for_subscriptions', AsyncMock()),
         patch('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', AsyncMock()),
         patch('app.services.payment.lava.cancel_lava_recurring_for_subscription_safe', AsyncMock()),
+        patch(
+            'app.services.cashera_recurring_cancel.cancel_cashera_recurring_for_subscription_safe', AsyncMock()
+        ) as cashera,
     ):
         result = await bulk._do_delete_subscription(db, user, params, dry_run=False, sub_override=sub)
 
     assert result.success is True
     assert 'Пробный' in result.message
     db.commit.assert_awaited()
+    cashera.assert_awaited_once_with(db, sub.id)
+
+
+class _LazyUserSqlalchemy21(_LazyUser):
+    """То же на SQLAlchemy 2.1: MissingGreenlet приходит завёрнутой в StatementError."""
+
+    @property
+    def subscriptions(self):
+        orig = MissingGreenlet('greenlet_spawn has not been called')
+        raise StatementError(str(orig), 'SELECT subscriptions', {}, orig)
+
+
+def test_known_subscriptions_falls_back_when_sqlalchemy_21_wraps_missing_greenlet() -> None:
+    user = _LazyUserSqlalchemy21()
+    target = _expired_trial_sub(user)
+
+    assert bulk._known_subscriptions(user, target) == [target]

@@ -211,7 +211,7 @@ async def _prepare_auto_purchase(
 def _safe_int(value: object | None, default: int = 0) -> int:
     try:
         return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 

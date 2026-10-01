@@ -213,7 +213,7 @@ async def list_user_messages(callback: types.CallbackQuery, db_user: User, db: A
     if ':' in callback.data:
         try:
             page = int(callback.data.split(':')[1])
-        except (ValueError, IndexError):
+        except ValueError, IndexError:
             page = 0
 
     await _render_user_messages_list(callback.message, db, db_user.language, page)
@@ -225,7 +225,7 @@ async def list_user_messages(callback: types.CallbackQuery, db_user: User, db: A
 async def view_user_message(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     try:
         message_id = int(callback.data.split(':')[1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Неверный ID сообщения', show_alert=True)
         return
 
@@ -261,7 +261,7 @@ async def view_user_message(callback: types.CallbackQuery, db_user: User, db: As
 async def toggle_message_status(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     try:
         message_id = int(callback.data.split(':')[1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Неверный ID сообщения', show_alert=True)
         return
 
@@ -283,7 +283,7 @@ async def delete_message_confirm(callback: types.CallbackQuery, db_user: User, d
     """Подтвердить удаление сообщения"""
     try:
         message_id = int(callback.data.split(':')[1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Неверный ID сообщения', show_alert=True)
         return
 
@@ -327,7 +327,7 @@ async def show_messages_stats(callback: types.CallbackQuery, db_user: User, db: 
 async def edit_user_message_start(callback: types.CallbackQuery, state: FSMContext, db_user: User, db: AsyncSession):
     try:
         message_id = int(callback.data.split(':')[1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Неверный ID сообщения', show_alert=True)
         return
 

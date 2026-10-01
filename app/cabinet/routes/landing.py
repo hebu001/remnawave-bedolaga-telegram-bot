@@ -190,7 +190,7 @@ class PurchaseRequest(BaseModel):
     campaign_slug: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode='after')
-    def validate_contacts(self) -> 'PurchaseRequest':
+    def validate_contacts(self) -> PurchaseRequest:
         _validate_contact(self.contact_type, self.contact_value)
         if self.is_gift:
             if not self.gift_recipient_type or not self.gift_recipient_value:
@@ -237,7 +237,7 @@ class GiftClaimRequest(BaseModel):
     email: str = Field(min_length=3, max_length=255)
 
     @model_validator(mode='after')
-    def validate_email(self) -> 'GiftClaimRequest':
+    def validate_email(self) -> GiftClaimRequest:
         _validate_contact('email', self.email)
         return self
 

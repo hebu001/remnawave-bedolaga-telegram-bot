@@ -72,7 +72,7 @@ async def resolve_subscription_from_context(
             sub = await get_subscription_by_id_for_user(db, sub_id, db_user.id)
             if sub:
                 return sub, sub_id
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             pass
 
     # 2. Try FSM state

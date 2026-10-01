@@ -4,7 +4,10 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
+from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import lazyload, selectinload
+from sqlalchemy.orm.attributes import NO_VALUE
 
 from app.config import settings
 
@@ -18,6 +21,85 @@ logger = structlog.get_logger(__name__)
 
 def calculate_months_from_days(days: int) -> int:
     return max(1, round(days / 30))
+
+
+async def ensure_user_promo_groups_loaded(db: AsyncSession, user: User | None) -> None:
+    """Load missing pricing relationships explicitly, preserving pending state.
+
+    Ordinary user CRUD already loads these. Quotes may also receive a persisted
+    user from a plain SELECT; synchronous promo getters must not perform I/O.
+    Transient users and DTOs keep their supplied in-memory pricing data.
+    """
+    from app.database.models import PromoGroup, User, UserPromoGroup
+
+    if not isinstance(user, User):
+        return
+    state = inspect(user, raiseerr=False)
+    if state is None or not state.persistent:
+        return
+    if state.session is not db.sync_session:
+        raise ValueError('Pricing user must belong to the supplied database session')
+    user_id = state.identity[0]
+    with db.no_autoflush:
+        if (
+            state.attrs.promo_group.loaded_value is NO_VALUE
+            or state.attrs.user_promo_groups.loaded_value is NO_VALUE
+            or any(
+                state.attrs[name].loaded_value is NO_VALUE
+                for name in ('id', 'promo_group_id', 'promo_offer_discount_percent', 'promo_offer_discount_expires_at')
+            )
+        ):
+            # No populate_existing: preserve pending promo-offer and balance changes.
+            await db.execute(
+                select(User)
+                .where(User.id == user_id)
+                .options(
+                    selectinload(User.promo_group).lazyload(PromoGroup.server_squads),
+                    selectinload(User.user_promo_groups)
+                    .selectinload(UserPromoGroup.promo_group)
+                    .lazyload(PromoGroup.server_squads),
+                )
+            )
+
+        links = state.attrs.user_promo_groups.loaded_value
+        if links is not NO_VALUE and any(
+            inspect(link).attrs.promo_group.loaded_value is NO_VALUE
+            or (
+                inspect(link).identity is not None
+                and any(
+                    inspect(link).attrs[column.key].loaded_value is NO_VALUE
+                    for column in inspect(link).mapper.column_attrs
+                )
+            )
+            for link in links
+        ):
+            # A previously loaded collection can still have unloaded nested groups.
+            await db.execute(
+                select(UserPromoGroup)
+                .where(UserPromoGroup.user_id == user_id)
+                .options(selectinload(UserPromoGroup.promo_group).lazyload(PromoGroup.server_squads))
+            )
+
+        # Loaded relationships can still contain expired/deferred scalar fields.
+        # Ordinary SELECT fills missing fields while retaining dirty scalar edits.
+        groups = [inspect(link).attrs.promo_group.loaded_value for link in links] if links is not NO_VALUE else []
+        groups.append(state.attrs.promo_group.loaded_value)
+        missing_group_ids = {
+            group_state.identity[0]
+            for group in groups
+            if group is not NO_VALUE and group is not None
+            for group_state in (inspect(group),)
+            if group_state.identity is not None
+            and any(
+                group_state.attrs[column.key].loaded_value is NO_VALUE for column in group_state.mapper.column_attrs
+            )
+        }
+        if missing_group_ids:
+            await db.execute(
+                select(PromoGroup)
+                .where(PromoGroup.id.in_(missing_group_ids))
+                .options(lazyload(PromoGroup.server_squads))
+            )
 
 
 def calculate_price_per_month(price_kopeks: int, period_days: int) -> int:
@@ -73,8 +155,8 @@ def apply_percentage_discount(amount: int, percent: int) -> tuple[int, int]:
 
 
 def resolve_discount_percent(
-    user: Optional['User'],
-    promo_group: Optional['PromoGroup'],
+    user: Optional[User],
+    promo_group: Optional[PromoGroup],
     category: str,
     *,
     period_days: int | None = None,
@@ -97,7 +179,7 @@ async def compute_simple_subscription_price(
     db: AsyncSession,
     params: dict[str, Any],
     *,
-    user: Optional['User'] = None,
+    user: Optional[User] = None,
     resolved_squad_uuids: Sequence[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Вычисляет стоимость простой подписки с учетом всех доплат и скидок.
@@ -108,12 +190,13 @@ async def compute_simple_subscription_price(
     """
     from app.services.pricing_engine import PricingEngine
 
+    await ensure_user_promo_groups_loaded(db, user)
     period_days = int(params.get('period_days', 30) or 30)
 
     traffic_limit_raw = params.get('traffic_limit_gb')
     try:
         traffic_limit_gb = int(traffic_limit_raw) if traffic_limit_raw is not None else 0
-    except (TypeError, ValueError):  # pragma: no cover - defensive conversion
+    except TypeError, ValueError:  # pragma: no cover - defensive conversion
         traffic_limit_gb = 0
     # Treat None / non-positive as unlimited (0 GB → price = 0 in PricingEngine)
     traffic_limit_gb = max(traffic_limit_gb, 0)
@@ -121,7 +204,7 @@ async def compute_simple_subscription_price(
     device_limit_raw = params.get('device_limit', settings.DEFAULT_DEVICE_LIMIT)
     try:
         device_limit = int(device_limit_raw)
-    except (TypeError, ValueError):  # pragma: no cover - defensive conversion
+    except TypeError, ValueError:  # pragma: no cover - defensive conversion
         device_limit = settings.DEFAULT_DEVICE_LIMIT
 
     # --- Resolve squad UUIDs from explicit arg or params ---
@@ -169,9 +252,9 @@ async def compute_simple_subscription_price(
 
 
 def _build_simple_subscription_breakdown(
-    pricing: 'RenewalPricing',
+    pricing: RenewalPricing,
     resolved_uuids: list[str],
-    promo_group: Optional['PromoGroup'],
+    promo_group: Optional[PromoGroup],
 ) -> dict[str, Any]:
     """Convert PricingEngine's RenewalPricing to the legacy breakdown dict.
 

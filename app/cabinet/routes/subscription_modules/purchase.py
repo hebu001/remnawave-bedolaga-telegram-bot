@@ -432,6 +432,7 @@ async def get_purchase_options(
                 # Автопродление Lava: фронт показывает переключатель на странице
                 # подписки, если фича включена.
                 'lava_recurrent_enabled': settings.is_lava_recurrent_enabled(),
+                'cashera_recurrent_enabled': settings.is_cashera_recurrent_enabled(),
             }
 
         # Classic mode - return periods
@@ -443,6 +444,7 @@ async def get_purchase_options(
         # отключённой фиче из ответа 403 — по красной строке в консоли на запрос.
         payload['platega_recurrent_enabled'] = settings.is_platega_recurrent_enabled()
         payload['lava_recurrent_enabled'] = settings.is_lava_recurrent_enabled()
+        payload['cashera_recurrent_enabled'] = settings.is_cashera_recurrent_enabled()
         return payload
 
     except PurchaseValidationError as e:
@@ -1152,20 +1154,34 @@ async def purchase_tariff(
             await db.commit()
             await db.refresh(subscription)
 
+        # Panel sync may roll back its session after the purchase was committed,
+        # expiring ORM attributes. Keep the cart's persisted subscription identity
+        # before these best-effort steps so cart creation never implicitly reloads it.
+        cart_subscription_id = subscription.id
+        # If identity resolution itself fails, a known panel link can only be
+        # retried as an update. The authoritative resolver overrides this fallback.
+        _should_create = not (subscription.remnawave_id or getattr(user, 'remnawave_id', None))
+        trial_panel_targets = [
+            (
+                trial_sub,
+                trial_sub.id,
+                trial_sub.remnawave_id
+                or (getattr(user, 'remnawave_id', None) if not settings.is_multi_tariff_enabled() else None),
+            )
+            for trial_sub in killed_trials
+        ]
+
         # --- Disable killed trials on RemnaWave panel ---
         service = SubscriptionService()
-        for trial_sub in killed_trials:
-            if trial_sub.id == (subscription.id if subscription else None):
+        for trial_sub, trial_id, trial_panel_user_id in trial_panel_targets:
+            if trial_id == cart_subscription_id:
                 continue  # This trial became the paid subscription, don't disable
             try:
-                _trial_panel_user_id = trial_sub.remnawave_id or (
-                    getattr(user, 'remnawave_id', None) if not settings.is_multi_tariff_enabled() else None
-                )
-                if _trial_panel_user_id:
-                    await service.disable_remnawave_user(_trial_panel_user_id)
+                if trial_panel_user_id:
+                    await service.disable_remnawave_user(trial_panel_user_id)
                 await decrement_subscription_server_counts(db, trial_sub)
             except Exception as trial_err:
-                logger.warning('Failed to disable trial on RemnaWave', error=trial_err, trial_id=trial_sub.id)
+                logger.warning('Failed to disable trial on RemnaWave', error=trial_err, trial_id=trial_id)
         try:
             # Mirror the bot handler logic: in single-tariff mode, check user.remnawave_id
             # (webhook clears it on panel deletion), not subscription.remnawave_id
@@ -1197,8 +1213,8 @@ async def purchase_tariff(
             from app.services.remnawave_retry_queue import remnawave_retry_queue
 
             remnawave_retry_queue.enqueue(
-                subscription_id=subscription.id,
-                user_id=user.id,
+                subscription_id=cart_subscription_id,
+                user_id=refund_user_id,
                 action='create' if _should_create else 'update',
             )
 
@@ -1207,14 +1223,14 @@ async def purchase_tariff(
             try:
                 cart_data = {
                     'cart_mode': 'extend',
-                    'subscription_id': subscription.id,
+                    'subscription_id': cart_subscription_id,
                     'period_days': period_days,
                     'total_price': price_kopeks,
-                    'tariff_id': tariff.id,
-                    'description': f'Продление тарифа {tariff.name} на {period_days} дней',
+                    'tariff_id': refund_tariff_id,
+                    'description': f'Продление тарифа {refund_tariff_name} на {period_days} дней',
                 }
-                await user_cart_service.save_user_cart(user.id, cart_data)
-                logger.info('Tariff cart saved for auto-renewal (cabinet) user', user_id=user.id)
+                await user_cart_service.save_user_cart(refund_user_id, cart_data)
+                logger.info('Tariff cart saved for auto-renewal (cabinet) user', user_id=refund_user_id)
             except Exception as e:
                 logger.error('Error saving tariff cart (cabinet)', error=e)
 

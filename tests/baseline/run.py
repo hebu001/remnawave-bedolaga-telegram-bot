@@ -105,8 +105,8 @@ def main():
         parser.error('--timeout-seconds must be positive')
     if (ROOT / '.env').exists():
         parser.error('Use a checkout without .env: the baseline must not load server credentials')
-    if sys.version_info[:2] != (3, 13):
-        parser.error('Use Python 3.13 from the project virtual environment')
+    if sys.version_info[:2] != (3, 14):
+        parser.error('Use Python 3.14 from the project virtual environment')
     pg_bin = args.pg_bin.resolve()
     for executable in ('initdb', 'pg_ctl', 'postgres'):
         if not (pg_bin / executable).is_file():
@@ -207,7 +207,7 @@ def main():
         'data_dir': str(data_dir),
         'socket_dir': str(socket_dir),
         'test_postgres_url': url,
-        'stop_argv': [str(pg_bin / 'pg_ctl'), '-D', str(data_dir), '-m', 'fast', '-w', 'stop'],
+        'stop_argv': [str(pg_bin / 'pg_ctl'), '-D', str(data_dir), '-m', 'fast', '-w', '-t', '300', 'stop'],
     }
     (output / 'postgres.json').write_text(json.dumps(control, indent=2) + '\n')
     started = False

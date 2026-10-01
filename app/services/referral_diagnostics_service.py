@@ -71,7 +71,7 @@ class LostReferral:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'LostReferral':
+    def from_dict(cls, data: dict) -> LostReferral:
         """Десериализация из dict."""
         click_time = data.get('click_time')
         if click_time and isinstance(click_time, str):
@@ -123,7 +123,7 @@ class DiagnosticReport:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'DiagnosticReport':
+    def from_dict(cls, data: dict) -> DiagnosticReport:
         """Десериализация из dict."""
         start = data.get('analysis_period_start')
         end = data.get('analysis_period_end')
@@ -229,7 +229,7 @@ class MissingBonus:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'MissingBonus':
+    def from_dict(cls, data: dict) -> MissingBonus:
         """Десериализация из dict."""
         topup_date = data.get('first_topup_date')
         if topup_date and isinstance(topup_date, str):
@@ -280,7 +280,7 @@ class MissingBonusReport:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'MissingBonusReport':
+    def from_dict(cls, data: dict) -> MissingBonusReport:
         """Десериализация из dict."""
         missing_bonuses = [MissingBonus.from_dict(mb) for mb in data.get('missing_bonuses', [])]
         return cls(

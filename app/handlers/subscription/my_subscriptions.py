@@ -503,6 +503,6 @@ def _extract_sub_id(callback: types.CallbackQuery) -> int | None:
     if len(parts) >= 2:
         try:
             return int(parts[1])
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
     return None

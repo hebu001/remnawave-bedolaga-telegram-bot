@@ -97,7 +97,7 @@ def _extract_amount_kopecks(payload: dict[str, Any]) -> int | None:
         return None
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

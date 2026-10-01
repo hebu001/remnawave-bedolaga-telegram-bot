@@ -146,7 +146,7 @@ async def show_promocodes_list_page(callback: types.CallbackQuery, db_user: User
     """Обработчик пагинации списка промокодов."""
     try:
         page = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         page = 1
     await show_promocodes_list(callback, db_user, db, page=page)
 
@@ -240,7 +240,7 @@ async def show_promocode_management(callback: types.CallbackQuery, db_user: User
 async def show_promocode_edit_menu(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     try:
         promo_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промокода', show_alert=True)
         return
 
@@ -308,7 +308,7 @@ async def show_promocode_edit_menu(callback: types.CallbackQuery, db_user: User,
 async def start_edit_promocode_date(callback: types.CallbackQuery, db_user: User, state: FSMContext):
     try:
         promo_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промокода', show_alert=True)
         return
 
@@ -340,7 +340,7 @@ ID промокода: {promo_id}
 async def start_edit_promocode_amount(callback: types.CallbackQuery, db_user: User, state: FSMContext):
     try:
         promo_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промокода', show_alert=True)
         return
 
@@ -370,7 +370,7 @@ async def start_edit_promocode_days(callback: types.CallbackQuery, db_user: User
     # ИСПРАВЛЕНИЕ: берем последний элемент как ID
     try:
         promo_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промокода', show_alert=True)
         return
 
@@ -399,7 +399,7 @@ ID промокода: {promo_id}
 async def start_edit_promocode_uses(callback: types.CallbackQuery, db_user: User, state: FSMContext):
     try:
         promo_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промокода', show_alert=True)
         return
 
@@ -546,7 +546,7 @@ async def process_promo_group_selection(
     """Handle promo group selection for promocode"""
     try:
         promo_group_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промогруппы', show_alert=True)
         return
 
@@ -1039,7 +1039,7 @@ async def toggle_promocode_first_purchase(callback: types.CallbackQuery, db_user
 async def confirm_delete_promocode(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     try:
         promo_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промокода', show_alert=True)
         return
 
@@ -1080,7 +1080,7 @@ ID: {promo_id}
 async def delete_promocode_confirmed(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     try:
         promo_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Ошибка получения ID промокода', show_alert=True)
         return
 

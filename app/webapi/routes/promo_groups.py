@@ -36,7 +36,7 @@ def _normalize_period_discounts(group: PromoGroup) -> dict[int, int]:
         for key, value in raw.items():
             try:
                 normalized[int(key)] = int(value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
     return normalized
 

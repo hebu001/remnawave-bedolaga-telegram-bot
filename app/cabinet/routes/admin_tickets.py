@@ -98,7 +98,7 @@ class AdminReplyRequest(BaseModel):
     media_items: list[TicketMediaItem] | None = Field(None, description='Multi-media gallery attachments')
 
     @model_validator(mode='after')
-    def validate_media_fields(self) -> 'AdminReplyRequest':
+    def validate_media_fields(self) -> AdminReplyRequest:
         _validate_media_bundle(self.media_type, self.media_file_id, self.media_items)
         has_text = bool(self.message.strip())
         has_media = bool(self.media_file_id) or bool(self.media_items)

@@ -55,7 +55,7 @@ def amount_to_kopeks(value: Any) -> int | None:
         return None
     try:
         rubles = Decimal(str(value).strip())
-    except (InvalidOperation, ValueError, TypeError):
+    except InvalidOperation, ValueError, TypeError:
         return None
 
     kopeks = rubles * _KOPEKS_IN_RUBLE
@@ -267,7 +267,7 @@ class ParityPayService:
 
         try:
             return await self.create_invoice(order_id=order_id, **kwargs)
-        except (ParityPayAPIError, ParityPayNetworkError):
+        except ParityPayAPIError, ParityPayNetworkError:
             recovered = await self.get_invoice(order_id=order_id)
             if recovered:
                 logger.info('ParityPay: счёт найден после неудачного повтора', order_id=order_id)

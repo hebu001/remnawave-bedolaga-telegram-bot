@@ -250,7 +250,7 @@ async def handle_promo_subscription_select(
     try:
         sub_id = int(parts[1])
         code = ':'.join(parts[2:])  # code may contain colons
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('Ошибка', show_alert=True)
         return
 

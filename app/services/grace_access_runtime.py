@@ -2235,7 +2235,7 @@ def _panel_user_matches_device_limit(panel_user: Any, target: _PanelTarget) -> b
     raw_limit = getattr(panel_user, 'hwid_device_limit', None)
     try:
         return raw_limit is not None and int(raw_limit) == target.device_limit
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
 
 

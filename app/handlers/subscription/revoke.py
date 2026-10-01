@@ -294,7 +294,7 @@ async def start_multi_revoke(
 
     try:
         sub_id = int(parts[1])
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await callback.answer('Неверный формат', show_alert=True)
         return
 

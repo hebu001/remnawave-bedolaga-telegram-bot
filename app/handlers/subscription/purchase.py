@@ -123,6 +123,8 @@ from app.utils.timezone import format_local_datetime
 
 from .autopay import (
     handle_autopay_menu,
+    handle_cashera_recurring_cancel,
+    handle_cashera_recurring_enable,
     handle_sbp_recurring_cancel,
     handle_sbp_recurring_enable,
     handle_sbp_recurring_menu,
@@ -1475,7 +1477,7 @@ async def return_to_saved_cart(callback: types.CallbackQuery, state: FSMContext,
             raw = cart_data.get('subscription_id')
             if raw is not None:
                 corrupted_sub_id = int(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass
 
         if corrupted_sub_id is not None:
@@ -1485,7 +1487,7 @@ async def return_to_saved_cart(callback: types.CallbackQuery, state: FSMContext,
                 try:
                     if int(global_cart['subscription_id']) == corrupted_sub_id:
                         await user_cart_service.delete_global_cart_only(db_user.id)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     pass
         else:
             # Cart corrupted beyond reading subscription_id -- global cleanup
@@ -2140,7 +2142,7 @@ async def select_devices(callback: types.CallbackQuery, state: FSMContext, db_us
 
     try:
         devices = int(callback.data.split('_')[1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer(texts.t('DEVICES_INVALID_COUNT', '❌ Некорректное количество устройств'), show_alert=True)
         return
 
@@ -4264,6 +4266,10 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(handle_sbp_recurring_enable, F.data == 'sbp_recurring_enable')
 
     dp.callback_query.register(handle_sbp_recurring_cancel, F.data == 'sbp_recurring_cancel')
+
+    dp.callback_query.register(handle_cashera_recurring_enable, F.data == 'cashera_recurring_enable')
+
+    dp.callback_query.register(handle_cashera_recurring_cancel, F.data == 'cashera_recurring_cancel')
 
     dp.callback_query.register(handle_subscription_config_back, F.data == 'subscription_config_back')
 

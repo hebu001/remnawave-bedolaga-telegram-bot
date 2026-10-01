@@ -11,6 +11,10 @@ the daily chart, payment-method totals and the recent-payments totals:
 - WATA: paid RUB gateway records, using `paid_at`.
 - YooKassa: paid, succeeded, non-test RUB records, using `captured_at`, with
   the linked transaction's `completed_at` as the historical fallback.
+- Cashera one-time: successful paid RUB receipts, using `paid_at` and the linked
+  completed ledger entry as a historical fallback. Direct gifts are included.
+- Cashera recurring: completed ledger charges with no matching one-time receipt
+  (by transaction FK, provider charge UUID or local order ID).
 - Other gateways: the existing completed external-transaction source,
   using completion time, or creation time when completion time is missing.
 
@@ -20,9 +24,14 @@ either ledger entry to repair a report. Gateway records also include gifts
 without a linked ledger transaction.
 
 The sales summary uses the same income source. Its existing unlinked-gift
-fallback remains for other gateways only: WATA/YooKassa gift receipts have
+fallback remains for other gateways only: WATA/YooKassa/Cashera gift receipts have
 already contributed to income. Sales consumption metrics (subscription
 spending, add-ons and manual credits) keep their distinct definitions.
+
+Income is gross received cash. Cashera preserves the successful receipt after
+refunded/chargeback events and writes a separate refund debit; the original receipt
+is counted once and the refund is not a new payment. The ledger remains intact.
+Cashera recurring is off by default, and Cashera is not a Subpage payment method.
 
 Calendar boundaries and chart grouping use `settings.TIMEZONE` through the
 existing local-day and local-date helpers. Revenue is dated by payment,

@@ -301,6 +301,6 @@ class AuthMiddleware(BaseMiddleware):
                     logger.error('Callback data', event_data=event.data)
                 try:
                     await db.rollback()
-                except (InterfaceError, OperationalError):
+                except InterfaceError, OperationalError:
                     pass  # Соединение уже закрыто
                 raise

@@ -247,7 +247,7 @@ class CisPayPaymentMixin:
 
                 try:
                     received_kopeks = int(received_amount)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     received_kopeks = None
 
                 if received_kopeks is None or received_kopeks != payment.amount_kopeks:
@@ -276,7 +276,7 @@ class CisPayPaymentMixin:
                 if charged_amount is not None:
                     try:
                         payment.charged_amount_kopeks = int(charged_amount)
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         pass
                 payment.callback_payload = callback_payload
                 payment.updated_at = datetime.now(UTC)
@@ -562,7 +562,7 @@ class CisPayPaymentMixin:
 
                         try:
                             received_kopeks = int(api_amount)
-                        except (TypeError, ValueError):
+                        except TypeError, ValueError:
                             received_kopeks = None
 
                         if received_kopeks is None or received_kopeks != payment.amount_kopeks:

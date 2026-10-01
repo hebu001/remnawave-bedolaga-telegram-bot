@@ -149,7 +149,7 @@ def resolve_min_device_limit(tariff: object | None = None) -> int:
     tariff_devices = getattr(tariff, 'device_limit', None) if tariff is not None else None
     try:
         return max(1, int(tariff_devices or 0))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 1
 
 

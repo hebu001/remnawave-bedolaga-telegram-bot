@@ -604,7 +604,7 @@ class GraceAccessService:
                     latest_billing,
                     expected_overlay=session.overlay,
                 )
-            except (GracePanelTransitionConflict, GracePanelTransitionPending):
+            except GracePanelTransitionConflict, GracePanelTransitionPending:
                 raise
             except Exception as error:
                 failed_session = replace(
@@ -1295,7 +1295,7 @@ def webhook_matches_overlay_event(
     try:
         if int(payload.get('trafficLimitBytes')) != overlay.traffic_limit_bytes:
             return False
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
 
     if 'activeInternalSquads' not in payload:
@@ -1325,7 +1325,7 @@ def webhook_matches_overlay(payload: Mapping[str, Any], overlay: GracePanelOverl
         try:
             if int(traffic_limit) != overlay.traffic_limit_bytes:
                 return False
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
         markers += 1
 

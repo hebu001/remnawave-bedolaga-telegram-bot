@@ -62,7 +62,7 @@ def _parse_ids(raw: Any) -> list[int]:
     for item in items:
         try:
             ids.append(int(str(item).strip()))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return ids
 
@@ -158,7 +158,7 @@ class SupportSettingsService:
     def get_sla_minutes(cls) -> int:
         try:
             minutes = int(settings.SUPPORT_TICKET_SLA_MINUTES)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return SLA_MINUTES_DEFAULT
         return minutes if minutes > 0 else SLA_MINUTES_DEFAULT
 
@@ -166,7 +166,7 @@ class SupportSettingsService:
     async def set_sla_minutes(cls, db: AsyncSession, minutes: Any) -> bool:
         try:
             minutes_int = int(minutes)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
         if minutes_int <= 0:
             return False
@@ -182,14 +182,14 @@ class SupportSettingsService:
     def is_moderator(cls, telegram_id: Any) -> bool:
         try:
             return int(telegram_id) in cls.get_moderators()
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
 
     @classmethod
     async def add_moderator(cls, db: AsyncSession, telegram_id: Any) -> bool:
         try:
             tid = int(telegram_id)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
         return await store_setting(db, KEY_MODERATORS, _ids_csv({*cls.get_moderators(), tid}))
 
@@ -197,7 +197,7 @@ class SupportSettingsService:
     async def remove_moderator(cls, db: AsyncSession, telegram_id: Any) -> bool:
         try:
             tid = int(telegram_id)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
         moderators = set(cls.get_moderators())
         if tid not in moderators:

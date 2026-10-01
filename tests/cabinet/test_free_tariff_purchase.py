@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -112,6 +113,79 @@ async def test_free_tariff_can_be_purchased(monkeypatch, panel):
         subscription = await db.get(Subscription, 1)
         assert subscription is not None, 'подписка не создана'
         assert subscription.status == SubscriptionStatus.ACTIVE.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('price_kopeks', [0, 600], ids=['free', 'paid'])
+@pytest.mark.parametrize('panel_outcome', ['handled', 'raised', 'identity-raised', 'linked-identity-raised'])
+async def test_tariff_cart_and_retry_preserve_identity_after_panel_rollback(
+    monkeypatch, panel, price_kopeks, panel_outcome
+):
+    """Committed purchases retain their cart and retry identity after panel rollback."""
+    from app.cabinet.routes.subscription_modules import purchase as module
+    from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+    async with memory_session(monkeypatch, TABLES) as db:
+        panel_calls = []
+        initial_balance = 2000
+        purchase_user = _user()
+        purchase_user.balance_kopeks = initial_balance
+        linked = panel_outcome == 'linked-identity-raised'
+        expected_subscription_id = 10 if linked else 1
+        if linked:
+            purchase_user.subscriptions = [_subscription()]
+        monkeypatch.setattr(f'{__name__}._user', lambda: purchase_user)
+
+        class RollbackPanel(_FakePanelSync):
+            async def create_remnawave_user(self, _db, subscription, **kwargs):
+                panel_calls.append(subscription.id)
+                await _db.rollback()
+                if panel_outcome == 'raised':
+                    raise RuntimeError('synthetic panel unavailable after rollback')
+                # The real service handles a panel failure by returning None
+                # after rollback; the already committed purchase stays issued.
+
+        async def identity_failure(_db, _subscription, _user):
+            await _db.rollback()
+            raise RuntimeError('synthetic identity resolution unavailable after rollback')
+
+        async def save_cart(user_id, cart):
+            assert not db.in_transaction(), 'cart preparation must not implicitly reload expired ORM attributes'
+            return True
+
+        saved_cart = AsyncMock(side_effect=save_cart)
+        enqueue = MagicMock()
+        monkeypatch.setattr(module, 'SubscriptionService', RollbackPanel)
+        monkeypatch.setattr(module.user_cart_service, 'save_user_cart', saved_cart)
+        monkeypatch.setattr(remnawave_retry_queue, 'enqueue', enqueue)
+        if panel_outcome.endswith('identity-raised'):
+            monkeypatch.setattr(module, 'should_create_panel_account', identity_failure)
+
+        response = await _purchase(db, {'30': price_kopeks})
+
+        assert response.get('success') is True, response
+        assert panel_calls == ([] if panel_outcome.endswith('identity-raised') else [1])
+        if panel_outcome == 'handled':
+            enqueue.assert_not_called()
+        else:
+            enqueue.assert_called_once_with(
+                subscription_id=expected_subscription_id, user_id=1, action='update' if linked else 'create'
+            )
+        saved_cart.assert_awaited_once_with(
+            1,
+            {
+                'cart_mode': 'extend',
+                'subscription_id': expected_subscription_id,
+                'period_days': 30,
+                'total_price': price_kopeks,
+                'tariff_id': 1,
+                'description': 'Продление тарифа Бесплатный на 30 дней',
+            },
+        )
+        subscription = await db.get(Subscription, expected_subscription_id)
+        assert subscription is not None
+        assert subscription.status == SubscriptionStatus.ACTIVE.value
+        assert purchase_user.balance_kopeks == initial_balance - price_kopeks
 
 
 @pytest.mark.asyncio

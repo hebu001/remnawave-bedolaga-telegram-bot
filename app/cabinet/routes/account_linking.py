@@ -150,7 +150,7 @@ class LinkTelegramRequest(BaseModel):
     hash: str | None = Field(None, min_length=64, max_length=64, description='Authentication hash (SHA-256 hex)')
 
     @model_validator(mode='after')
-    def check_exclusive(self) -> 'LinkTelegramRequest':
+    def check_exclusive(self) -> LinkTelegramRequest:
         has_init = self.init_data is not None
         has_oidc = self.id_token is not None
         has_widget = self.id is not None or self.hash is not None or self.auth_date is not None
@@ -889,7 +889,7 @@ async def get_merge_preview_endpoint(
             created_at = created_at.replace(tzinfo=UTC)
         elapsed = (datetime.now(UTC) - created_at).total_seconds()
         expires_in_seconds = max(0, int(MERGE_TOKEN_TTL_SECONDS - elapsed))
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         expires_in_seconds = 0
 
     return MergePreviewResponse(

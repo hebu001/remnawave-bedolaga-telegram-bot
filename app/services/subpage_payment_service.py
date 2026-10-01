@@ -393,7 +393,7 @@ async def try_fulfill_subpage_renewal(
         await db.commit()
         await fulfill_paid_invoice(db, token)
         return True
-    except (Exception, asyncio.CancelledError):
+    except Exception, asyncio.CancelledError:
         await db.rollback()
         raise
 
@@ -511,7 +511,7 @@ async def fulfill_paid_invoice(db: AsyncSession, token: str) -> None:
             invoice.new_expires_at = result.subscription.end_date
         invoice.updated_at = datetime.now(UTC)
         await db.commit()
-    except (Exception, asyncio.CancelledError):
+    except Exception, asyncio.CancelledError:
         await db.rollback()
         raise
 

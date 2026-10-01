@@ -67,7 +67,7 @@ CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
         'description': (
             'YooKassa, CryptoBot, Heleket, CloudPayments, Freekassa, MulenPay, PAL24, Wata, '
             'Platega, Tribute, Kassa AI, RioPay, SeverPay, PayPear, RollyPay, Overpay, AuraPay, '
-            'Etoplatezhi, Antilopay, Jupiter, CisPay, TabPay, ParityPay, Donut, Lava и Telegram Stars.'
+            'Etoplatezhi, Antilopay, Jupiter, CisPay, TabPay, ParityPay, Donut, Lava, Cashera и Telegram Stars.'
         ),
         'icon': '💳',
         'categories': (
@@ -89,6 +89,7 @@ CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
             'ANTILOPAY',
             'JUPITER',
             'CISPAY',
+            'CASHERA',
             'TABPAY',
             'PARITYPAY',
             'DONUT',
@@ -1007,7 +1008,7 @@ class BotConfigInputFilter(BaseFilter):
 
         try:
             return (time.time() - float(timestamp)) <= self.timeout
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return False
 
 
@@ -1025,7 +1026,7 @@ def _parse_category_payload(payload: str) -> tuple[str, str, int, int]:
     def _safe_int(value: str, default: int = 1) -> int:
         try:
             return max(1, int(value))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return default
 
     category_page = _safe_int(parts[3]) if len(parts) > 3 else 1
@@ -1038,7 +1039,7 @@ def _parse_group_payload(payload: str) -> tuple[str, int]:
     group_key = parts[1] if len(parts) > 1 else CATEGORY_FALLBACK_KEY
     try:
         page = max(1, int(parts[2]))
-    except (IndexError, ValueError):
+    except IndexError, ValueError:
         page = 1
     return group_key, page
 

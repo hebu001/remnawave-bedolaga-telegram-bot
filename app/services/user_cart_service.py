@@ -90,7 +90,7 @@ class UserCartService:
                         user_id=user_id,
                         subscription_id=sub_id,
                     )
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     pass  # Non-integer subscription_id -- skip per-sub key
 
             # «Свежее намерение»: корзина сохранена именно для пополнения и
@@ -171,7 +171,7 @@ class UserCartService:
                     sub_id_raw = data.get('subscription_id')
                     if sub_id_raw is not None:
                         subscription_id = int(sub_id_raw)
-                except (json.JSONDecodeError, TypeError, ValueError):
+                except json.JSONDecodeError, TypeError, ValueError:
                     pass
 
             result = await client.delete(key)
@@ -405,7 +405,7 @@ class UserCartService:
                     if raw_data:
                         try:
                             results.append(json.loads(raw_data))
-                        except (json.JSONDecodeError, TypeError):
+                        except json.JSONDecodeError, TypeError:
                             logger.warning('Невалидный JSON в корзине подписки', key=key)
                 if not cursor or cursor == 0 or cursor == b'0':
                     break

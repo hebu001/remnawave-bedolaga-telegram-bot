@@ -191,7 +191,7 @@ async def test_node_event_coalescing_keeps_one_flush_task(
     webhook_service._node_event_flush_task.cancel()
     try:
         await webhook_service._node_event_flush_task
-    except (asyncio.CancelledError, Exception):
+    except asyncio.CancelledError, Exception:
         pass
 
 
@@ -213,7 +213,7 @@ async def test_node_event_buffer_overflow_counts_dropped_events(
         webhook_service._node_event_flush_task.cancel()
         try:
             await webhook_service._node_event_flush_task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError, Exception:
             pass
 
 
@@ -307,7 +307,7 @@ async def test_enqueue_tracks_flush_task_in_pending_set(
     task.cancel()
     try:
         await task
-    except (asyncio.CancelledError, Exception):
+    except asyncio.CancelledError, Exception:
         pass
     # Allow the done-callback to fire on the next event-loop iteration.
     await asyncio.sleep(0)

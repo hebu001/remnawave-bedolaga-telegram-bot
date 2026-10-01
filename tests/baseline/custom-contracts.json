@@ -2,7 +2,7 @@
   "schema_version": 1,
   "baseline_commit": "4b06edcdce26850c03ca474e8d195ef94ddb347e",
   "upstream_commit": "877690a7039d1326b2c00eda3e297879b80c0678",
-  "python": "3.13",
+  "python": "3.14",
   "test_only_packages": [],
   "notes": [
     "Existing fork regression suites plus directly related external contracts, not all upstream tests.",
@@ -25,7 +25,8 @@
       "tests/test_pricing_engine.py",
       "tests/cabinet/test_device_addon_prorate.py",
       "tests/cabinet/test_purchase_tariff_expired_trial_reuse.py",
-      "tests/cabinet/test_purchase_tariff_refund_on_failure.py"
+      "tests/cabinet/test_purchase_tariff_refund_on_failure.py",
+      "tests/integration/test_cashera_renewal_sync.py"
     ],
     "session_and_password_security": [
       "tests/integration/test_cabinet_auth_migration.py",

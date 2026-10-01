@@ -45,7 +45,7 @@ def _lava_amount_to_kopeks(raw: Any) -> int:
         return 0
     try:
         return int(round(float(raw) * 100))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -213,7 +213,7 @@ class LavaPaymentMixin:
         if isinstance(value, (int, float)):
             try:
                 return datetime.fromtimestamp(float(value), tz=UTC)
-            except (ValueError, OSError):
+            except ValueError, OSError:
                 return None
         if isinstance(value, str):
             try:
@@ -331,7 +331,7 @@ class LavaPaymentMixin:
                 if received_amount is not None:
                     try:
                         received_kopeks = round(float(received_amount) * 100)
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         received_kopeks = None
                     if received_kopeks is not None and abs(received_kopeks - payment.amount_kopeks) > 1:
                         logger.error(
@@ -859,9 +859,11 @@ class LavaPaymentMixin:
         subscription.autopay_enabled = False
         await db.commit()
 
+        from app.services.cashera_recurring_cancel import cancel_cashera_recurring_for_subscription_safe
         from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
 
         await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
+        await cancel_cashera_recurring_for_subscription_safe(db, subscription.id)
 
         return {
             'local_id': record.id,

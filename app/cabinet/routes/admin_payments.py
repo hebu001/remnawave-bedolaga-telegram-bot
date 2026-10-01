@@ -280,7 +280,7 @@ def _extract_decline_reason(record: PendingPayment) -> str | None:
     elif isinstance(raw, str) and raw.strip():
         try:
             data = _json.loads(raw)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             data = None
     if not isinstance(data, dict):
         return None

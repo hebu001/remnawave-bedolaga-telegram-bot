@@ -70,7 +70,7 @@ class PromoOfferService:
 
         try:
             duration_hours = int(payload.get('test_duration_hours') or payload.get('duration_hours') or 24)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             duration_hours = 24
 
         if duration_hours <= 0:

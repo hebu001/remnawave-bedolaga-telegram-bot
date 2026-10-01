@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import shlex
 import shutil
 import subprocess
@@ -32,7 +33,10 @@ from tests.fixtures.postgres_db import (
 
 
 MAKE = shutil.which('make')
-WORKFLOW_PATH = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'tests.yml'
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW_PATH = REPO_ROOT / '.github' / 'workflows' / 'tests.yml'
+COMPOSE_PATH = REPO_ROOT / 'docker-compose.yml'
+MATRIX_POSTGRES = '${{ matrix.postgres }}'
 
 
 def test_missing_url_skips_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,12 +88,24 @@ def test_ci_workflow_runs_postgres_tests_for_real() -> None:
 
     job = yaml.safe_load(workflow)['jobs']['pytest']
     runs = [step.get('run', '') for step in job['steps']]
-    assert any('apt-get install' in run and 'postgresql-15' in run for run in runs), 'CI не устанавливает PostgreSQL 15'
+    assert not job.get('services'), 'stateful tests must use the owned Unix-only lab'
+    assert any('apt-get install' in run and f'postgresql-{MATRIX_POSTGRES}' in run for run in runs)
+    assert any('create_main_cluster = false' in run for run in runs), 'CI must not start a system TCP cluster'
+    entries = job['strategy']['matrix']['include']
+    versions = {str(entry['postgres']) for entry in entries}
+    assert {'15', '18'} <= versions, 'CI must cover both application-supported PostgreSQL majors'
+    compose_version = re.search(r'image:\s*postgres:(\d+)', COMPOSE_PATH.read_text(encoding='utf-8')).group(1)
+    full_suite_versions = {str(entry['postgres']) for entry in entries if entry.get('full_suite')}
+    assert compose_version in full_suite_versions, 'full suite must cover the active/default database major'
     for suite in ('postgres', 'full'):
         steps = [step for step in job['steps'] if f'tests/baseline/run.py --suite {suite} ' in step.get('run', '')]
         assert len(steps) == 1, f'нет обязательного отдельного шага {suite}'
         assert not steps[0].get('continue-on-error'), 'ошибка тестов не должна скрываться'
-        assert '--pg-bin /usr/lib/postgresql/15/bin' in steps[0]['run']
+        assert f'--pg-bin /usr/lib/postgresql/{MATRIX_POSTGRES}/bin' in steps[0]['run']
+        if suite == 'postgres':
+            assert not steps[0].get('if'), 'mandatory PostgreSQL suite must run on every matrix major'
+        else:
+            assert steps[0].get('if') == 'matrix.full_suite'
 
     # The child environment is intentionally built by the owned lab harness,
     # not inherited from a workflow TCP DSN. Require the actual env.update call.

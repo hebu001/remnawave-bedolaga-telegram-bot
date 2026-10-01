@@ -464,7 +464,7 @@ async def handle_blocked_list_pagination(
     """Обрабатывает пагинацию списка заблокированных."""
     try:
         page = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         page = 1
 
     await show_blocked_list(callback, db_user, state, page)

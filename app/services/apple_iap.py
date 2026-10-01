@@ -89,7 +89,7 @@ def _transaction_fields(txn_info: dict[str, Any]) -> dict[str, Any]:
     price = txn_info.get('price')
     try:
         price_micros = int(price) if price is not None else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         price_micros = None
 
     return {

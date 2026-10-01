@@ -300,7 +300,7 @@ async def _send_and_pin_message(bot: Bot, chat_id: int, pinned_message: PinnedMe
         await asyncio.sleep(min(e.retry_after + 1, 30))
         try:
             await bot.unpin_all_chat_messages(chat_id=chat_id)
-        except (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter):
+        except TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter:
             pass
 
     try:

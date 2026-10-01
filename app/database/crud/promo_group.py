@@ -16,7 +16,7 @@ def _normalize_period_discounts(period_discounts: dict[int, int] | None) -> dict
         try:
             period = int(key)
             percent = int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
 
         normalized[period] = max(0, min(100, percent))

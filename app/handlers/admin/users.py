@@ -1793,7 +1793,7 @@ async def process_referral_percent_input(
         normalized_number = raw_text.replace(',', '.').strip()
         try:
             percent_float = float(normalized_number)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             await message.answer(
                 get_texts(db_user.language).t(
                     'ADMIN_USER_REFERRAL_COMMISSION_INVALID',
@@ -3467,12 +3467,14 @@ async def confirm_subscription_deletion(callback: types.CallbackQuery, db_user: 
     # runs BEFORE any irreversible panel/DB step, and the guard is
     # re-acquired immediately below — closing that window before anything
     # that can't be undone happens.
+    from app.services.cashera_recurring_cancel import cancel_cashera_recurring_for_subscription_safe
     from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
     from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
 
     await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
 
     await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
+    await cancel_cashera_recurring_for_subscription_safe(db, subscription.id)
     try:
         await ensure_no_open_grace_for_subscriptions(db, (subscription.id,))
     except GraceAccessDeletionBlocked:
@@ -4423,7 +4425,7 @@ async def _update_user_traffic(
 
 async def _resolve_admin_subscription(
     db: AsyncSession, user_id: int, subscription_id: int | None = None, tariff_id: int | None = None
-) -> 'Subscription | None':
+) -> Subscription | None:
     """Resolve subscription for admin operations.
 
     In multi-tariff without explicit subscription_id:

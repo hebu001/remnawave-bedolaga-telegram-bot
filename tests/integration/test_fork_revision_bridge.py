@@ -49,7 +49,7 @@ async def test_dry_run_atomic_apply_repeat_and_actual_startup(profile):
             assert repeat.state == 'already_bridged' and not repeat.applied
             for _ in range(2):
                 await connection.run_sync(_upgrade_on_connection, config(schema=schema))
-                assert await connection.run_sync(bridge.read_revisions, schema) == ['evo_0109']
+                assert await connection.run_sync(bridge.read_revisions, schema) == ['evo_0110']
                 await connection.rollback()
                 # Once runtime DDL has advanced, the old bridge must not restamp it.
                 with pytest.raises(bridge.ForkRevisionError):
@@ -235,7 +235,7 @@ async def test_current_fork_fresh_bootstrap_and_repeat():
         async with engine.connect() as connection:
             for _ in range(2):
                 await connection.run_sync(_upgrade_on_connection, config(schema=schema))
-                assert await connection.run_sync(bridge.read_revisions, schema) == ['evo_0109']
+                assert await connection.run_sync(bridge.read_revisions, schema) == ['evo_0110']
                 current = await connection.run_sync(bridge.snapshot_schema, schema)
                 if _ == 0:
                     initial = current

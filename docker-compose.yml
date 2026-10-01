@@ -8,6 +8,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-remnawave_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
       POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+    # Keep the existing PostgreSQL 15 cluster for the application-only 5.0.0 update.
+    # PostgreSQL 18 requires a separately rehearsed data and volume migration.
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:

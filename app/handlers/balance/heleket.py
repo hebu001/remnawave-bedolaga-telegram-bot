@@ -124,12 +124,16 @@ async def process_heleket_payment_amount(
     amount_rubles = amount_kopeks / 100
 
     if amount_rubles < 100:
-        await message.answer('Минимальная сумма пополнения: 100 ₽', reply_markup=get_back_keyboard(db_user.language))
+        await message.answer(
+            'Минимальная сумма пополнения: 100 ₽\n\nОтправьте новую сумму пополнения числом в сообщении.',
+            reply_markup=get_back_keyboard(db_user.language),
+        )
         return
 
     if amount_rubles > 100000:
         await message.answer(
-            'Максимальная сумма пополнения: 100,000 ₽', reply_markup=get_back_keyboard(db_user.language)
+            'Максимальная сумма пополнения: 100,000 ₽\n\nОтправьте новую сумму пополнения числом в сообщении.',
+            reply_markup=get_back_keyboard(db_user.language),
         )
         return
 
@@ -173,7 +177,7 @@ async def process_heleket_payment_amount(
         try:
             discount_int = int(discount_percent)
             markup_percent = -discount_int
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             markup_percent = None
 
     if markup_percent:
@@ -191,7 +195,7 @@ async def process_heleket_payment_amount(
             if payer_amount_float > 0:
                 rub_per_currency = amount_rubles / payer_amount_float
                 details.append(f'💱 Курс: 1 {payer_currency} ≈ {rub_per_currency:.2f} ₽')
-        except (TypeError, ValueError, ZeroDivisionError):
+        except TypeError, ValueError, ZeroDivisionError:
             pass
 
     details.extend(
@@ -269,7 +273,7 @@ async def check_heleket_payment_status(
 ) -> None:
     try:
         local_payment_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('Некорректный идентификатор платежа', show_alert=True)
         return
 

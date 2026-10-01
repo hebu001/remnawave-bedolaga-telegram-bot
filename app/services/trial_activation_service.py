@@ -47,7 +47,7 @@ def get_trial_activation_charge_amount() -> int:
 
     try:
         price_kopeks = int(settings.get_trial_activation_price() or 0)
-    except (TypeError, ValueError):  # pragma: no cover - defensive
+    except TypeError, ValueError:  # pragma: no cover - defensive
         price_kopeks = 0
 
     return max(0, price_kopeks)

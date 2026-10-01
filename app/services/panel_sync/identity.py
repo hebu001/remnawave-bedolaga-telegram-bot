@@ -127,7 +127,7 @@ async def find_foreign_panel_owner(db, user, subscription, panel_id, *, multi_ta
         return None
     try:
         panel_id = int(panel_id)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     if getattr(subscription, 'remnawave_id', None) == panel_id:
         return None

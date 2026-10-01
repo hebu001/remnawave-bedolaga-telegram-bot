@@ -2296,7 +2296,7 @@ async def reset_password(
         user.password_reset_expires = None
         await revoke_password_sessions(db, user)
         await db.commit()
-    except (Exception, asyncio.CancelledError):
+    except Exception, asyncio.CancelledError:
         await db.rollback()
         raise
 

@@ -137,7 +137,7 @@ class TributeService:
 
             try:
                 telegram_user_id = int(telegram_user_id)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 logger.error('❌ Некорректный telegram_user_id', telegram_user_id=telegram_user_id)
                 return None
 

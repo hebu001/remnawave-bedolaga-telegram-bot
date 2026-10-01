@@ -22,6 +22,7 @@ def ledger(monkeypatch, reset_local_timezone_cache):
         Column('type', String),
         Column('amount_kopeks', Integer),
         Column('payment_method', String),
+        Column('external_id', String),
         Column('is_completed', Boolean),
         Column('created_at', DateTime),
         Column('completed_at', DateTime),
@@ -45,6 +46,19 @@ def ledger(monkeypatch, reset_local_timezone_cache):
         Column('captured_at', DateTime),
         Column('status', String),
         Column('test_mode', Boolean),
+        Column('transaction_id', Integer),
+    )
+    cashera = Table(
+        'cashera_payments',
+        metadata,
+        Column('id', Integer, primary_key=True),
+        Column('amount_kopeks', Integer),
+        Column('is_paid', Boolean),
+        Column('currency', String),
+        Column('paid_at', DateTime),
+        Column('status', String),
+        Column('cashera_uuid', String),
+        Column('order_id', String),
         Column('transaction_id', Integer),
     )
     metadata.create_all(engine)
@@ -73,7 +87,9 @@ def ledger(monkeypatch, reset_local_timezone_cache):
             def add(self, table, **values):
                 connection.execute(table.insert().values(**values))
 
-        yield Ledger(), transactions, wata, yookassa
+        db = Ledger()
+        db.cashera = cashera
+        yield db, transactions, wata, yookassa
     engine.dispose()
 
 
@@ -210,3 +226,124 @@ async def test_empty_period_returns_zero(ledger):
     stats = await revenue.get_transactions_statistics(db, utc('2026-09-01'), utc('2026-09-16'))
     assert stats['totals']['income_kopeks'] == 0
     assert stats['by_payment_method'] == {}
+
+
+@pytest.mark.asyncio
+async def test_cashera_gift_deposit_debit_and_recurring_are_received_once(ledger):
+    db, transactions, *_ = ledger
+    paid = utc('2026-09-10 10:00:00')
+    # One top-up receipt can have both deposit and debit ledger records.
+    for number, kind in [(1, 'deposit'), (2, 'subscription_payment')]:
+        db.add(
+            transactions,
+            id=number,
+            type=kind,
+            amount_kopeks=30000 if number == 1 else -30000,
+            payment_method='cashera',
+            external_id='topup-order' if number == 1 else 'topup-charge',
+            is_completed=True,
+            created_at=paid,
+            completed_at=paid,
+        )
+    db.add(
+        db.cashera,
+        amount_kopeks=30000,
+        is_paid=True,
+        currency='RUB',
+        status='success',
+        paid_at=paid,
+        cashera_uuid='topup-charge',
+        order_id='topup-order',
+        transaction_id=1,
+    )
+    # Direct gift has a successful receipt and no ledger entry.
+    db.add(
+        db.cashera,
+        amount_kopeks=20000,
+        is_paid=True,
+        currency='RUB',
+        status='success',
+        paid_at=paid,
+        cashera_uuid='gift-charge',
+        order_id='gift-order',
+    )
+    # Recurring charges have only the completed ledger charge UUID.
+    db.add(
+        transactions,
+        type='subscription_payment',
+        amount_kopeks=-40000,
+        payment_method='cashera',
+        external_id='recurring-charge',
+        is_completed=True,
+        created_at=paid,
+        completed_at=paid,
+    )
+    # Unpaid or failed receipts cannot become income through a stray ledger record.
+    for number, status in [(4, 'pending'), (5, 'amount_mismatch')]:
+        charge = f'failed-{number}'
+        db.add(
+            transactions,
+            id=number,
+            type='deposit',
+            amount_kopeks=90000,
+            payment_method='cashera',
+            external_id=charge,
+            is_completed=True,
+            created_at=paid,
+            completed_at=paid,
+        )
+        db.add(
+            db.cashera,
+            amount_kopeks=90000,
+            is_paid=False,
+            currency='RUB',
+            status=status,
+            paid_at=paid,
+            cashera_uuid=charge,
+            order_id=charge,
+            transaction_id=number,
+        )
+    stats = await revenue.get_transactions_statistics(db, utc('2026-09-01'), utc('2026-09-16'))
+    assert stats['totals']['income_kopeks'] == 90000
+    assert stats['by_payment_method'] == {'cashera': {'count': 3, 'amount': 90000}}
+
+
+@pytest.mark.asyncio
+async def test_cashera_refund_is_not_a_second_received_payment(ledger):
+    db, transactions, *_ = ledger
+    paid = utc('2026-09-10 10:00:00')
+    # Upstream preserves is_paid/status=success after reversal. Its refund ledger
+    # is a distinct debit; gross received-income remains one original receipt.
+    db.add(
+        db.cashera,
+        amount_kopeks=30000,
+        is_paid=True,
+        currency='RUB',
+        status='success',
+        paid_at=paid,
+        cashera_uuid='refunded-charge',
+        order_id='refunded-order',
+        transaction_id=1,
+    )
+    db.add(
+        transactions,
+        id=1,
+        type='deposit',
+        amount_kopeks=30000,
+        payment_method='cashera',
+        external_id='refunded-charge',
+        is_completed=True,
+        created_at=paid,
+        completed_at=paid,
+    )
+    db.add(
+        transactions,
+        type='refund',
+        amount_kopeks=-30000,
+        payment_method='cashera',
+        external_id='refund-refunded-charge',
+        is_completed=True,
+        created_at=paid,
+        completed_at=paid,
+    )
+    assert await revenue.get_income_total(db, utc('2026-09-01'), utc('2026-09-16')) == 30000

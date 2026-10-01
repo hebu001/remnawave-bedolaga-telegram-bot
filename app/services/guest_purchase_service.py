@@ -1203,9 +1203,9 @@ async def _send_telegram_gift_notification(
 
 
 async def _send_guest_main_email(
-    templates: 'EmailNotificationTemplates',
+    templates: EmailNotificationTemplates,
     purchase: GuestPurchase,
-    notification_type: 'NotificationType',
+    notification_type: NotificationType,
     language: str,
     context: dict,
     recipient_email: str,

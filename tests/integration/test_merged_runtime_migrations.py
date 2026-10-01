@@ -30,7 +30,7 @@ pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(not os.getenv('TEST_POSTGRES_URL'), reason='needs dedicated local PostgreSQL'),
 ]
-HEAD = 'evo_0109'
+HEAD = 'evo_0110'
 
 
 async def upgrade_runtime(connection, schema):
@@ -104,6 +104,33 @@ async def test_backup_restore_preserves_pending_durable_and_identity_data(monkey
                     "VALUES (12,1,2,350,'fixture referral reward',12,1)"
                 )
             )
+            await conn.execute(
+                text(
+                    'INSERT INTO cashera_payments '
+                    '(id,user_id,order_id,cashera_uuid,amount_kopeks,status,is_paid,paid_at,transaction_id,metadata_json) '
+                    "VALUES (12,1,'fixture-cashera-order','fixture-cashera-charge',14900,'success',true,"
+                    "'2026-09-01T00:00:00Z',1,CAST(:metadata AS JSON))"
+                ),
+                {'metadata': json.dumps({'synthetic': True})},
+            )
+            await conn.execute(
+                text(
+                    'INSERT INTO cashera_subscriptions '
+                    '(id,user_id,subscription_id,tariff_id,cashera_subscription_uuid,external_id,interval,'
+                    'charge_days,amount_kopeks,status,last_charge_external_id,charges_success) '
+                    "VALUES (12,1,1,1,'fixture-cashera-binding','fixture-cashera-recurring','monthly',"
+                    "30,14900,'ACTIVE','fixture-cashera-recurring-charge',3)"
+                )
+            )
+            await conn.execute(
+                text(
+                    'INSERT INTO dpichecker_actions '
+                    '(id,kind,remote_id,admin_user_id,targets,request,idempotency_key,delivery_ids,cost_usd) '
+                    "VALUES (12,'probe',12001,1,CAST(:targets AS JSON),'{}',"
+                    "'fixture-dpichecker-idempotency',CAST(:deliveries AS JSON),0.0123)"
+                ),
+                {'targets': json.dumps([{'value': 'example.invalid'}]), 'deliveries': json.dumps(['fixture-delivery'])},
+            )
             await conn.commit()
             columns = await conn.run_sync(application_columns)
             before = await conn.run_sync(application_rows, columns)
@@ -123,6 +150,7 @@ async def test_backup_restore_preserves_pending_durable_and_identity_data(monkey
         payload, associations, count, _ = await service._export_database_via_orm(models)
         assert payload['subpage_invoices'] and payload['renewal_sync_tasks']
         assert payload['cabinet_ws_tickets'] and payload['traffic_notification_states']
+        assert payload['cashera_payments'] and payload['cashera_subscriptions'] and payload['dpichecker_actions']
         monkeypatch.setattr(module, 'AsyncSessionLocal', async_sessionmaker(target, expire_on_commit=False))
         # The application helper uses its global engine; this test targets the
         # isolated schema. Sequence reset has its own coverage.
@@ -148,6 +176,32 @@ async def test_backup_restore_preserves_pending_durable_and_identity_data(monkey
                     json.dumps({'before': before, 'restored': restored}, indent=2) + '\n'
                 )
             assert restored == before
+
+
+async def test_deployed_evo_0109_incremental_upgrade_matches_fresh_and_preserves_all_old_rows():
+    """Run the actual old DDL first; never stamp over pending schema changes."""
+    from tests.integration.bridge_fixtures import upgrade
+
+    async with database() as (source, schema), database(None, seed=False) as (target, fresh_schema):
+        async with source.connect() as conn, target.connect() as fresh:
+            report = await call(conn, schema)
+            await call(conn, schema, apply=True, expected_revision='0106', expected_digest=report.schema_sha256)
+            await upgrade(conn, config(schema=schema), 'evo_0109')
+            assert await conn.run_sync(bridge.read_revisions, schema) == ['evo_0109']
+            columns = await conn.run_sync(application_columns)
+            old_rows = await conn.run_sync(application_rows, columns)
+            await conn.rollback()
+            await upgrade_runtime(conn, schema)
+            assert await conn.run_sync(application_rows, columns) == old_rows
+            await upgrade_runtime(fresh, fresh_schema)
+            catalog = await conn.run_sync(bridge.snapshot_schema, schema)
+            assert catalog == await fresh.run_sync(bridge.snapshot_schema, fresh_schema)
+            tables = {item['name'] for item in catalog['relations'] if item['kind'] == 'r'}
+            assert {'cashera_payments', 'cashera_subscriptions', 'dpichecker_actions'} <= tables
+            await conn.rollback()
+            await upgrade_runtime(conn, schema)
+            assert await conn.run_sync(bridge.snapshot_schema, schema) == catalog
+            assert await conn.run_sync(application_rows, columns) == old_rows
 
 
 async def test_pinned_upstream_0127_schema_accepts_custom_branch():
@@ -258,7 +312,9 @@ async def test_upstream_metadata_payment_null_is_preserved_and_migration_refused
                 await conn.run_sync(_upgrade_on_connection, config(schema=schema))
             await conn.rollback()
             assert (await conn.execute(text(f'SELECT amount_kopeks,is_paid FROM {table}'))).all() == [(250, None)]
-            assert await conn.run_sync(bridge.read_revisions, schema) == ['evo_0107']
+            # The independent upstream branch committed, but the fork's failing
+            # parity revision and the final join must not be marked applied.
+            assert await conn.run_sync(bridge.read_revisions, schema) == ['0131', 'evo_0107']
 
 
 async def test_wrong_existing_index_is_not_silently_accepted():
@@ -271,7 +327,7 @@ async def test_wrong_existing_index_is_not_silently_accepted():
             with pytest.raises(RuntimeError, match=r'Unexpected index shape: email_queue\.ix_email_queue_id'):
                 await conn.run_sync(_upgrade_on_connection, config(schema=schema))
             await conn.rollback()
-            assert await conn.run_sync(bridge.read_revisions, schema) == ['evo_0107']
+            assert await conn.run_sync(bridge.read_revisions, schema) == ['0131', 'evo_0107']
 
 
 async def test_restore_foreign_key_error_is_not_reported_as_duplicate(monkeypatch):

@@ -165,7 +165,7 @@ class TrafficMonitoringServiceV2:
                 for raw_id, bytes_val in snapshot_data.items():
                     try:
                         result[int(raw_id)] = float(bytes_val)
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         logger.debug('Пропускаем непригодный ключ snapshot', raw_id=raw_id)
                 logger.debug('📦 Snapshot загружен из Redis', result_count=len(result))
                 return result

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -124,9 +125,13 @@ async def _user_subscriptions(db, user_id: int) -> list[Subscription]:
 
 
 @pytest.mark.asyncio
-async def test_legacy_subscription_gets_the_tariff_in_place(postgres_database):
+async def test_legacy_subscription_gets_the_tariff_in_place(postgres_database, monkeypatch):
     """Тариф надевается на старую подписку: одна строка, тот же аккаунт панели, остаток + период."""
     now = datetime.now(UTC)
+    from app.cabinet.routes.subscription_modules import purchase as module
+
+    saved_cart = AsyncMock(return_value=True)
+    monkeypatch.setattr(module.user_cart_service, 'save_user_cart', saved_cart)
     async with postgres_session(postgres_database, TABLES) as db:
         user, legacy, tariff = await _seed(db, now)
 
@@ -146,6 +151,17 @@ async def test_legacy_subscription_gets_the_tariff_in_place(postgres_database):
         )
         await db.refresh(user)
         assert user.balance_kopeks == 0
+        saved_cart.assert_awaited_once_with(
+            user.id,
+            {
+                'cart_mode': 'extend',
+                'subscription_id': legacy.id,
+                'period_days': PERIOD_DAYS,
+                'total_price': PRICE_KOPEKS,
+                'tariff_id': tariff.id,
+                'description': f'Продление тарифа Базовый на {PERIOD_DAYS} дней',
+            },
+        )
 
 
 @pytest.mark.asyncio

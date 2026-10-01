@@ -224,7 +224,7 @@ class CryptoBotPaymentMixin:
                     parsed = _json.loads(crypto_payload_str)
                     if isinstance(parsed, dict) and parsed.get('purpose') == 'guest_purchase':
                         crypto_guest_meta = parsed
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     pass
 
             if crypto_guest_meta is not None:

@@ -87,7 +87,7 @@ class ServerStatusService:
             try:
                 value = float(match.group('value'))
                 entry.latency_ms = int(round(value))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 entry.latency_ms = None
 
         for match in self._STATUS_PATTERN.finditer(body):
@@ -101,7 +101,7 @@ class ServerStatusService:
             try:
                 value = float(match.group('value'))
                 entry.is_online = value >= 1
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 entry.is_online = False
 
         return sorted(

@@ -15,7 +15,7 @@ def _normalize_period_discounts(value: dict[object, object] | None) -> dict[int,
             try:
                 key = int(raw_key)
                 normalized[key] = int(raw_value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
 
     # Return empty dict (not None) so the backend can distinguish

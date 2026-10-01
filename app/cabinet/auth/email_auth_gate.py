@@ -31,7 +31,7 @@ def _parse_stored_flag(stored: str) -> bool | None:
     переключатель ('true'), и редактор, и перенос .env в БД (сырое '1')."""
     try:
         return bool(BotConfigurationService.deserialize_value(EMAIL_AUTH_ENABLED_KEY, stored))
-    except (ValueError, KeyError):
+    except ValueError, KeyError:
         logger.warning('Нечитаемое значение флага email-входа в БД, берём окружение', value=stored)
         return None
 

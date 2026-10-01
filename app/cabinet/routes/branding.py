@@ -556,7 +556,7 @@ async def _resolve_manifest_colors(db: AsyncSession) -> tuple[str, str]:
     if colors_json:
         try:
             stored = json.loads(colors_json)
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             stored = None
         if isinstance(stored, dict):
             colors.update({key: value for key, value in stored.items() if app_icon.is_hex_color(value)})
@@ -566,7 +566,7 @@ async def _resolve_manifest_colors(db: AsyncSession) -> tuple[str, str]:
     if themes_json:
         try:
             themes = json.loads(themes_json)
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             themes = None
         if isinstance(themes, dict) and isinstance(themes.get('dark'), bool):
             dark_enabled = themes['dark']
@@ -969,7 +969,7 @@ async def get_theme_colors(
             # Merge with defaults to ensure all fields exist
             merged = {**DEFAULT_THEME_COLORS, **colors}
             return ThemeColorsResponse(**merged)
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     return ThemeColorsResponse(**DEFAULT_THEME_COLORS)
@@ -989,7 +989,7 @@ async def update_theme_colors(
     if colors_json:
         try:
             current_colors.update(json.loads(colors_json))
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     # Update with new values (only non-None fields)
@@ -1043,7 +1043,7 @@ async def get_enabled_themes(
         try:
             themes = json.loads(themes_json)
             return EnabledThemesResponse(**themes)
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     return EnabledThemesResponse(**DEFAULT_ENABLED_THEMES)
@@ -1063,7 +1063,7 @@ async def update_enabled_themes(
     if themes_json:
         try:
             current_themes.update(json.loads(themes_json))
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     # Update with new values
@@ -1131,7 +1131,7 @@ async def get_animation_config(
         try:
             config = json.loads(config_value)
             return AnimationConfigResponse(**config)
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     # Auto-migrate from old ANIMATION_ENABLED_KEY
@@ -1156,7 +1156,7 @@ async def update_animation_config(
     if config_value:
         try:
             current = json.loads(config_value)
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             current = dict(DEFAULT_ANIMATION_CONFIG)
     else:
         current = dict(DEFAULT_ANIMATION_CONFIG)

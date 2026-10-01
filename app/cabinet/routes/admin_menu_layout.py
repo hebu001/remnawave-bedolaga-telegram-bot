@@ -367,7 +367,7 @@ async def update_menu_layout(
         if raw:
             try:
                 current_styles = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError, TypeError:
                 current_styles = {}
 
         for section, updates in button_styles_updates.items():

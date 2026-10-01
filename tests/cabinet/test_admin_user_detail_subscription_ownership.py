@@ -31,6 +31,16 @@ FOREIGN_PANEL_ID = 5002
 LEGACY_USER_PANEL_ID = 9999
 
 
+def _mock_db():
+    """AsyncSession.execute returns a synchronous SQLAlchemy Result, not AsyncMock."""
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    result.scalars.return_value.first.return_value = None
+    db.execute.return_value = result
+    return db
+
+
 def _subscription(subscription_id: int, user_id: int, *, panel_id: int | None) -> SimpleNamespace:
     return SimpleNamespace(
         id=subscription_id,
@@ -173,7 +183,7 @@ async def test_authoritative_subscription_lookup_constrains_id_and_user_id(owned
     """Would fail if a route reverted to an id-only subscription lookup."""
     result = MagicMock()
     result.scalar_one_or_none.return_value = owned_subscription
-    db = AsyncMock()
+    db = _mock_db()
     db.execute = AsyncMock(return_value=result)
 
     assert await admin_users._get_owned_subscription_or_404(db, OWNED_ID, OWNER_ID) is owned_subscription
@@ -200,7 +210,7 @@ async def test_subscription_reads_and_device_delete_accept_owned_subscription(
     """Every BP-S route uses the selected owned subscription in either mode."""
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: multi_tariff)
     route = getattr(admin_users, route_name)
-    db = AsyncMock()
+    db = _mock_db()
     admin = SimpleNamespace(id=1)
 
     owned_result = await route(OWNER_ID, admin=admin, db=db, subscription_id=OWNED_ID, **kwargs)
@@ -226,7 +236,7 @@ async def test_subscription_reads_and_device_delete_reject_foreign_and_absent_wi
     """No rejected BP-S request may construct or call the panel client in either mode."""
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: multi_tariff)
     route = getattr(admin_users, route_name)
-    db = AsyncMock()
+    db = _mock_db()
     admin = SimpleNamespace(id=1)
 
     for subscription_id in (FOREIGN_ID, MISSING_ID):
@@ -270,7 +280,7 @@ async def test_panel_info_validates_supplied_subscription_before_unconfigured_se
         await admin_users.get_user_panel_info(
             OWNER_ID,
             admin=SimpleNamespace(id=1),
-            db=AsyncMock(),
+            db=_mock_db(),
             subscription_id=subscription_id,
         )
 
@@ -295,7 +305,7 @@ async def test_panel_info_does_not_fall_back_to_user_panel_id_for_selected_unlin
     response = await admin_users.get_user_panel_info(
         OWNER_ID,
         admin=SimpleNamespace(id=1),
-        db=AsyncMock(),
+        db=_mock_db(),
         subscription_id=OWNED_ID,
     )
 
@@ -335,7 +345,7 @@ async def test_subscription_actions_accept_an_owned_subscription(
     monkeypatch.setattr('app.database.crud.subscription.reset_subscription', reset_subscription)
     monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', AsyncMock())
     monkeypatch.setattr('app.services.payment.lava.cancel_lava_recurring_for_subscription_safe', AsyncMock())
-    db = AsyncMock()
+    db = _mock_db()
     request = UpdateSubscriptionRequest(action=action, subscription_id=OWNED_ID, **request_kwargs)
 
     result = await admin_users.update_user_subscription(OWNER_ID, request, admin=SimpleNamespace(id=1), db=db)
@@ -373,7 +383,7 @@ async def test_selected_actions_pin_sync_to_the_selected_identity_when_legacy_mo
         OWNER_ID,
         UpdateSubscriptionRequest(action=action, subscription_id=OWNED_ID, **request_kwargs),
         admin=SimpleNamespace(id=1),
-        db=AsyncMock(),
+        db=_mock_db(),
     )
 
     assert result.success is True
@@ -441,7 +451,7 @@ async def test_selected_sync_uses_only_selected_panel_id_when_legacy_mode_is_ena
         subscription_crypto_link=None,
         remnawave_short_uuid=None,
     )
-    db = AsyncMock()
+    db = _mock_db()
 
     changes = await admin_users._sync_subscription_to_panel(db, user, subscription, pinned_subscription_identity=True)
 
@@ -456,7 +466,7 @@ async def test_selected_sync_with_no_panel_link_does_not_substitute_legacy_ident
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
     user = SimpleNamespace(id=OWNER_ID, remnawave_id=LEGACY_USER_PANEL_ID)
     subscription = SimpleNamespace(id=OWNED_ID, remnawave_id=None)
-    db = AsyncMock()
+    db = _mock_db()
 
     result = await admin_users._sync_subscription_to_panel(db, user, subscription, pinned_subscription_identity=True)
 
@@ -475,7 +485,7 @@ async def test_selected_devices_return_selected_subscription_device_limit(monkey
     monkeypatch.setattr(admin_users, '_get_owned_subscription_or_404', AsyncMock(return_value=selected))
 
     response = await admin_users.get_user_devices(
-        OWNER_ID, admin=SimpleNamespace(id=1), db=AsyncMock(), subscription_id=OWNED_ID
+        OWNER_ID, admin=SimpleNamespace(id=1), db=_mock_db(), subscription_id=OWNED_ID
     )
 
     assert response.device_limit == 9
@@ -502,7 +512,7 @@ async def test_selected_reset_returns_unsuccessful_when_panel_deactivation_fails
         OWNER_ID,
         UpdateSubscriptionRequest(action='reset', subscription_id=OWNED_ID),
         admin=SimpleNamespace(id=1),
-        db=AsyncMock(),
+        db=_mock_db(),
     )
 
     assert result.success is False
@@ -526,7 +536,7 @@ async def test_selected_reset_without_link_does_not_substitute_legacy_identity(
         OWNER_ID,
         UpdateSubscriptionRequest(action='reset', subscription_id=OWNED_ID),
         admin=SimpleNamespace(id=1),
-        db=AsyncMock(),
+        db=_mock_db(),
     )
 
     assert result.success is True
@@ -534,14 +544,14 @@ async def test_selected_reset_without_link_does_not_substitute_legacy_identity(
     reset_subscription.assert_awaited_once()
 
 
-async def test_selected_reset_cancels_both_recurring_bindings(monkeypatch, ownership_boundary, owned_subscription):
+async def test_selected_reset_cancels_all_recurring_bindings(monkeypatch, ownership_boundary, owned_subscription):
     """Живая привязка автопродления воскресила бы только что сброшенную подписку.
 
-    Ветка сброса выбранной подписки появилась раньше рекуррента Lava, поэтому
-    отменяла только Platega — как и остальные пути сброса, обязана снимать обе.
+    Сброс выбранной подписки обязан снимать Platega, Lava и новый Cashera.
     """
     platega_cancel = AsyncMock()
     lava_cancel = AsyncMock()
+    cashera_cancel = AsyncMock()
     monkeypatch.setattr(
         'app.services.subscription_service.SubscriptionService.disable_remnawave_user',
         AsyncMock(return_value=True),
@@ -549,18 +559,23 @@ async def test_selected_reset_cancels_both_recurring_bindings(monkeypatch, owner
     monkeypatch.setattr('app.database.crud.subscription.reset_subscription', AsyncMock())
     monkeypatch.setattr('app.services.payment.platega.cancel_platega_recurring_for_subscription_safe', platega_cancel)
     monkeypatch.setattr('app.services.payment.lava.cancel_lava_recurring_for_subscription_safe', lava_cancel)
+    monkeypatch.setattr(
+        'app.services.cashera_recurring_cancel.cancel_cashera_recurring_for_subscription_safe', cashera_cancel
+    )
     monkeypatch.setattr(admin_users, '_build_subscription_info_async', AsyncMock(return_value=None))
+    db = _mock_db()
 
     result = await admin_users.update_user_subscription(
         OWNER_ID,
         UpdateSubscriptionRequest(action='reset', subscription_id=OWNED_ID),
         admin=SimpleNamespace(id=1),
-        db=AsyncMock(),
+        db=db,
     )
 
     assert result.success is True
     platega_cancel.assert_awaited_once()
     lava_cancel.assert_awaited_once()
+    cashera_cancel.assert_awaited_once_with(db, OWNED_ID)
 
 
 @pytest.mark.parametrize(
@@ -582,7 +597,7 @@ async def test_subscription_actions_reject_foreign_or_absent_ids_before_mutation
     monkeypatch.setattr(admin_users, '_sync_subscription_to_panel', sync)
     monkeypatch.setattr(admin_users, '_build_subscription_info_async', AsyncMock(return_value=None))
     monkeypatch.setattr('app.services.subscription_service.reset_subscription_with_panel', reset)
-    db = AsyncMock()
+    db = _mock_db()
     before = getattr(foreign_subscription, state_field)
     request = UpdateSubscriptionRequest(action=action, subscription_id=FOREIGN_ID, **request_kwargs)
 

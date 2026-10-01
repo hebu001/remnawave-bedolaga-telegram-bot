@@ -51,7 +51,7 @@ class BschekGatewayError(BschekAPIError):
 def _float_or_none(value: Any) -> float | None:
     try:
         return None if value is None else float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

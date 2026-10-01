@@ -29,7 +29,7 @@ def _first_present(raw: dict[str, Any], *keys: str) -> Any:
 def coerce_bytes(value: Any) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -53,7 +53,7 @@ def normalize_node_usage(raw_items: Any, node_uuid: str) -> list[dict[str, Any]]
         raw_user_id = _first_present(raw, 'user_id', 'id', 'userId')
         try:
             parsed_user_id = int(raw_user_id) if raw_user_id is not None else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             parsed_user_id = None
         items.append(
             {

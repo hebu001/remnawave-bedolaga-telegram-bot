@@ -195,7 +195,7 @@ class RemnaWaveWebhookService:
         # `_node_event_pending_tasks` — strong-ref набор для GC-safety: задача
         # остаётся в нём до полного завершения коаллбэка через add_done_callback.
         # Asyncio docs предупреждают, что слабо-ссылочные задачи могут быть
-        # выгружены GC до завершения; на CPython 3.13 риск практически нулевой,
+        # выгружены GC до завершения; на CPython риск практически нулевой,
         # но паттерн с set — канонический.
         self._node_event_buffer: dict[str, list[dict]] = {}
         self._node_event_overflow: dict[str, int] = {}
@@ -323,7 +323,7 @@ class RemnaWaveWebhookService:
         if telegram_id:
             try:
                 candidate_telegram_ids.append(int(telegram_id))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 # Конверт вебхука — внешние данные: непригодный telegramId это
                 # просто «кандидата нет», а не повод ронять обработку хука.
                 pass
@@ -332,7 +332,7 @@ class RemnaWaveWebhookService:
         if nested_tid:
             try:
                 candidate_telegram_ids.append(int(nested_tid))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 pass  # см. выше: непригодный telegramId — просто отсутствие кандидата
 
         return any(pid in cls._intentional_panel_deletions_by_id for pid in candidate_ids) or any(
@@ -399,7 +399,7 @@ class RemnaWaveWebhookService:
         try:
             await handler(db, user, subscription, data)
             return True
-        except (StaleDataError, PendingRollbackError):
+        except StaleDataError, PendingRollbackError:
             logger.warning(
                 'RemnaWave webhook : entity already deleted for user (concurrent deletion)',
                 event_name=event_name,
@@ -695,7 +695,7 @@ class RemnaWaveWebhookService:
             task.cancel()
             try:
                 await asyncio.wait_for(task, timeout=self._STOP_CANCEL_TIMEOUT_SECONDS)
-            except (TimeoutError, asyncio.CancelledError):
+            except TimeoutError, asyncio.CancelledError:
                 pass
             except Exception:
                 # Реальная ошибка в задаче — логируем как warning, чтобы
@@ -762,7 +762,7 @@ class RemnaWaveWebhookService:
             return None
         try:
             panel_user_id = int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return panel_user_id if panel_user_id > 0 else None
 
@@ -884,7 +884,7 @@ class RemnaWaveWebhookService:
             if telegram_id:
                 try:
                     user = await get_user_by_telegram_id(db, int(telegram_id))
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     # Непригодный telegramId в конверте — значит по нему искать
                     # нечего; ниже пробуем остальные ключи опознания.
                     pass
@@ -898,7 +898,7 @@ class RemnaWaveWebhookService:
                 if nested_tid:
                     try:
                         user = await get_user_by_telegram_id(db, int(nested_tid))
-                    except (ValueError, TypeError):
+                    except ValueError, TypeError:
                         pass  # как и выше: непригодный telegramId — просто нет совпадения
 
         # Последняя попытка найти ПОЛЬЗОВАТЕЛЯ — через панельную идентичность
@@ -1084,7 +1084,7 @@ class RemnaWaveWebhookService:
         if format_kwargs:
             try:
                 message = message.format(**format_kwargs)
-            except (KeyError, IndexError):
+            except KeyError, IndexError:
                 logger.warning('Failed to format message with kwargs', text_key=text_key, format_kwargs=format_kwargs)
                 return
 
@@ -1747,7 +1747,7 @@ class RemnaWaveWebhookService:
         raw = meta.get('expiration', data.get('expiration'))
         try:
             hours = int(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.warning('Webhook user.expiration: некорректное meta.expiration', user_id=user.id, raw=raw)
             return
 

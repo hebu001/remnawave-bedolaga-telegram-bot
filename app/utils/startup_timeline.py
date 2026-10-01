@@ -65,7 +65,7 @@ class StepRecord:
 class StageHandle:
     def __init__(
         self,
-        timeline: 'StartupTimeline',
+        timeline: StartupTimeline,
         title: str,
         icon: str,
         success_message: str | None,

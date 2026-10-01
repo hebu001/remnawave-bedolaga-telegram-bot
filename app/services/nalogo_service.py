@@ -722,7 +722,7 @@ def _receipt_file_stem(receipt_uuid: str) -> str:
     pattern = str(getattr(settings, 'NALOGO_RECEIPT_FILENAME', '') or '').strip()
     try:
         stem = pattern.format(uuid=receipt_uuid) if pattern else ''
-    except (KeyError, IndexError, ValueError):
+    except KeyError, IndexError, ValueError:
         stem = ''
     stem = _RECEIPT_FILENAME_FORBIDDEN.sub('_', stem).strip(' ._')
     return stem or f'receipt_{receipt_uuid}'
@@ -784,7 +784,7 @@ async def _send_receipt_email(
 
 async def send_nalogo_receipt_notifications(
     bot: Any,
-    nalogo_service: 'NaloGoService | None',
+    nalogo_service: NaloGoService | None,
     receipt_uuid: str | None,
     amount_kopeks: int,
     telegram_user_id: int | None = None,

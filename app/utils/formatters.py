@@ -17,7 +17,7 @@ def _coerce_datetime(dt: datetime | str) -> datetime:
             return datetime.now(UTC)
         try:
             return datetime.fromisoformat(dt.replace('Z', '+00:00'))
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             return datetime.now(UTC)
     return dt
 
@@ -42,7 +42,7 @@ def format_time_ago(dt: datetime | str, language: str = 'ru') -> str:
         else:
             try:
                 dt = datetime.fromisoformat(dt.replace('Z', '+00:00'))
-            except (ValueError, AttributeError):
+            except ValueError, AttributeError:
                 dt = datetime.now(UTC)
 
     now = datetime.now(UTC)
@@ -212,7 +212,7 @@ def format_subscription_status(is_active: bool, is_trial: bool, end_date: dateti
     if isinstance(end_date, str):
         try:
             end_date = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             end_date = datetime.now(UTC)
 
     language_code = (language or 'ru').split('-')[0].lower()

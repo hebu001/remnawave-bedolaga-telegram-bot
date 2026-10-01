@@ -6,7 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database.local_date import as_date, local_date_expr
-from app.database.models import PaymentMethod, Transaction, TransactionType, User, WataPayment, YooKassaPayment
+from app.database.models import (
+    CasheraPayment,
+    PaymentMethod,
+    Transaction,
+    TransactionType,
+    User,
+    WataPayment,
+    YooKassaPayment,
+)
 from app.utils.timezone import local_day_bounds, local_day_start, local_month_start
 
 
@@ -35,8 +43,9 @@ REAL_PAYMENT_METHODS = [m.value for m in PaymentMethod if m.value not in _NON_GA
 def income_payments_query():
     """One row per received payment, never both its deposit and subscription debit.
 
-    WATA/YooKassa records also cover gifts and subpage purchases without a linked
-    transaction. Other gateways retain their existing transaction-based source.
+    WATA/YooKassa/Cashera records also cover gifts and direct purchases without a
+    linked transaction. Cashera recurring charges use the ledger: their charge
+    UUIDs have no CasheraPayment row. Other gateways retain their existing source.
     Old YooKassa records without captured_at use the completed ledger entry.
     """
     wata = select(
@@ -58,6 +67,34 @@ def income_payments_query():
             YooKassaPayment.currency == 'RUB',
         )
     )
+    cashera = (
+        select(
+            CasheraPayment.amount_kopeks.label('amount_kopeks'),
+            func.coalesce(CasheraPayment.paid_at, Transaction.completed_at).label('paid_at'),
+            literal(PaymentMethod.CASHERA.value).label('payment_method'),
+        )
+        .outerjoin(Transaction, Transaction.id == CasheraPayment.transaction_id)
+        .where(
+            CasheraPayment.is_paid.is_(True),
+            CasheraPayment.status == 'success',
+            CasheraPayment.currency == 'RUB',
+        )
+    )
+    # Cashera refunds retain the original successful receipt and write a separate
+    # refund ledger entry. This query reports gross receipts, like WATA/YooKassa;
+    # it neither invents a second payment nor treats the refund as new income.
+    cashera_receipt_exists = (
+        select(CasheraPayment.id)
+        .where(
+            or_(
+                CasheraPayment.transaction_id == Transaction.id,
+                CasheraPayment.cashera_uuid == Transaction.external_id,
+                CasheraPayment.order_id == Transaction.external_id,
+            )
+        )
+        .correlate(Transaction)
+        .exists()
+    )
     other_gateways = select(
         func.abs(Transaction.amount_kopeks).label('amount_kopeks'),
         func.coalesce(Transaction.completed_at, Transaction.created_at).label('paid_at'),
@@ -68,8 +105,9 @@ def income_payments_query():
         Transaction.payment_method.in_(
             [m for m in REAL_PAYMENT_METHODS if m not in (PaymentMethod.WATA.value, PaymentMethod.YOOKASSA.value)]
         ),
+        or_(Transaction.payment_method != PaymentMethod.CASHERA.value, ~cashera_receipt_exists),
     )
-    return union_all(wata, yookassa, other_gateways).subquery('income_payments')
+    return union_all(wata, yookassa, cashera, other_gateways).subquery('income_payments')
 
 
 async def get_income_total(db: AsyncSession, start_date: datetime, end_date: datetime) -> int:
@@ -595,6 +633,9 @@ async def create_unique_tribute_transaction(
     Returns ``(transaction, created)``. When ``created`` is False the payment was
     already processed (a replayed webhook) and the caller MUST NOT credit the balance
     again.
+
+    Без коммита (flush) — вызывающий коммитит транзакцию вместе с зачислением
+    и после коммита вызывает ``emit_transaction_side_effects``.
     """
     external_id = f'donation_{payment_id}'
 
@@ -630,5 +671,6 @@ async def create_unique_tribute_transaction(
         payment_method=PaymentMethod.TRIBUTE,
         external_id=external_id,
         is_completed=True,
+        commit=False,
     )
     return transaction, True

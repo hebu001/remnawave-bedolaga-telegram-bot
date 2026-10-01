@@ -342,7 +342,7 @@ def running_rechecks(result: dict) -> dict[str, dict]:
 def _age_sec(started_at: Any, now: datetime) -> float:
     try:
         started = datetime.fromisoformat(str(started_at))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return float('inf')
     if started.tzinfo is None:
         started = started.replace(tzinfo=UTC)

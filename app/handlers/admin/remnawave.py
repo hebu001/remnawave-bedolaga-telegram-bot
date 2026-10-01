@@ -351,7 +351,7 @@ async def paginate_migration_source(
 
     try:
         page = int(callback.data.split('_page_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer()
         return
 
@@ -478,7 +478,7 @@ async def paginate_migration_target(
 
     try:
         page = int(callback.data.split('_page_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer()
         return
 

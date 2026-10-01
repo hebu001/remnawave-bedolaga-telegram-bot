@@ -166,7 +166,7 @@ async def restore_merge_token(token: str, data: dict[str, Any]) -> bool:
             created_at = created_at.replace(tzinfo=UTC)
         elapsed = (datetime.now(UTC) - created_at).total_seconds()
         remaining_ttl = max(1, min(int(MERGE_TOKEN_TTL_SECONDS - elapsed), MERGE_TOKEN_TTL_SECONDS))
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         remaining_ttl = 60  # brief retry window — fail closed
 
     key = cache_key(MERGE_TOKEN_PREFIX, token)

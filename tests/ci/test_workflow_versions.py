@@ -14,6 +14,8 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import yaml
+
 
 WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / '.github' / 'workflows'
 
@@ -26,9 +28,9 @@ SHA_PINNED = re.compile(r'^[0-9a-f]{40}$')
 
 PYTHON_VERSION_RE = re.compile(r'python-version:\s*(?P<quote>["\']?)(?P<version>[^"\'\s]+)(?P=quote)')
 
-# Версия PostgreSQL в CI обязана совпадать с боевой из docker-compose:
-# именно на ней проверяются блокировки строк и ограничения схемы.
-POSTGRES_IMAGE_RE = re.compile(r'image:\s*(postgres:[\w.-]+)')
+# Версия PostgreSQL из docker-compose обязана быть среди версий CI: именно
+# на ней проверяются блокировки строк и ограничения схемы.
+MATRIX_POSTGRES = '${{ matrix.postgres }}'
 
 
 def _workflow_files() -> list[Path]:
@@ -97,25 +99,38 @@ def test_python_version_matches_pyproject() -> None:
     assert ci_version in requires.group(1), f'CI гоняет Python {ci_version}, а pyproject требует {requires.group(1)}'
 
 
-def test_postgres_image_matches_production_compose() -> None:
-    """Тестовая база должна быть той же версии, что и боевая.
+def _ci_postgres_versions() -> set[str]:
+    """Resolve native package and binary majors for every PostgreSQL CI variant.
 
-    Смысл тестов на PostgreSQL — проверить поведение конкретного движка.
-    Разъехавшиеся версии превращают их в проверку чего-то другого.
+    Installing a package without selecting its binaries would silently exercise
+    a different server. Require both, and fail when no PostgreSQL lab exists.
     """
-    ci_images = _collect(POSTGRES_IMAGE_RE, 1)
+    versions = set()
+    for path in _workflow_files():
+        workflow = yaml.safe_load(path.read_text(encoding='utf-8'))
+        for job in (workflow.get('jobs') or {}).values():
+            runs = '\n'.join(step.get('run', '') for step in job.get('steps', []))
+            if 'postgresql-' not in runs:
+                continue
+            if MATRIX_POSTGRES in runs:
+                entries = job['strategy']['matrix']['include']
+                variants = [runs.replace(MATRIX_POSTGRES, str(entry['postgres'])) for entry in entries]
+            else:
+                variants = [runs]
+            for variant in variants:
+                packages = set(re.findall(r'apt-get install[^\n]*\bpostgresql-(\d+)\b', variant))
+                binaries = set(re.findall(r'/usr/lib/postgresql/(\d+)/bin', variant))
+                assert packages and binaries, f'{path.name}: package and binary major must be explicit'
+                assert packages == binaries, f'{path.name}: packages {packages}, binaries {binaries}'
+                versions.update(packages)
+    assert versions, 'CI must install and select PostgreSQL binaries; coverage cannot be skipped'
+    return versions
 
+
+def test_postgres_image_matches_production_compose() -> None:
+    """The active database major must be covered, with additional CI majors allowed."""
+    ci_versions = _ci_postgres_versions()
     compose = (WORKFLOWS_DIR.parents[1] / 'docker-compose.yml').read_text(encoding='utf-8')
-    compose_images = set(re.findall(r'image:\s*(postgres:[\w.-]+)', compose))
-
-    if ci_images:
-        assert set(ci_images) == compose_images, f'в CI {sorted(ci_images)}, в docker-compose {sorted(compose_images)}'
-    else:
-        # Native Unix-only lab: compare the installed package AND selected
-        # executable major with production, without silently skipping coverage.
-        workflow = (WORKFLOWS_DIR / 'tests.yml').read_text(encoding='utf-8')
-        packages = set(re.findall(r'apt-get install[^\n]*\bpostgresql-(\d+)\b', workflow))
-        binaries = set(re.findall(r'/usr/lib/postgresql/(\d+)/bin', workflow))
-        production = {image.split(':')[1].split('-')[0].split('.')[0] for image in compose_images}
-        assert packages and binaries and production, 'версия PostgreSQL должна быть явно задана'
-        assert packages == binaries == production, f'пакеты {packages}, бинарники {binaries}, прод {production}'
+    production = set(re.findall(r'image:\s*postgres:(\d+)', compose))
+    assert production, 'в docker-compose.yml нет образа postgres'
+    assert production <= ci_versions, f'CI {sorted(ci_versions)}, compose {sorted(production)}'

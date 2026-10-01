@@ -46,7 +46,7 @@ def create_apple_iap_router(bot: Any = None) -> APIRouter:
 
         try:
             body = json.loads(raw_body.decode('utf-8'))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except UnicodeDecodeError, json.JSONDecodeError:
             return JSONResponse({'status': 'error', 'reason': 'invalid_json'}, status_code=400)
 
         signed_payload = body.get('signedPayload')

@@ -128,7 +128,7 @@ def get_status() -> dict[str, Any]:
 
     try:
         metadata = validate_p12(path.read_bytes(), settings.OVERPAY_P12_PASSPHRASE)
-    except (ValueError, OSError):
+    except ValueError, OSError:
         return status
 
     status.update(metadata)

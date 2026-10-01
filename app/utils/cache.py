@@ -509,7 +509,7 @@ class ChannelSubCache:
                 try:
                     parsed = json.loads(raw)
                     statuses[ch_id] = parsed == 1
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     statuses[ch_id] = None
         return statuses
 

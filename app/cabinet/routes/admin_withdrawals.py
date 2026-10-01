@@ -141,7 +141,7 @@ async def get_withdrawal_detail(
     if withdrawal.risk_analysis:
         try:
             risk_analysis = json.loads(withdrawal.risk_analysis)
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     # Get referral stats

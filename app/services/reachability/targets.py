@@ -84,7 +84,7 @@ def _port(value: str | int | None) -> int | None:
         return None
     try:
         port = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise TargetValidationError(f'Порт «{value}» не число') from None
     if not 1 <= port <= 65535:
         raise TargetValidationError(f'Порт {port} вне диапазона 1–65535')

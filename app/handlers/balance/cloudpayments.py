@@ -280,7 +280,7 @@ async def process_cloudpayments_amount(
         amount_text = message.text.strip().replace(',', '.').replace(' ', '')
         amount_rub = float(amount_text)
         amount_kopeks = int(amount_rub * 100)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(
             texts.t('INVALID_AMOUNT', 'Введите корректную сумму числом'),
             parse_mode='HTML',

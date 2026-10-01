@@ -88,7 +88,7 @@ def _normalize_periods_dict(raw: dict | None) -> dict[int, int]:
         try:
             period = int(key)
             percent = int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
 
         normalized[period] = max(0, min(100, percent))
@@ -646,7 +646,7 @@ async def process_create_group_priority(message: types.Message, state: FSMContex
         priority = int(message.text)
         if priority < 0:
             raise ValueError
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(
             texts.t(
                 'ADMIN_PROMO_GROUP_INVALID_PRIORITY',
@@ -669,7 +669,7 @@ async def process_create_group_traffic(message: types.Message, state: FSMContext
     texts = get_texts((await state.get_data()).get('language', 'ru'))
     try:
         value = _validate_percent(message.text)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(texts.t('ADMIN_PROMO_GROUP_INVALID_PERCENT', 'Введите число от 0 до 100.'))
         return
 
@@ -687,7 +687,7 @@ async def process_create_group_servers(message: types.Message, state: FSMContext
     texts = get_texts((await state.get_data()).get('language', 'ru'))
     try:
         value = _validate_percent(message.text)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(texts.t('ADMIN_PROMO_GROUP_INVALID_PERCENT', 'Введите число от 0 до 100.'))
         return
 
@@ -714,7 +714,7 @@ async def process_create_group_devices(
 
     try:
         devices_discount = _validate_percent(message.text)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(texts.t('ADMIN_PROMO_GROUP_INVALID_PERCENT', 'Введите число от 0 до 100.'))
         return
 
@@ -971,7 +971,7 @@ async def process_edit_group_priority(
         priority = int(message.text)
         if priority < 0:
             raise ValueError
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(
             texts.t(
                 'ADMIN_PROMO_GROUP_INVALID_PRIORITY',
@@ -1011,7 +1011,7 @@ async def process_edit_group_traffic(
 
     try:
         value = _validate_percent(message.text)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(texts.t('ADMIN_PROMO_GROUP_INVALID_PERCENT', 'Введите число от 0 до 100.'))
         return
 
@@ -1046,7 +1046,7 @@ async def process_edit_group_servers(
 
     try:
         value = _validate_percent(message.text)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(texts.t('ADMIN_PROMO_GROUP_INVALID_PERCENT', 'Введите число от 0 до 100.'))
         return
 
@@ -1081,7 +1081,7 @@ async def process_edit_group_devices(
 
     try:
         devices_discount = _validate_percent(message.text)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(texts.t('ADMIN_PROMO_GROUP_INVALID_PERCENT', 'Введите число от 0 до 100.'))
         return
 

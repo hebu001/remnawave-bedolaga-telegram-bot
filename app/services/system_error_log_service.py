@@ -246,7 +246,7 @@ class SystemErrorLogService:
         raw_user_id = event_dict.get('user_id')
         try:
             user_id = int(raw_user_id) if raw_user_id is not None else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             user_id = None
 
         return {

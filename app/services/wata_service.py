@@ -66,7 +66,7 @@ class WataService:
         if retry_after:
             try:
                 return float(retry_after)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 pass
 
         match = re.search(r'[Rr]etry after (\d+)', response_text)
@@ -165,7 +165,7 @@ class WataService:
             if parsed.tzinfo is None:
                 return parsed.replace(tzinfo=UTC)
             return parsed.astimezone(UTC)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             logger.debug('Failed to parse WATA datetime', raw=raw)
             return None
 

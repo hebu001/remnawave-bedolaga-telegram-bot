@@ -158,7 +158,7 @@ class MulenPayPaymentMixin:
             if mulen_payment_id_raw is not None:
                 try:
                     mulen_payment_id_int = int(mulen_payment_id_raw)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     mulen_payment_id_int = None
             amount_value = callback_data.get('amount')
             logger.debug(

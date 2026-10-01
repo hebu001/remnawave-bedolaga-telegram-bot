@@ -131,7 +131,7 @@ class SeverPayPaymentMixin:
             if expire_at_raw:
                 try:
                     expires_at = datetime.fromtimestamp(int(expire_at_raw), tz=UTC)
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     pass
 
             # Сохраняем в БД

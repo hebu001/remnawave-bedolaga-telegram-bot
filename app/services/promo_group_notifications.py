@@ -45,7 +45,7 @@ def collect_promo_group_discounts(group: PromoGroup) -> PromoGroupDiscounts:
     for key in raw:
         try:
             days = int(key)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         percent = group.get_discount_percent('period', days)
         if percent > 0:

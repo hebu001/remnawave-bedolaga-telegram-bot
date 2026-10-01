@@ -44,6 +44,8 @@ from app.database.models import (
     ButtonClickLog,
     CabinetRefreshToken,
     CabinetWsTicket,
+    CasheraPayment,
+    CasheraSubscription,
     CisPayPayment,
     CloudPaymentsPayment,
     ContestAttempt,
@@ -54,6 +56,7 @@ from app.database.models import (
     CryptoBotPayment,
     DiscountOffer,
     DonutPayment,
+    DpiCheckerAction,
     EmailQueueItem,
     EmailTemplate,
     EtoplatezhiPayment,
@@ -300,6 +303,7 @@ class BackupService:
             DonutPayment,
             LavaPayment,
             CisPayPayment,
+            CasheraPayment,
             TabPayPayment,
             ParityPayPayment,
             AppleIAPAccount,
@@ -372,6 +376,7 @@ class BackupService:
             # Durable custom and upstream state must survive ORM backup/restore too.
             PlategaSubscription,
             LavaSubscription,
+            CasheraSubscription,
             GraceAccessSessionModel,
             SubpageInvoice,
             RenewalSyncTask,
@@ -387,6 +392,7 @@ class BackupService:
             ReachabilityJob,
             ReachabilityLeg,
             ReachabilityTargetPref,
+            DpiCheckerAction,
             UserReminder,
             UserReminderState,
         ]
@@ -1573,7 +1579,7 @@ class BackupService:
                 if isinstance(value, str) and value.strip():
                     try:
                         processed_data[key] = json_lib.loads(value)
-                    except (ValueError, TypeError):
+                    except ValueError, TypeError:
                         processed_data[key] = value
                 elif isinstance(value, (list, dict)):
                     processed_data[key] = value
@@ -1828,6 +1834,9 @@ class BackupService:
             'tabpay_payments',
             'paritypay_payments',
             'cispay_payments',
+            'cashera_payments',
+            'cashera_subscriptions',
+            'dpichecker_actions',
             'donut_payments',
             'jupiter_payments',
             'lava_payments',
@@ -2101,7 +2110,7 @@ class BackupService:
             if set(summary) != {'timestamp', 'tables_count', 'total_records', 'created_by', 'database_type', 'version'}:
                 return None
             return self._listing_metadata(summary)
-        except (OSError, ValueError, UnicodeDecodeError):
+        except OSError, ValueError, UnicodeDecodeError:
             return None
 
     def _write_backup_sidecar_sync(self, backup_file: Path, identity: dict, metadata: dict) -> None:

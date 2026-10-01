@@ -8,7 +8,7 @@ import pytest
 
 from app.cabinet.routes import admin_sales_stats, admin_stats
 from app.database.crud.transaction import get_income_total, get_revenue_by_period, get_transactions_statistics
-from app.database.models import GuestPurchase, Transaction, User, WataPayment, YooKassaPayment
+from app.database.models import CasheraPayment, GuestPurchase, Transaction, User, WataPayment, YooKassaPayment
 from app.utils.timezone import local_month_start
 from tests.fixtures.local_day import reset_local_timezone_cache, use_timezone  # noqa: F401
 from tests.fixtures.postgres_db import postgres_session
@@ -21,6 +21,7 @@ TABLES = [
     Transaction.__table__,
     WataPayment.__table__,
     YooKassaPayment.__table__,
+    CasheraPayment.__table__,
     GuestPurchase.__table__,
 ]
 
@@ -155,3 +156,105 @@ async def test_sales_preserves_other_gateway_gift_fallback(postgres_database, mo
             days=None, start_date=start.isoformat(), end_date=now.isoformat(), admin=ADMIN, db=db
         )
         assert sales.total_revenue_kopeks == 7000
+
+
+@pytest.mark.asyncio
+async def test_cashera_gift_receipt_and_recurring_share_income_source_without_sales_fallback_double_count(
+    postgres_database,
+    monkeypatch,
+    reset_local_timezone_cache,
+):
+    use_timezone(monkeypatch, 'Europe/Moscow')
+    now = datetime.now(UTC)
+    start = local_month_start(now)
+    async with postgres_session(postgres_database, TABLES) as db:
+        user = User(telegram_id=90001, first_name='Synthetic Cashera payer')
+        db.add(user)
+        await db.flush()
+        topup = Transaction(
+            user_id=user.id,
+            type='deposit',
+            amount_kopeks=30000,
+            payment_method='cashera',
+            external_id='synthetic-one-time',
+            is_completed=True,
+            created_at=now,
+            completed_at=now,
+        )
+        db.add(topup)
+        await db.flush()
+        db.add_all(
+            [
+                CasheraPayment(
+                    user_id=user.id,
+                    order_id='synthetic-one-time',
+                    cashera_uuid='cashera-one-time',
+                    amount_kopeks=30000,
+                    status='success',
+                    is_paid=True,
+                    paid_at=now,
+                    transaction_id=topup.id,
+                ),
+                Transaction(
+                    user_id=user.id,
+                    type='subscription_payment',
+                    amount_kopeks=-30000,
+                    payment_method='cashera',
+                    external_id='cashera-one-time',
+                    is_completed=True,
+                    created_at=now,
+                    completed_at=now,
+                ),
+                CasheraPayment(
+                    order_id='synthetic-gift',
+                    cashera_uuid='cashera-direct-gift',
+                    amount_kopeks=22000,
+                    status='success',
+                    is_paid=True,
+                    paid_at=now,
+                ),
+                GuestPurchase(
+                    token='c' * 64,
+                    contact_type='telegram',
+                    contact_value='synthetic',
+                    period_days=30,
+                    amount_kopeks=22000,
+                    is_gift=True,
+                    status='paid',
+                    paid_at=now,
+                    payment_method='cashera',
+                ),
+                Transaction(
+                    user_id=user.id,
+                    type='subscription_payment',
+                    amount_kopeks=-40000,
+                    payment_method='cashera',
+                    external_id='cashera-recurring-only',
+                    is_completed=True,
+                    created_at=now,
+                    completed_at=now,
+                ),
+                CasheraPayment(
+                    order_id='synthetic-unpaid',
+                    amount_kopeks=99900,
+                    status='pending',
+                    is_paid=False,
+                    paid_at=now,
+                ),
+            ]
+        )
+        await db.commit()
+        expected = 30000 + 22000 + 40000
+        stats = await get_transactions_statistics(db, start, now)
+        assert stats['totals']['income_kopeks'] == expected
+        assert stats['by_payment_method'] == {'cashera': {'count': 3, 'amount': expected}}
+        recent = await admin_stats.get_recent_payments(limit=50, admin=ADMIN, db=db)
+        assert recent.total_today_kopeks == expected
+        sales = await admin_sales_stats.get_sales_summary(
+            days=None,
+            start_date=start.isoformat(),
+            end_date=now.isoformat(),
+            admin=ADMIN,
+            db=db,
+        )
+        assert sales.total_revenue_kopeks == expected

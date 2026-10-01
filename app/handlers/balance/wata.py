@@ -260,7 +260,7 @@ async def check_wata_payment_status(
 ):
     try:
         local_payment_id = int(callback.data.split('_')[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Некорректный идентификатор платежа', show_alert=True)
         return
 

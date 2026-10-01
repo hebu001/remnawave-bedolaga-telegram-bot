@@ -3,7 +3,9 @@
 `tests/baseline/custom-contracts.json` selects the existing fork regressions and
 their adjacent external contracts. The original reference is
 `4b06edcdce26850c03ca474e8d195ef94ddb347e`; the integration target is the pinned
-upstream `877690a7` (v4.15.0). No upstream merge is required to run the baseline.
+upstream `877690a7` (v4.15.0). Those provenance references remain historical.
+The current integration target is pinned upstream `5bda3c56` (v5.0.0) on Python
+3.14; test deployment keeps PostgreSQL 15 and CI also covers PostgreSQL 18.
 
 The five groups cover:
 
@@ -26,18 +28,18 @@ output. The runner records their source SHA256 alongside test results.
 
 ## Reproduce
 
-Use a checkout without `.env` and Python 3.13. Dependencies come from the existing
+Use a checkout without `.env` and Python 3.14. Dependencies come from the existing
 frozen lockfile. The merged upstream dependencies include greenlet for
 SQLAlchemy asyncio on this macOS environment:
 
 ```sh
-uv sync --frozen --dev --python 3.13
+uv sync --frozen --dev --python 3.14
 .venv/bin/python tests/baseline/run.py \
   --pg-bin /absolute/path/to/postgresql/bin \
   --output /tmp/custom-baseline-new-run
 ```
 
-The PostgreSQL build used for the first run is 15.13, matching the major
+The PostgreSQL build used for the historical first run is 15.13, matching the major
 version of the test bot's database. The historical phase-1 greenlet overlay is
 no longer needed with the pinned v4.15.0 lockfile.
 
@@ -119,10 +121,10 @@ coordinated snapshot and rehearsed recovery procedure.
 
 ## CI portability and bounded runs
 
-The GitHub Tests job installs PostgreSQL 15 binaries from the signed official
+The GitHub Tests job installs PostgreSQL 15 and 18 binaries in separate matrix jobs from the signed official
 PGDG repository on an ephemeral Ubuntu 24.04 runner. It disables automatic
 system-cluster creation and never starts a Docker/TCP database service. Both
-`--suite postgres` and `--suite full` use this harness, creating a fresh private
+`--suite postgres` and `--suite full` run on each matrix major using this harness, creating a fresh private
 Unix-only cluster under canonical `/tmp` for each step. Canonical `/tmp` resolves
 to `/private/tmp` on macOS; bridge fixtures and the local-only bridge CLI require
 a direct `bot-custom-pg-*` child under that canonical root. Their URL, username,
@@ -137,7 +139,7 @@ An always-run artifact step retains results, identities and diagnostic logs.
 These limits do not change test assertions or excuse incomplete coverage.
 
 The same mandatory commands are available through Make, with an explicit local
-PostgreSQL 15 binary directory and a new output directory for each invocation:
+PostgreSQL 15 or 18 binary directory and a new output directory for each invocation:
 
 ```sh
 make test-postgres PG_BIN=/absolute/path/to/postgresql15/bin TEST_OUTPUT=/tmp/pg-proof-new

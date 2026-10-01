@@ -122,7 +122,7 @@ class QuestButtonsStrategy(BaseGameStrategy):
                 is_correct = secret_idx is not None and idx == secret_idx
             else:
                 is_correct = False
-        except (ValueError, IndexError):
+        except ValueError, IndexError:
             is_correct = False
 
         responses = ['Пусто', 'Ложный сервер', 'Найди другой узел']
@@ -186,7 +186,7 @@ class LockHackStrategy(BaseGameStrategy):
                 is_correct = secret_idx is not None and idx == secret_idx
             else:
                 is_correct = False
-        except (ValueError, IndexError):
+        except ValueError, IndexError:
             is_correct = False
 
         responses = ['Заблокировано', 'Попробуй ещё', 'Нет доступа']

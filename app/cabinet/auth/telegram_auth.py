@@ -60,7 +60,7 @@ def validate_telegram_login_widget(data: dict[str, Any], max_age_seconds: int = 
                 'Telegram widget auth accepted with stale auth_date',
                 age_hours=round(age / 3600, 1),
             )
-    except (ValueError, TypeError, OSError):
+    except ValueError, TypeError, OSError:
         return False
 
     # Build data-check-string (sorted key=value pairs, newline-separated)
@@ -117,7 +117,7 @@ def validate_telegram_init_data(init_data: str, max_age_seconds: int = 86400) ->
                     'Telegram initData accepted with stale auth_date (Telegram caching bug)',
                     age_hours=round(age / 3600, 1),
                 )
-        except (ValueError, TypeError, OSError):
+        except ValueError, TypeError, OSError:
             return None
 
         # Build data-check-string
@@ -142,7 +142,7 @@ def validate_telegram_init_data(init_data: str, max_age_seconds: int = 86400) ->
 
         return parsed
 
-    except (ValueError, TypeError, json.JSONDecodeError):
+    except ValueError, TypeError, json.JSONDecodeError:
         return None
 
 

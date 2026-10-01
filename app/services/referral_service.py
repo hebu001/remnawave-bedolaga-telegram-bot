@@ -252,7 +252,7 @@ async def attach_referrer_if_missing(
         if pending and pending.get('referrer_id'):
             try:
                 pending_referrer_id = int(pending['referrer_id'])
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 pending_referrer_id = None
             if pending_referrer_id is not None:
                 referrer = await get_user_by_id(db, pending_referrer_id)

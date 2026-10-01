@@ -24,7 +24,7 @@ from app.services.subscription_auto_purchase_service import resume_addon_cart
 def _price_kopeks(cart_data: dict) -> int:
     try:
         return int(cart_data.get('price_kopeks') or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 

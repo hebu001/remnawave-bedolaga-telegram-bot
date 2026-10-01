@@ -50,7 +50,7 @@ class HeleketPaymentMixin:
                 rounded = int(round(markup_percent))
                 if rounded != 0:
                     discount_percent = -rounded
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 logger.warning('Некорректная наценка Heleket', markup_percent=markup_percent)
 
         payload: dict[str, Any] = {
@@ -116,13 +116,13 @@ class HeleketPaymentMixin:
 
         try:
             exchange_rate_value = float(exchange_rate) if exchange_rate is not None else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             exchange_rate_value = None
 
         if exchange_rate_value is None and payer_amount:
             try:
                 exchange_rate_value = float(payer_amount) / amount_rubles if amount_rubles else None
-            except (TypeError, ValueError, ZeroDivisionError):
+            except TypeError, ValueError, ZeroDivisionError:
                 exchange_rate_value = None
 
         expires_at_raw = payment_result.get('expired_at')
@@ -130,7 +130,7 @@ class HeleketPaymentMixin:
         if expires_at_raw:
             try:
                 expires_at = datetime.fromtimestamp(int(expires_at_raw), tz=UTC)
-            except (TypeError, ValueError, OSError):
+            except TypeError, ValueError, OSError:
                 expires_at = None
 
         heleket_crud = import_module('app.database.crud.heleket')
@@ -210,13 +210,13 @@ class HeleketPaymentMixin:
         if exchange_rate_raw is not None:
             try:
                 exchange_rate = float(exchange_rate_raw)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 exchange_rate = None
 
         if exchange_rate is None and payer_amount:
             try:
                 exchange_rate = float(payer_amount) / payment.amount_float if payment.amount_float else None
-            except (TypeError, ValueError, ZeroDivisionError):
+            except TypeError, ValueError, ZeroDivisionError:
                 exchange_rate = None
 
         paid_at: datetime | None = None
@@ -227,7 +227,7 @@ class HeleketPaymentMixin:
                     paid_at = datetime.fromtimestamp(float(paid_at_raw), tz=UTC)
                 else:
                     paid_at = datetime.fromisoformat(str(paid_at_raw).replace('Z', '+00:00'))
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 paid_at = None
 
         if paid_at and paid_at.tzinfo is not None:

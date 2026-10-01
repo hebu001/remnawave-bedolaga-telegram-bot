@@ -47,7 +47,7 @@ def verify_password(password: str, password_hash: str) -> bool:
         password_bytes = validate_password_bytes(password).encode('utf-8')
         hash_bytes = password_hash.encode('utf-8')
         return bcrypt.checkpw(password_bytes, hash_bytes)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return False
 
 
@@ -61,6 +61,6 @@ async def verify_password_async(password: str, password_hash: str) -> bool:
     """Verify outside the event loop without accepting oversized bcrypt input."""
     try:
         validate_password_bytes(password)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return False
     return await password_executor.run(verify_password, password, password_hash)

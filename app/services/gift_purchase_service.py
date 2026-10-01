@@ -253,6 +253,9 @@ async def list_gift_offers(db: AsyncSession, buyer: User | None = None) -> list[
     if not await is_gift_enabled(db):
         return []
 
+    from app.utils.pricing_utils import ensure_user_promo_groups_loaded
+
+    await ensure_user_promo_groups_loaded(db, buyer)
     result = await db.execute(
         select(Tariff)
         .where(Tariff.is_active.is_(True), Tariff.show_in_gift.is_(True))
@@ -307,6 +310,9 @@ async def quote_gift_purchase(
     if not await is_gift_enabled(db):
         raise GiftFeatureDisabledError('Gift feature is not enabled')
 
+    from app.utils.pricing_utils import ensure_user_promo_groups_loaded
+
+    await ensure_user_promo_groups_loaded(db, buyer)
     tariff = await get_tariff_by_id(db, tariff_id)
     if tariff is None or not tariff.is_active or not tariff.show_in_gift:
         raise GiftTariffUnavailableError('Tariff not found or inactive')

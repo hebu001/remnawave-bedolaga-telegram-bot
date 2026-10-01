@@ -27,7 +27,7 @@ def limit_for(tariff: Tariff, squad_uuid: str) -> int:
         raw = raw.get('traffic_limit_gb')
     try:
         return max(0, int(raw or 0))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 

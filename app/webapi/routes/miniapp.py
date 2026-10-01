@@ -270,7 +270,7 @@ def _normalize_autopay_days(value: Any | None) -> int | None:
         return None
     try:
         numeric = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return numeric if numeric >= 0 else None
 
@@ -376,7 +376,7 @@ def _current_request_timestamp() -> str:
 def _compute_stars_min_amount() -> int | None:
     try:
         rate = Decimal(str(settings.get_stars_rate()))
-    except (InvalidOperation, TypeError):
+    except InvalidOperation, TypeError:
         return None
 
     if rate <= 0:
@@ -388,7 +388,7 @@ def _compute_stars_min_amount() -> int | None:
 def _normalize_stars_amount(amount_kopeks: int) -> tuple[int, int]:
     try:
         rate = Decimal(str(settings.get_stars_rate()))
-    except (InvalidOperation, TypeError):
+    except InvalidOperation, TypeError:
         raise ValueError('Stars rate is not configured')
 
     if rate <= 0:
@@ -455,13 +455,13 @@ def _parse_client_timestamp(value: str | float | None) -> datetime | None:
     if isinstance(value, (int, float)):
         try:
             timestamp = float(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         if timestamp > 1e12:
             timestamp /= 1000.0
         try:
             return datetime.fromtimestamp(timestamp, tz=UTC)
-        except (OverflowError, OSError, ValueError):
+        except OverflowError, OSError, ValueError:
             return None
     if isinstance(value, str):
         normalized = value.strip()
@@ -551,7 +551,7 @@ def _format_gb(value: float | None) -> float:
         return 0.0
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0.0
 
 
@@ -597,7 +597,7 @@ async def _resolve_user_from_init_data(
 
     try:
         telegram_id = int(telegram_user['id'])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail='Invalid Telegram user identifier',
@@ -628,7 +628,7 @@ def _normalize_amount_kopeks(
     if amount_kopeks is not None:
         try:
             normalized = int(amount_kopeks)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return normalized if normalized >= 0 else None
 
@@ -637,7 +637,7 @@ def _normalize_amount_kopeks(
 
     try:
         decimal_amount = Decimal(str(amount_rubles)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError):
+    except InvalidOperation, ValueError:
         return None
 
     normalized = int((decimal_amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
@@ -1101,7 +1101,7 @@ async def create_payment_link(
         method_option = payload.payment_option or str(active_methods[0])
         try:
             method_code = int(str(method_option).strip())
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Invalid Platega payment option')
 
         if method_code not in active_methods:
@@ -1266,7 +1266,7 @@ async def create_payment_link(
                     Decimal('0.01'), rounding=ROUND_HALF_UP
                 )
             )
-        except (InvalidOperation, ValueError):
+        except InvalidOperation, ValueError:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 detail='Unable to convert amount to USD',
@@ -1998,7 +1998,7 @@ async def _resolve_cryptobot_payment_status(
     amount_kopeks = None
     try:
         amount_kopeks = int(Decimal(payment.amount) * Decimal(100))
-    except (InvalidOperation, TypeError):
+    except InvalidOperation, TypeError:
         amount_kopeks = None
 
     descriptor = decode_payment_payload(getattr(payment, 'payload', '') or '', expected_user_id=user.id)
@@ -2327,7 +2327,7 @@ def _extract_template_id(notification_type: str | None) -> int | None:
 
     try:
         return int(match.group('template_id'))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -2402,7 +2402,7 @@ def _format_offer_message(
     discount_percent = getattr(offer, 'discount_percent', None)
     try:
         discount_percent = int(discount_percent)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         discount_percent = None
 
     replacements: dict[str, Any] = {}
@@ -2456,7 +2456,7 @@ def _extract_offer_duration_hours(
             return None
         hours = int(float(source))
         return hours if hours > 0 else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -2598,7 +2598,7 @@ async def _build_promo_offer_models(
         discount_percent = getattr(offer, 'discount_percent', 0)
         try:
             discount_percent = int(discount_percent)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             discount_percent = 0
 
         extra = _extract_offer_extra(offer)
@@ -2675,7 +2675,7 @@ async def _build_promo_offer_models(
             if (discount_value is None or discount_value <= 0) and effect_type != 'test_access':
                 try:
                     discount_value = int(getattr(active_offer_record, 'discount_percent', 0) or 0)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     discount_value = 0
             if discount_value is None:
                 discount_value = 0
@@ -3136,7 +3136,7 @@ async def get_subscription_details(
 
     try:
         telegram_id = int(telegram_user['id'])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Invalid Telegram user identifier',
@@ -3249,7 +3249,7 @@ async def get_subscription_details(
     active_discount_percent = 0
     try:
         active_discount_percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         active_discount_percent = 0
 
     active_discount_expires_at = getattr(user, 'promo_offer_discount_expires_at', None)
@@ -4146,7 +4146,7 @@ async def activate_promo_code(
 
     try:
         telegram_id = int(telegram_user['id'])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'invalid_user', 'message': 'Invalid Telegram user identifier'},
@@ -4184,12 +4184,12 @@ async def activate_promo_code(
 
         try:
             balance_bonus = int(promocode_data.get('balance_bonus_kopeks') or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             balance_bonus = 0
 
         try:
             subscription_days = int(promocode_data.get('subscription_days') or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             subscription_days = 0
 
         promo_payload = MiniAppPromoCode(
@@ -4280,7 +4280,7 @@ async def claim_promo_offer(
 
     try:
         telegram_id = int(telegram_user['id'])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'invalid_user', 'message': 'Invalid Telegram user identifier'},
@@ -4367,7 +4367,7 @@ async def claim_promo_offer(
     if raw_duration in (None, '') and template_id:
         try:
             template = await get_promo_offer_template_by_id(db, int(template_id))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             template = None
         if template and template.active_discount_hours:
             raw_duration = template.active_discount_hours
@@ -4376,7 +4376,7 @@ async def claim_promo_offer(
 
     try:
         duration_hours = int(raw_duration) if raw_duration is not None else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         duration_hours = None
 
     if duration_hours and duration_hours > 0:
@@ -4425,7 +4425,7 @@ async def remove_connected_device(
 
     try:
         telegram_id = int(telegram_user['id'])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'invalid_user', 'message': 'Invalid Telegram user identifier'},
@@ -4490,7 +4490,7 @@ async def remove_connected_device(
 def _safe_int(value: Any) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -4503,7 +4503,7 @@ def _normalize_period_discounts(raw: dict[Any, Any] | None) -> dict[str, int]:
         try:
             period = int(key)
             normalized[str(period)] = int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
 
     return normalized
@@ -4658,7 +4658,7 @@ def _parse_period_identifier(identifier: str | None) -> int | None:
 
     try:
         return int(match.group(1))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -4800,7 +4800,7 @@ def _validate_subscription_id(
 
     try:
         requested = int(requested_id)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={
@@ -4846,7 +4846,7 @@ async def _authorize_miniapp_user(
 
     try:
         telegram_id = int(telegram_user['id'])
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'invalid_user', 'message': 'Invalid Telegram user identifier'},
@@ -5103,7 +5103,7 @@ async def _build_subscription_settings(
                 continue
             try:
                 gb_value = int(package.get('gb'))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
 
             price = int(package.get('price') or 0)
@@ -6000,7 +6000,7 @@ async def update_subscription_traffic_endpoint(
 
     try:
         new_traffic = int(raw_value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'validation_error', 'message': 'Invalid traffic amount'},
@@ -6030,7 +6030,7 @@ async def update_subscription_traffic_endpoint(
     for package in settings.get_traffic_packages():
         try:
             gb_value = int(package.get('gb'))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         is_enabled = bool(package.get('enabled', True))
         if package.get('is_active') is False:
@@ -6156,7 +6156,7 @@ async def update_subscription_devices_endpoint(
 
     try:
         new_devices = int(raw_value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'validation_error', 'message': 'Invalid device limit'},
@@ -6825,7 +6825,7 @@ async def purchase_tariff_endpoint(
             subscription.end_date = datetime.now(UTC) + timedelta(days=1)
 
         await db.commit()
-    except (Exception, asyncio.CancelledError):
+    except Exception, asyncio.CancelledError:
         await db.rollback()
         raise
 

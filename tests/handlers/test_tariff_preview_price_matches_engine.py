@@ -21,6 +21,7 @@ from app.database.models import (
     SubscriptionStatus,
     Tariff,
     User,
+    UserPromoGroup,
     UserStatus,
     tariff_promo_groups,
 )
@@ -32,6 +33,7 @@ TABLES = (
     Subscription.__table__,
     Tariff.__table__,
     PromoGroup.__table__,
+    UserPromoGroup.__table__,
     tariff_promo_groups,
 )
 

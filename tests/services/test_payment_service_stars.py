@@ -52,17 +52,17 @@ def _make_service(bot: DummyBot | None) -> PaymentService:
 class DummySession:
     """Минимальная заглушка AsyncSession для проверки сценариев Stars."""
 
-    def __init__(self, pending_subscription: 'DummySubscription') -> None:
+    def __init__(self, pending_subscription: DummySubscription) -> None:
         self.pending_subscription = pending_subscription
         self.commits: int = 0
         self.refreshed: list[Any] = []
 
     async def execute(self, *_args: Any, **_kwargs: Any) -> Any:
         class _Result:
-            def __init__(self, subscription: 'DummySubscription') -> None:
+            def __init__(self, subscription: DummySubscription) -> None:
                 self._subscription = subscription
 
-            def scalar_one_or_none(self) -> 'DummySubscription':
+            def scalar_one_or_none(self) -> DummySubscription:
                 return self._subscription
 
         return _Result(self.pending_subscription)

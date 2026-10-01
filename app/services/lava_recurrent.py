@@ -58,7 +58,7 @@ def resolve_product_charge_days(product: dict | None) -> int:
     raw_days = product.get('periodDays')
     try:
         days = int(raw_days) if raw_days is not None else 0
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         days = 0
     if days > 0:
         return days

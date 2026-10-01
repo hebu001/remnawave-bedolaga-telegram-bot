@@ -68,7 +68,7 @@ async def _build_promo_group_discount_text(
         for key in raw_period_discounts.keys():
             try:
                 period_candidates.add(int(key))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
 
     for period_days in sorted(period_candidates):
@@ -112,7 +112,7 @@ async def claim_discount_offer(
 
     try:
         offer_id = int(callback.data.split('_')[-1])
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         await callback.answer(
             texts.get('DISCOUNT_CLAIM_NOT_FOUND', '❌ Предложение не найдено'),
             show_alert=True,
@@ -234,14 +234,14 @@ async def claim_discount_offer(
     if raw_duration in (None, '') and template_id:
         try:
             template = await get_promo_offer_template_by_id(db, int(template_id))
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             template = None
         if template and template.active_discount_hours:
             raw_duration = template.active_discount_hours
 
     try:
         duration_hours = int(raw_duration) if raw_duration is not None else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         duration_hours = None
 
     if duration_hours and duration_hours > 0:
@@ -280,7 +280,7 @@ async def claim_discount_offer(
         format_values.setdefault('expires_at_iso', discount_expires_at.isoformat())
         try:
             expires_timestamp = int(discount_expires_at.timestamp())
-        except (OverflowError, OSError, ValueError):
+        except OverflowError, OSError, ValueError:
             expires_timestamp = None
         if expires_timestamp:
             format_values.setdefault('expires_at_ts', expires_timestamp)
@@ -309,7 +309,7 @@ async def claim_discount_offer(
                 maybe_amount = extra_data.get(key)
                 try:
                     amount_value = int(maybe_amount)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
                 if amount_value > 0:
                     amount_text = settings.format_price(amount_value)
@@ -327,7 +327,7 @@ async def claim_discount_offer(
     if not amount_text:
         try:
             bonus_amount = int(getattr(offer, 'bonus_amount_kopeks', 0))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             bonus_amount = 0
         if bonus_amount > 0:
             amount_text = settings.format_price(bonus_amount)

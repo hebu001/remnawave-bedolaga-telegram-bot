@@ -393,7 +393,7 @@ class FreekassaPaymentMixin:
                         display_name = settings.get_freekassa_sbp_display_name_html()
                     elif pm == 'freekassa_card':
                         display_name = settings.get_freekassa_card_display_name_html()
-                except (json.JSONDecodeError, AttributeError, TypeError):
+                except json.JSONDecodeError, AttributeError, TypeError:
                     pass
                 await self.bot.send_message(
                     user.telegram_id,

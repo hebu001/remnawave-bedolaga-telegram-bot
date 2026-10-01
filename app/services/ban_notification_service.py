@@ -27,7 +27,7 @@ def _format_notification_template(template: str, fallback: str, **values: object
     """Format an editable template and fall back safely when its placeholders are invalid."""
     try:
         return template.format(**values)
-    except (IndexError, KeyError, ValueError):
+    except IndexError, KeyError, ValueError:
         logger.exception('Некорректный шаблон ban-уведомления, использован резервный')
         return fallback.format(**values)
 

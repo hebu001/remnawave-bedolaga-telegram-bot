@@ -232,7 +232,7 @@ class JupiterPaymentMixin:
                 if received_value is not None:
                     try:
                         received_kopeks = round(float(received_value) * 100)
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         received_kopeks = None
                     if received_kopeks is not None and abs(received_kopeks - payment.amount_kopeks) > 1:
                         logger.error(

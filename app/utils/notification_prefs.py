@@ -43,7 +43,7 @@ def get_subscription_expiry_days(user: User) -> int:
     value = get_user_notification_pref(user, 'subscription_expiry_days')
     try:
         return max(1, int(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 3
 
 
@@ -57,7 +57,7 @@ def get_traffic_warning_percent(user: User) -> int:
     value = get_user_notification_pref(user, 'traffic_warning_percent')
     try:
         return max(50, min(99, int(value)))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 80
 
 
@@ -71,7 +71,7 @@ def get_balance_low_threshold(user: User) -> int:
     value = get_user_notification_pref(user, 'balance_low_threshold')
     try:
         return max(0, int(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 100
 
 

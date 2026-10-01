@@ -122,12 +122,12 @@ class _PanelIdMapMutation:
 
     __slots__ = ('_map_original', '_user_original', 'id_map')
 
-    def __init__(self, id_map: dict[int, 'User']):
+    def __init__(self, id_map: dict[int, User]):
         self.id_map = id_map
         self._map_original: dict[int, Any] = {}
         self._user_original: dict[User, tuple[Any, Any]] = {}
 
-    def _capture_user_state(self, user: Optional['User']) -> None:
+    def _capture_user_state(self, user: Optional[User]) -> None:
         if not user or user in self._user_original:
             return
         # В async-контексте ORM-атрибуты могут быть expired (например после
@@ -148,13 +148,13 @@ class _PanelIdMapMutation:
             return
         self._map_original[key] = self.id_map.get(key, _PANEL_ID_MAP_MISSING)
 
-    def set_user_panel_id(self, user: Optional['User'], value: int | None) -> None:
+    def set_user_panel_id(self, user: Optional[User], value: int | None) -> None:
         if not user:
             return
         self._capture_user_state(user)
         user.remnawave_id = value
 
-    def set_user_updated_at(self, user: Optional['User'], value: datetime) -> None:
+    def set_user_updated_at(self, user: Optional[User], value: datetime) -> None:
         if not user:
             return
         self._capture_user_state(user)
@@ -166,7 +166,7 @@ class _PanelIdMapMutation:
         self._capture_map_entry(key)
         self.id_map.pop(key, None)
 
-    def set_map_entry(self, key: int | None, value: Optional['User']) -> None:
+    def set_map_entry(self, key: int | None, value: Optional[User]) -> None:
         if key is None:
             return
         self._capture_map_entry(key)
@@ -241,9 +241,9 @@ class RemnaWaveService:
 
     def _ensure_user_remnawave_id(
         self,
-        user: 'User',
+        user: User,
         panel_user_id: Any,
-        id_map: dict[int, 'User'],
+        id_map: dict[int, User],
     ) -> tuple[bool, _PanelIdMapMutation | None]:
         """Обновляет панельный id пользователя, если он изменился в панели."""
 
@@ -637,7 +637,7 @@ class RemnaWaveService:
                 # но безобидный ноль экраном ошибки.
                 try:
                     total_user_traffic = int(str(system_stats.get('nodes', {}).get('totalBytesLifetime') or 0).strip())
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     logger.warning(
                         'Панель вернула нечисловой totalBytesLifetime',
                         value=system_stats.get('nodes', {}).get('totalBytesLifetime'),
@@ -663,7 +663,7 @@ class RemnaWaveService:
                 uptime_value = system_stats.get('uptime')
                 try:
                     uptime_seconds = int(float(uptime_value)) if uptime_value is not None else 0
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     logger.warning('Не удалось преобразовать uptime в число, используем 0', uptime_value=uptime_value)
 
                 result = {

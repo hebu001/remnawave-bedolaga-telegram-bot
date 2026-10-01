@@ -305,7 +305,7 @@ class AdminNotificationService:
                 try:
                     days = int(raw_days)
                     percent = int(raw_percent)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
 
                 if percent > 0:
@@ -1491,7 +1491,7 @@ class AdminNotificationService:
         """
         try:
             chat_id = int(self.chat_id)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 'none'  # строка @username или None — тип чата не определить
         if chat_id < 0:
             # супергруппа / канал / старая группа — доверенный админ-чат оператора,
@@ -1852,6 +1852,7 @@ class AdminNotificationService:
             'freekassa': f'💳 {settings.get_freekassa_display_name()}',
             'kassa_ai': f'💳 {settings.get_kassa_ai_display_name()}',
             'cispay': f'💳 {settings.get_cispay_display_name()}',
+            'cashera': f'💳 {settings.get_cashera_display_name()}',
             'tabpay': f'💳 {settings.get_tabpay_display_name()}',
             'paritypay': f'💳 {settings.get_paritypay_display_name()}',
             'manual': '🛠️ Вручную (админ)',
@@ -1880,7 +1881,7 @@ class AdminNotificationService:
             return '❌ Нет серверов'
 
         try:
-            from app.handlers.subscription import get_servers_display_names
+            from app.handlers.subscription.devices import get_servers_display_names
 
             servers_names = await get_servers_display_names(squad_uuids)
             return f'{len(squad_uuids)} шт. ({servers_names})'
@@ -2210,7 +2211,7 @@ class AdminNotificationService:
             return 'Нет серверов'
 
         try:
-            from app.handlers.subscription import get_servers_display_names
+            from app.handlers.subscription.devices import get_servers_display_names
 
             servers_names = await get_servers_display_names(server_uuids)
 

@@ -179,12 +179,12 @@ async def view_admin_ticket(
             parts = data_str.split('_')
             ticket_id = int(parts[3])
             page = max(1, int(parts[4]))
-        except (ValueError, IndexError):
+        except ValueError, IndexError:
             pass
     elif ticket_id is None:
         try:
             ticket_id = int(data_str.split('_')[-1])
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             texts = get_texts(db_user.language)
             await callback.answer(texts.t('TICKET_NOT_FOUND', 'Тикет не найден.'), show_alert=True)
             return
@@ -407,7 +407,7 @@ async def handle_admin_ticket_reply(message: types.Message, state: FSMContext, d
     ticket_id = data.get('ticket_id')
     try:
         ticket_id = int(ticket_id) if ticket_id is not None else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         ticket_id = None
 
     if not ticket_id:

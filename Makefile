@@ -32,15 +32,20 @@ test: ## Запустить тесты
 # через тот же harness, что и CI; этот TCP-контейнер для них не используется.
 PG_TEST_CONTAINER ?= bedolaga_test_pg
 PG_TEST_PORT ?= 55433
+PG_TEST_MAJOR ?= 15
 PG_BIN ?=
 TEST_OUTPUT ?=
+
+.PHONY: pg-upgrade
+pg-upgrade: ## Штатный helper PG18; для этого форка требуется отдельный план переноса
+	bash scripts/pg-upgrade.sh $(ARGS)
 
 .PHONY: pg-test-up
 pg-test-up: ## Поднять PostgreSQL для тестов
 	@docker rm -f $(PG_TEST_CONTAINER) >/dev/null 2>&1 || true
 	docker run -d --name $(PG_TEST_CONTAINER) \
 		-e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test \
-		-p $(PG_TEST_PORT):5432 postgres:15-alpine >/dev/null
+		-p $(PG_TEST_PORT):5432 postgres:$(PG_TEST_MAJOR)-alpine >/dev/null
 	@echo "⏳ Ждём готовности PostgreSQL..."
 	@for i in $$(seq 1 30); do \
 		docker exec $(PG_TEST_CONTAINER) pg_isready -U test -d test >/dev/null 2>&1 && break; \
@@ -56,7 +61,7 @@ pg-test-down: ## Убрать PostgreSQL для тестов
 .PHONY: test-lab-config
 test-lab-config:
 	@if [ -z "$(PG_BIN)" ] || [ -z "$(TEST_OUTPUT)" ]; then \
-		echo "Укажите PG_BIN=/path/to/postgresql15/bin и TEST_OUTPUT=/path/to/new-output"; \
+		echo "Укажите PG_BIN=/path/to/postgresql15-or-18/bin и TEST_OUTPUT=/path/to/new-output"; \
 		exit 2; \
 	fi
 

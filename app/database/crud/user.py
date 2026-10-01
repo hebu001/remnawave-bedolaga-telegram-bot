@@ -253,7 +253,7 @@ async def get_user_by_remnawave_id(db: AsyncSession, remnawave_id: int) -> User 
         return None
     try:
         panel_user_id = int(remnawave_id)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
     result = await db.execute(
@@ -737,7 +737,7 @@ async def subtract_user_balance(
     if consume_promo_offer:
         try:
             current_percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             current_percent = 0
 
         if current_percent > 0:
@@ -884,7 +884,7 @@ async def cleanup_expired_promo_offer_discounts(db: AsyncSession) -> int:
     for user in users:
         try:
             percent = int(getattr(user, 'promo_offer_discount_percent', 0) or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             percent = 0
 
         source = getattr(user, 'promo_offer_discount_source', None)
@@ -998,7 +998,7 @@ def _users_list_conditions(
     has_subscription: bool | None = None,
     purchase_count: int | None = None,
     traffic_used_percent_min: int | None = None,
-    connected: 'ConnectedAccounts | None' = None,
+    connected: ConnectedAccounts | None = None,
     in_grace: bool | None = None,
 ) -> list:
     """Условия WHERE списка пользователей админки — одни для списка и для счётчика.
@@ -1196,7 +1196,7 @@ async def get_users_list(
     has_subscription: bool | None = None,
     purchase_count: int | None = None,
     traffic_used_percent_min: int | None = None,
-    connected: 'ConnectedAccounts | None' = None,
+    connected: ConnectedAccounts | None = None,
     in_grace: bool | None = None,
     order_by_balance: bool = False,
     order_by_traffic: bool = False,
@@ -1374,7 +1374,7 @@ async def get_users_count(
     has_subscription: bool | None = None,
     purchase_count: int | None = None,
     traffic_used_percent_min: int | None = None,
-    connected: 'ConnectedAccounts | None' = None,
+    connected: ConnectedAccounts | None = None,
     in_grace: bool | None = None,
 ) -> int:
     query = select(func.count(User.id)).where(

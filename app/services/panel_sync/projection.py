@@ -138,7 +138,7 @@ def _parse_date(value) -> datetime | None:
     try:
         text = str(value).strip().replace('Z', '+00:00')
         return panel_datetime_to_utc(datetime.fromisoformat(text))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         logger.warning('Панель прислала дату, которую не разобрать', value=value)
         return None
 

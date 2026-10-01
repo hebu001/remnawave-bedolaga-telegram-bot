@@ -1025,7 +1025,7 @@ async def toggle_edit_campaign_server(
     parts = callback.data.split('_')
     try:
         server_id = int(parts[-1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Не удалось определить сервер', show_alert=True)
         return
 

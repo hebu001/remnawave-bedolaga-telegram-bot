@@ -129,14 +129,16 @@ async def get_sales_summary(
         # Gateway receipts include both balance top-ups and direct purchases once.
         total_revenue = await get_income_total(db, period_start, period_end)
 
-        # WATA/YooKassa gifts are already included by their gateway receipt.
+        # WATA/YooKassa/Cashera gifts are already included by their gateway receipt.
         # Preserve upstream's unlinked-gift fallback only for other gateways.
         gift_revenue_result = await db.execute(
             select(func.coalesce(func.sum(GuestPurchase.amount_kopeks), 0)).where(
                 and_(
                     GuestPurchase.is_gift.is_(True),
                     GuestPurchase.payment_method.in_(REAL_PAYMENT_METHODS),
-                    GuestPurchase.payment_method.notin_([PaymentMethod.WATA.value, PaymentMethod.YOOKASSA.value]),
+                    GuestPurchase.payment_method.notin_(
+                        [PaymentMethod.WATA.value, PaymentMethod.YOOKASSA.value, PaymentMethod.CASHERA.value]
+                    ),
                     GuestPurchase.paid_at >= period_start,
                     GuestPurchase.paid_at <= period_end,
                 )

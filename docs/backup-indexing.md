@@ -69,3 +69,26 @@ in the backup directory, including nested paths, remain usable. Regression tests
 use synthetic files to cover sibling traversal and outbound symlinks; no real
 secrets or production files are involved. Whether the Web API is currently
 publicly enabled on production was not rechecked during this local fix.
+
+
+## Upstream 5.0.0 table completeness
+
+The JSON ORM fallback and JSON restore catalog include `CasheraPayment`,
+`CasheraSubscription` and `DpiCheckerAction` after their parent user, subscription,
+tariff and transaction records. JSON roundtrip checks contain real synthetic rows
+in each new table, including foreign keys and decimal audit costs, and exercise
+both merge and replace modes. Replace-restore clearing includes the three tables.
+
+Native `pg_dump` already dumps the entire selected database without table filters;
+its coverage does not depend on the ORM list. The catalog fix concerns JSON export
+and JSON restore. Existing bounded I/O, metadata sidecars and atomic publication
+remain in place. SQL restore is a separate operation, and JSON replace restore is
+not one globally atomic transaction.
+
+Python 3.14 adds explicit loop error reporting for late exceptions of a cancelled
+`asyncio.shield` waiter. Backup I/O now waits through `asyncio.wait`, which leaves
+the worker future running when the caller is cancelled. Its completion callback
+still consumes late failures, and the thread completion alone releases admission.
+Cancelled writers retain staging ownership until completion even across repeated
+cancellation. Reader/writer late-failure tests require no loop exception, while
+ordinary worker failures still propagate to active callers.

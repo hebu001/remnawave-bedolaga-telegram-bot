@@ -110,7 +110,7 @@ def _verify_mulenpay_signature(request: Request, raw_body: bytes) -> bool:
 
     try:
         payload = json.loads(raw_body.decode('utf-8'))
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except json.JSONDecodeError, UnicodeDecodeError:
         logger.warning('MulenPay webhook: cannot parse JSON body for signature check', display_name=display_name)
         return False
 
@@ -184,7 +184,7 @@ def _mulenpay_amount_to_kopeks(value: object) -> int | None:
     """Convert a provider amount to exact kopeks without float rounding."""
     try:
         amount = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return None
 
     if not amount.is_finite():
@@ -217,7 +217,7 @@ def _build_verified_mulenpay_callback_payload(
         remote_provider_id = int(remote_payment.get('id'))
         local_amount_kopeks = int(local_payment.amount_kopeks)
         remote_status_code = int(remote_payment.get('status'))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
     if remote_provider_id != local_provider_id:
@@ -257,7 +257,7 @@ async def _process_unsigned_mulenpay_callback(payment_service: PaymentService, p
     """Treat an unsigned callback only as a trigger for authenticated API verification."""
     try:
         provider_id = int(payload.get('id'))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return _MULENPAY_UNSIGNED_REJECTED
     if provider_id <= 0:
         return _MULENPAY_UNSIGNED_REJECTED
@@ -441,9 +441,10 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                 )
             except Exception as e:
                 logger.exception('Tribute webhook processing error', e=e)
+                # 5xx — Tribute повторит доставку (~сутки); зачисление идемпотентно по payment_id
                 return JSONResponse(
                     {'status': 'error', 'reason': 'processing_failed'},
-                    status_code=status.HTTP_400_BAD_REQUEST,
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
         routes_registered = True
@@ -466,7 +467,7 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
             if not signed:
                 try:
                     unsigned_payload = json.loads(raw_body.decode('utf-8'))
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except json.JSONDecodeError, UnicodeDecodeError:
                     return JSONResponse(
                         {'status': 'error', 'reason': 'invalid_signature'},
                         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1999,6 +2000,60 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
 
         routes_registered = True
 
+    # Cashera webhook (api.cashera.cash)
+    if settings.is_cashera_configured():
+
+        @router.get(settings.CASHERA_WEBHOOK_PATH)
+        async def cashera_health() -> JSONResponse:
+            return JSONResponse(
+                {
+                    'status': 'ok',
+                    'service': 'cashera_webhook',
+                    'enabled': settings.is_cashera_enabled(),
+                }
+            )
+
+        @router.post(settings.CASHERA_WEBHOOK_PATH)
+        async def cashera_webhook(request: Request) -> JSONResponse:
+            from app.services.cashera_service import cashera_service
+
+            # Подлинность — статические заголовки X-Api-Key и X-Secret, сверка в постоянном
+            # времени до разбора тела. X-Secret не логируется.
+            if not cashera_service.verify_webhook(request.headers.get('X-Api-Key'), request.headers.get('X-Secret')):
+                return JSONResponse({'status': 'unauthorized'}, status_code=status.HTTP_401_UNAUTHORIZED)
+
+            try:
+                payload = json.loads(await request.body())
+            except Exception as parse_error:
+                logger.error('Cashera webhook: failed to parse JSON', parse_error=parse_error)
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_400_BAD_REQUEST)
+            if not isinstance(payload, dict):
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                success = await _process_payment_service_callback(
+                    payment_service,
+                    payload,
+                    'process_cashera_webhook',
+                )
+            except Exception as e:
+                logger.exception('Cashera webhook processing error', error=e)
+                success = False
+
+            if not success:
+                transaction = payload.get('transaction') if isinstance(payload.get('transaction'), dict) else {}
+                logger.error(
+                    'Cashera webhook processing failed',
+                    external_id=transaction.get('external_id'),
+                    cashera_uuid=transaction.get('uuid'),
+                )
+                # 5xx Cashera повторит (до 3 раз, ~5 мин); 4xx — нет. Поэтому только 500.
+                return JSONResponse({'status': 'error'}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            return JSONResponse({'status': 'ok'}, status_code=status.HTTP_200_OK)
+
+        routes_registered = True
+
     # ParityPay webhook (api.paritypay.net v2)
     if settings.is_paritypay_configured():
 
@@ -2202,6 +2257,7 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                     'donut_enabled': settings.is_donut_enabled(),
                     'lava_enabled': settings.is_lava_enabled(),
                     'cispay_enabled': settings.is_cispay_enabled(),
+                    'cashera_enabled': settings.is_cashera_enabled(),
                     'tabpay_enabled': settings.is_tabpay_enabled(),
                     'paritypay_enabled': settings.is_paritypay_enabled(),
                 }

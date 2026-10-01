@@ -415,7 +415,7 @@ async def submit_contest_answer(
                 idx = int(parts[0])
                 secret = int(parts[1])
                 is_winner = idx == secret
-        except (ValueError, IndexError):
+        except ValueError, IndexError:
             is_winner = False
 
     elif tpl.slug == GAME_BLITZ:

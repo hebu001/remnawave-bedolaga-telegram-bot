@@ -43,18 +43,20 @@ class BackupIOExecutor:
         # Cancelling an HTTP request must not release admission while its thread
         # still runs, nor cancel work shared by other list callers.
         try:
-            return await asyncio.shield(wrapped)
+            # wait() cancels only its waiter, leaving the worker future intact.
+            # Python 3.14 shield() reports every late worker exception after
+            # caller cancellation even when our callback has consumed it.
+            await asyncio.wait((wrapped,))
+            return wrapped.result()
         except asyncio.CancelledError:
             if wait_on_cancel:
                 # Writers retain exclusive ownership of staging until their
                 # actual worker finishes, even during application shutdown.
                 while not wrapped.done():
                     try:
-                        await asyncio.shield(wrapped)
+                        await asyncio.wait((wrapped,))
                     except asyncio.CancelledError:
                         continue
-                    except Exception:
-                        break
             raise
 
 

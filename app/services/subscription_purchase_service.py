@@ -358,7 +358,7 @@ class MiniAppSubscriptionPurchaseService:
         for server in server_catalog.values():
             try:
                 server_uuid_to_id[server.squad_uuid] = int(getattr(server, 'id', 0) or 0)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
 
         default_connected = list(own_squads)
@@ -701,7 +701,7 @@ class MiniAppSubscriptionPurchaseService:
         )
         try:
             devices = int(devices)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             raise PurchaseValidationError('Invalid devices selection', code='invalid_devices')
 
         devices = max(devices, period.devices.minimum)

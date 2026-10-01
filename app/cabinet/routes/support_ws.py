@@ -497,7 +497,7 @@ async def _authenticate_ws(
 
     try:
         user_id = int(payload.get('sub'))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None, _shared_error('AUTH_REQUIRED', 'Access token payload is invalid', resource_type='auth')
 
     user = await get_user_by_id(db, user_id)
@@ -1621,7 +1621,7 @@ _bridge_tasks: set[asyncio.Task[Any]] = set()
 def _coerce_int(value: Any) -> int | None:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

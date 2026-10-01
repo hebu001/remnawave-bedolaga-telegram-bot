@@ -91,3 +91,37 @@ async def test_worker_failure_propagates_and_releases_slot():
         assert await pool.run(lambda: 'ok') == 'ok'
     finally:
         await asyncio.to_thread(pool.shutdown)
+
+
+async def test_cancelled_writer_waits_and_consumes_late_failure_without_loop_error():
+    pool = BackupIOExecutor(workers=1, capacity=1)
+    started, release = threading.Event(), threading.Event()
+    errors = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    def writer():
+        started.set()
+        assert release.wait(3)
+        raise RuntimeError('late writer failure')
+
+    try:
+        task = asyncio.create_task(pool.run(writer, wait_on_cancel=True))
+        await wait_for_thread(started)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert not task.done()
+        with pytest.raises(BackupIOBusy):
+            await pool.run(lambda: None)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await pool.run(lambda: 42) == 42
+        assert errors == []
+    finally:
+        release.set()
+        await asyncio.to_thread(pool.shutdown)
+        loop.set_exception_handler(previous_handler)

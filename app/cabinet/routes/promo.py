@@ -183,7 +183,7 @@ async def get_promo_group_discounts(
         for key, value in raw_period_discounts.items():
             try:
                 period_discounts[str(key)] = int(value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
 
     return PromoGroupDiscounts(
@@ -234,7 +234,7 @@ async def get_loyalty_tiers(
             for key, value in raw_period_discounts.items():
                 try:
                     period_discounts[str(key)] = int(value)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
 
         tiers.append(
@@ -365,14 +365,14 @@ async def claim_promo_offer(
     if raw_duration in (None, '') and template_id:
         try:
             template = await get_promo_offer_template_by_id(db, int(template_id))
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             template = None
         if template and template.active_discount_hours:
             raw_duration = template.active_discount_hours
 
     try:
         duration_hours = int(raw_duration) if raw_duration is not None else None
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         duration_hours = None
 
     if duration_hours and duration_hours > 0:

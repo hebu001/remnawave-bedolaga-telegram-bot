@@ -285,7 +285,7 @@ async def confirm_change_devices(
     texts = get_texts(db_user.language)
     try:
         new_devices_count = int(callback.data.split('_')[2])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer(texts.t('INVALID_REQUEST', 'Invalid request'), show_alert=True)
         return
     subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
@@ -543,7 +543,7 @@ async def execute_change_devices(
     texts = get_texts(db_user.language)
     try:
         new_devices_count = int(callback_parts[3])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer(texts.t('INVALID_REQUEST', 'Invalid request'), show_alert=True)
         return
 

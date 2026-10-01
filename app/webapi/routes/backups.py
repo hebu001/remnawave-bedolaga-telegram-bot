@@ -60,7 +60,7 @@ def _parse_datetime(value: str | None) -> datetime | None:
 def _to_int(value: Any) -> int | None:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -72,7 +72,7 @@ def _serialize_backup(raw: dict) -> BackupInfo:
     file_size_mb = raw.get('file_size_mb')
     try:
         file_size_mb = float(file_size_mb)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         file_size_mb = round(file_size_bytes / 1024 / 1024, 2)
 
     created_by = _to_int(raw.get('created_by'))

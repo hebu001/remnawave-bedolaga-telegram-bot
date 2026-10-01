@@ -202,7 +202,7 @@ def encode_payment_payload(descriptor: RenewalPaymentDescriptor) -> str:
                 ensure_ascii=False,
             ).encode('utf-8')
             snapshot_segment = base64.urlsafe_b64encode(raw_snapshot).decode('ascii').rstrip('=')
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             snapshot_segment = ''
 
     payload = (
@@ -241,7 +241,7 @@ def decode_payment_payload(payload: str, expected_user_id: int | None = None) ->
         period_days = int(period_raw)
         total_amount = int(total_raw)
         missing_amount = int(missing_raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
     pricing_snapshot: dict[str, Any] | None = None
@@ -254,7 +254,7 @@ def decode_payment_payload(payload: str, expected_user_id: int | None = None) ->
                 snapshot_data = json.loads(decoded.decode('utf-8'))
                 if isinstance(snapshot_data, dict):
                     pricing_snapshot = snapshot_data
-            except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            except ValueError, json.JSONDecodeError, UnicodeDecodeError:
                 logger.warning('Failed to decode renewal pricing snapshot from payload')
 
     if expected_user_id is not None and user_id != expected_user_id:
@@ -299,7 +299,7 @@ def parse_payment_metadata(
         period_days = int(metadata.get('period_days'))
         total_amount = int(metadata.get('total_amount_kopeks'))
         missing_amount = int(metadata.get('missing_amount_kopeks'))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
     payload_id = str(metadata.get('payload_id') or '')
@@ -307,7 +307,7 @@ def parse_payment_metadata(
     if user_id is not None:
         try:
             user_id_int = int(user_id)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             user_id_int = None
     else:
         user_id_int = None
@@ -449,7 +449,7 @@ class SubscriptionRenewalService:
                 await db.commit()
             else:
                 await db.flush()
-        except (Exception, asyncio.CancelledError):
+        except Exception, asyncio.CancelledError:
             await db.rollback()
             raise
 

@@ -73,7 +73,7 @@ class AuthProviderImpl(AuthProvider):
         try:
             with storage_path.open(encoding='utf-8') as f:
                 self._token_data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError, OSError:
             # Ignore errors, token will be None
             pass
 

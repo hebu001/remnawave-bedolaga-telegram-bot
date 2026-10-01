@@ -66,7 +66,7 @@ def validate_amount(amount_str: str, min_amount: float = 0, max_amount: float = 
         if min_amount <= amount <= max_amount:
             return amount
         return None
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
 
 
@@ -76,7 +76,7 @@ def validate_positive_integer(value: str | int, max_value: int = None) -> int | 
         if num > 0 and (max_value is None or num <= max_value):
             return num
         return None
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
 
 
@@ -125,7 +125,7 @@ def validate_subscription_period(days: str | int) -> int | None:
         if 1 <= days_int <= 3650:
             return days_int
         return None
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
 
 
@@ -214,7 +214,7 @@ def validate_device_count(count: str | int) -> int | None:
         if 1 <= count_int <= 10:
             return count_int
         return None
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
 
 

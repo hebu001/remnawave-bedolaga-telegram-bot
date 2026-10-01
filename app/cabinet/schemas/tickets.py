@@ -19,7 +19,7 @@ class TicketMediaItem(BaseModel):
     token: str | None = Field(default=None, description='Signed media download token (response only)')
 
     @model_validator(mode='after')
-    def validate_type(self) -> 'TicketMediaItem':
+    def validate_type(self) -> TicketMediaItem:
         if self.type not in ALLOWED_MEDIA_TYPES:
             raise ValueError(f'type must be one of: {sorted(ALLOWED_MEDIA_TYPES)}')
         return self
@@ -124,7 +124,7 @@ class TicketCreateRequest(BaseModel):
     media_items: list[TicketMediaItem] | None = Field(None, description='Multi-media attachments')
 
     @model_validator(mode='after')
-    def validate_has_content(self) -> 'TicketCreateRequest':
+    def validate_has_content(self) -> TicketCreateRequest:
         _validate_media_bundle(self.media_type, self.media_file_id, self.media_items)
         has_text = bool(self.message.strip())
         has_media = bool(self.media_file_id) or bool(self.media_items)
@@ -143,7 +143,7 @@ class TicketMessageCreateRequest(BaseModel):
     media_items: list[TicketMediaItem] | None = Field(None, description='Multi-media attachments')
 
     @model_validator(mode='after')
-    def validate_has_content(self) -> 'TicketMessageCreateRequest':
+    def validate_has_content(self) -> TicketMessageCreateRequest:
         _validate_media_bundle(self.media_type, self.media_file_id, self.media_items)
         has_text = bool(self.message.strip())
         has_media = bool(self.media_file_id) or bool(self.media_items)

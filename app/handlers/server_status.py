@@ -29,7 +29,7 @@ async def change_server_status_page(callback: types.CallbackQuery, db_user: User
     try:
         _, page_str = callback.data.split(':', 1)
         page = int(page_str)
-    except (ValueError, AttributeError, IndexError):
+    except ValueError, AttributeError, IndexError:
         page = 1
 
     await _render_server_status(callback, db_user, page=page)

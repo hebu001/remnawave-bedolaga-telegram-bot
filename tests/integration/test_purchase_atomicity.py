@@ -353,7 +353,7 @@ async def test_concurrent_purchases_cannot_spend_the_same_balance(sessions, cont
     async def attempt():
         try:
             return await (purchase(sessions, context) if flow == 'miniapp' else renew(sessions, context, sub_id))
-        except (HTTPException, renewal.SubscriptionRenewalChargeError):
+        except HTTPException, renewal.SubscriptionRenewalChargeError:
             return None
 
     results = await asyncio.gather(attempt(), attempt())

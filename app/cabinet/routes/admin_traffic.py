@@ -140,7 +140,7 @@ async def _aggregate_traffic(
                 try:
                     panel_user_id = int(user_entry['id'])
                     total = int(user_entry.get('totalBytes') or 0)
-                except (KeyError, TypeError, ValueError):
+                except KeyError, TypeError, ValueError:
                     continue
                 if total > 0 and panel_user_id in known_panel_user_ids:
                     per_node = user_traffic.setdefault(panel_user_id, {})

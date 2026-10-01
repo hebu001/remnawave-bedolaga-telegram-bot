@@ -121,7 +121,7 @@ def _resolve_max_workers() -> int:
     raw = getattr(settings, 'YOOKASSA_MAX_CONCURRENT_REQUESTS', 4)
     try:
         value = int(raw or 4)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         value = 4
     return max(1, value)
 

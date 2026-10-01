@@ -344,7 +344,7 @@ async def process_freekassa_custom_amount(
         amount_text = message.text.replace(',', '.').replace(' ', '').strip()
         amount_rubles = float(amount_text)
         amount_kopeks = int(amount_rubles * 100)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(
             texts.t(
                 'PAYMENT_INVALID_AMOUNT',

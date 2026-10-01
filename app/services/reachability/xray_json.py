@@ -101,7 +101,7 @@ def links_from_xray_json(text: str) -> list[str]:
     """Ссылки из JSON-подписки; не JSON или без прокси-outbound — пусто."""
     try:
         data = json.loads(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except json.JSONDecodeError, TypeError, ValueError:
         return []
     configs = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
     links: list[str] = []

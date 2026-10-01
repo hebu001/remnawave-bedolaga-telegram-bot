@@ -891,7 +891,7 @@ async def toggle_faq_page(
     parts = (callback.data or '').split(':')
     try:
         page_id = int(parts[1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer()
         return
 
@@ -938,7 +938,7 @@ async def delete_faq_page(
     parts = (callback.data or '').split(':')
     try:
         page_id = int(parts[1])
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer()
         return
 
@@ -994,7 +994,7 @@ async def move_faq_page(
     try:
         page_id = int(parts[1])
         direction = parts[2]
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer()
         return
 

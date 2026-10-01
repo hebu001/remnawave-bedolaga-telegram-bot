@@ -94,7 +94,7 @@ async def handle_poll_start(
 ):
     try:
         response_id = int(callback.data.split(':')[1])
-    except (IndexError, ValueError):
+    except IndexError, ValueError:
         await callback.answer('❌ Опрос не найден', show_alert=True)
         return
 
@@ -150,7 +150,7 @@ async def handle_poll_answer(
         response_id = int(response_id)
         question_id = int(question_id)
         option_id = int(option_id)
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         await callback.answer('❌ Некорректные данные', show_alert=True)
         return
 

@@ -13,9 +13,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.exc import MissingGreenlet
+from sqlalchemy import event, inspect as sa_inspect
+from sqlalchemy.orm.attributes import NO_VALUE
 
 from app.database.models import (
     PromoGroup,
@@ -78,8 +77,16 @@ async def test_promo_group_resolved_after_refresh_dropped_the_relationship(monke
         # Без этого many-to-one резолвится из identity map БЕЗ запроса и баг не
         # воспроизводится: в проде группы в карте сессии не было.
         db.expunge(group)
-        with pytest.raises(MissingGreenlet):
-            getattr(user, 'promo_group', None)  # ← ровно то, на чём падало
+        assert sa_inspect(user).attrs.promo_group.loaded_value is NO_VALUE
+
+        def unexpected_implicit_query(_statement):
+            raise AssertionError('reading an unloaded relationship must not issue an ORM query')
+
+        event.listen(db.sync_session, 'do_orm_execute', unexpected_implicit_query)
+        try:
+            assert _loaded_relationship(user, 'promo_group') is None
+        finally:
+            event.remove(db.sync_session, 'do_orm_execute', unexpected_implicit_query)
 
         service = AdminNotificationService(SimpleNamespace())
         resolved = await service._get_user_promo_group(db, user)
@@ -123,6 +130,16 @@ def test_loaded_relationship_never_triggers_io_for_unloaded() -> None:
     user = User(telegram_id=1, username='u', first_name='U', promo_group_id=5)
     # Свежесозданный инстанс: связь не загружена
     assert _loaded_relationship(user, 'promo_group') is None
+
+
+async def test_loaded_relationship_is_safe_for_real_detached_unloaded_user(monkeypatch) -> None:
+    async with memory_session(monkeypatch, TABLES) as db:
+        user, _group = await _seed(db)
+        await db.refresh(user)
+        assert sa_inspect(user).attrs.promo_group.loaded_value is NO_VALUE
+        db.expunge(user)
+        assert sa_inspect(user).detached
+        assert _loaded_relationship(user, 'promo_group') is None
 
 
 def test_loaded_relationship_falls_back_for_non_orm_objects() -> None:

@@ -240,7 +240,7 @@ class TabPayService:
 
         try:
             return await self.create_payment(order_id=order_id, **kwargs)
-        except (TabPayAPIError, TabPayNetworkError):
+        except TabPayAPIError, TabPayNetworkError:
             # Последняя попытка разобраться: повтор мог снова потерять ответ.
             recovered = await self.get_payment_by_order_id(order_id)
             if recovered:

@@ -169,7 +169,7 @@ class LandingPaymentMethodInput(BaseModel):
         return v
 
     @model_validator(mode='after')
-    def validate_amount_range(self) -> 'LandingPaymentMethodInput':
+    def validate_amount_range(self) -> LandingPaymentMethodInput:
         if (
             self.min_amount_kopeks is not None
             and self.max_amount_kopeks is not None
@@ -217,7 +217,7 @@ class LandingCreateRequest(BaseModel):
     analytics_click_goal: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode='after')
-    def validate_analytics_goals(self) -> 'LandingCreateRequest':
+    def validate_analytics_goals(self) -> LandingCreateRequest:
         if self.analytics_view_enabled and not self.analytics_view_goal:
             raise ValueError('analytics_view_goal is required when analytics_view_enabled is True')
         if self.analytics_click_enabled and not self.analytics_click_goal:
@@ -286,7 +286,7 @@ class LandingCreateRequest(BaseModel):
         return v
 
     @model_validator(mode='after')
-    def validate_discount(self) -> 'LandingCreateRequest':
+    def validate_discount(self) -> LandingCreateRequest:
         has_discount = self.discount_percent is not None
         has_dates = self.discount_starts_at is not None or self.discount_ends_at is not None
         if has_dates and not has_discount:
@@ -414,7 +414,7 @@ class LandingUpdateRequest(BaseModel):
         return v
 
     @model_validator(mode='after')
-    def validate_discount(self) -> 'LandingUpdateRequest':
+    def validate_discount(self) -> LandingUpdateRequest:
         if self.discount_starts_at is not None and self.discount_ends_at is not None:
             if self.discount_starts_at >= self.discount_ends_at:
                 raise ValueError('discount_starts_at must be before discount_ends_at')

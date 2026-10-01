@@ -56,6 +56,8 @@ def _method_display(method: PaymentMethod) -> str:
         return settings.get_freekassa_display_name()
     if method == PaymentMethod.CISPAY:
         return settings.get_cispay_display_name()
+    if method == PaymentMethod.CASHERA:
+        return settings.get_cashera_display_name()
     if method == PaymentMethod.TABPAY:
         return settings.get_tabpay_display_name()
     if method == PaymentMethod.PARITYPAY:
@@ -499,7 +501,7 @@ def _parse_method_and_id(payload: str, *, prefix: str) -> tuple[PaymentMethod, i
         method = PaymentMethod(method_str)
         payment_id = int(identifier)
         return method, payment_id
-    except (ValueError, KeyError):
+    except ValueError, KeyError:
         return None
 
 

@@ -259,7 +259,7 @@ async def process_riopay_custom_amount(
         amount_text = message.text.replace(',', '.').replace(' ', '').strip()
         amount_rubles = float(amount_text)
         amount_kopeks = round(amount_rubles * 100)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await message.answer(
             texts.t(
                 'PAYMENT_INVALID_AMOUNT',

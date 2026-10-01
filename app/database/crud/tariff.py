@@ -21,7 +21,7 @@ def _normalize_period_prices(period_prices: dict[int, int] | None) -> dict[str, 
         try:
             period = int(key)
             price = int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
 
         if period > 0 and price >= 0:
@@ -41,7 +41,7 @@ def _resolve_highlight_period(period_prices: dict[str, int], highlight: int | No
         return None
     try:
         days = int(highlight)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return days if str(days) in period_prices else None
 

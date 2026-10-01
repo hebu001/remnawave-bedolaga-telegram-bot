@@ -47,7 +47,7 @@ class EmailNotificationTemplates:
         'webhook_torrent_detected': 'torrent_detected',
     }
 
-    def _template_map(self) -> dict['NotificationType', Callable[[str, dict[str, Any]], dict[str, str]]]:
+    def _template_map(self) -> dict[NotificationType, Callable[[str, dict[str, Any]], dict[str, str]]]:
         """Тип уведомления -> билдер письма. Единственный реестр email-шаблонов.
 
         Список типов в редакторе админки строится отсюда же (supported_types):
@@ -102,13 +102,13 @@ class EmailNotificationTemplates:
         }
         return {**template_map, **webhook_map}
 
-    def supported_types(self) -> list['NotificationType']:
+    def supported_types(self) -> list[NotificationType]:
         """Типы, у которых есть email-шаблон, — источник истины для списка редактора."""
         return list(self._template_map())
 
     def get_template(
         self,
-        notification_type: 'NotificationType',
+        notification_type: NotificationType,
         language: str,
         context: dict[str, Any],
     ) -> dict[str, str] | None:
@@ -1367,7 +1367,7 @@ class EmailNotificationTemplates:
         raw_level = context.get('level', 1)
         try:
             show_level = int(raw_level or 1) > 1
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             # Редактор шаблонов рендерит их с токенами вида '{level}'. Уровень там
             # неизвестен, но блок обязан попасть в payload — иначе админ его просто
             # не увидит и не сможет отредактировать.
@@ -1888,7 +1888,7 @@ class EmailNotificationTemplates:
         def _percent(key: str) -> int:
             try:
                 return max(0, int(context.get(key) or 0))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return 0
 
         labels = {

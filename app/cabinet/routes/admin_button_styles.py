@@ -136,7 +136,7 @@ async def get_button_styles(
                             for k, v in overrides['labels'].items()
                             if isinstance(k, str) and isinstance(v, str) and k in BOT_LOCALES
                         }
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     return _build_response(merged)
@@ -172,7 +172,7 @@ async def update_button_styles(
                             for k, v in overrides['labels'].items()
                             if isinstance(k, str) and isinstance(v, str) and k in BOT_LOCALES
                         }
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError, TypeError:
             pass
 
     # Apply updates

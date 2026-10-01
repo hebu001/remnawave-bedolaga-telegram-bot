@@ -37,12 +37,16 @@ class PasswordExecutor:
             raise
         concurrent_future.add_done_callback(self._release_slot)
 
-        # Shield the concurrent future from request cancellation. Consume errors
+        # Keep the concurrent future alive after request cancellation. Consume errors
         # even after cancellation so a disconnected client leaves no unhandled
         # asyncio future exception. Normal callers still receive that exception.
         future = asyncio.wrap_future(concurrent_future)
         future.add_done_callback(self._consume_exception)
-        return await asyncio.shield(future)
+        # wait() cancels only its waiter, leaving the worker future intact.
+        # Python 3.14 shield() explicitly reports late worker exceptions even
+        # after the callback above has consumed them for a cancelled request.
+        await asyncio.wait((future,))
+        return future.result()
 
     def _release_slot(self, _future: Future) -> None:
         self._slots.release()

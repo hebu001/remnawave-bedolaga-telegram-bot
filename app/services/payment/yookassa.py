@@ -36,7 +36,7 @@ class YooKassaPaymentMixin:
         try:
             quantized = Decimal(str(value)).quantize(Decimal('0.00'))
             return format(quantized, 'f')
-        except (InvalidOperation, ValueError, TypeError):
+        except InvalidOperation, ValueError, TypeError:
             return str(value)
 
     @classmethod
@@ -847,7 +847,7 @@ class YooKassaPaymentMixin:
                                         actual_sub_id=subscription.id,
                                         user_id=user.id,
                                     )
-                            except (ValueError, TypeError):
+                            except ValueError, TypeError:
                                 logger.warning(
                                     'Recurrent payment: invalid subscription_id in metadata',
                                     meta_sub_id=_meta_sub_id,
@@ -1565,7 +1565,7 @@ class YooKassaPaymentMixin:
 
         try:
             user_id = int(user_id_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.error(
                 'Webhook YooKassa содержит некорректный user_id',
                 yookassa_payment_id=yookassa_payment_id,
@@ -1597,7 +1597,7 @@ class YooKassaPaymentMixin:
                     if meta_tg is not None:
                         try:
                             expected_tg = int(meta_tg)
-                        except (TypeError, ValueError):
+                        except TypeError, ValueError:
                             expected_tg = None
                         if expected_tg and user.telegram_id != expected_tg:
                             logger.warning(
@@ -1626,7 +1626,7 @@ class YooKassaPaymentMixin:
                 if tg_id_raw is not None:
                     try:
                         tg_id = int(tg_id_raw)
-                    except (TypeError, ValueError):
+                    except TypeError, ValueError:
                         tg_id = None
                     if tg_id and tg_id > 0:
                         user = await get_user_by_telegram_id(db, tg_id)

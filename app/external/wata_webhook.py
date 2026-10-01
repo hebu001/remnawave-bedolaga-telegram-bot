@@ -113,7 +113,7 @@ class WataWebhookHandler:
 
         try:
             signature_bytes = base64.b64decode(signature)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             logger.error('Некорректная подпись WATA (не Base64)')
             return False
 

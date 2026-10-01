@@ -4,10 +4,13 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from sqlalchemy import inspect, select
+from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import NO_VALUE
 
 from app.config import CLASSIC_PERIOD_PRICES, PERIOD_PRICES, settings
 from app.database.crud.server_squad import get_server_squads_by_uuids
-from app.utils.pricing_utils import calculate_months_from_days
+from app.utils.pricing_utils import calculate_months_from_days, ensure_user_promo_groups_loaded
 from app.utils.promo_offer import get_user_active_promo_discount_percent
 
 
@@ -148,6 +151,11 @@ class PricingEngine:
             pg = user.get_primary_promo_group()
             if pg is not None:
                 return pg
+            from app.database.models import User
+
+            if isinstance(user, User) and inspect(user, raiseerr=False) is not None:
+                # The ORM getter has already considered the loaded legacy link.
+                return None
         return getattr(user, 'promo_group', None)
 
     @staticmethod
@@ -532,6 +540,7 @@ class PricingEngine:
         if not isinstance(period_days, int) or period_days <= 0:
             raise ValueError(f'Invalid period_days: {period_days}')
 
+        await ensure_user_promo_groups_loaded(db, user)
         if subscription.tariff_id is not None:
             if subscription.tariff is None:
                 logger.error(
@@ -582,6 +591,14 @@ class PricingEngine:
         Promo-offer discount applied on the discounted subtotal.
         Device cost is monthly × months_in_period.
         """
+        from sqlalchemy.ext.asyncio import async_object_session
+
+        from app.database.models import PromoGroup, Tariff, User
+
+        if isinstance(user, User) and inspect(user, raiseerr=False) is not None:
+            db = async_object_session(user)
+            if db is not None:
+                await ensure_user_promo_groups_loaded(db, user)
         months = calculate_months_from_days(period_days)
 
         # --- Base price ---
@@ -620,6 +637,19 @@ class PricingEngine:
         devices_pct = 0
         promo_group = self.resolve_promo_group(user)
         # Only apply promo group discount if the tariff is available for this group
+        if promo_group is not None and isinstance(tariff, Tariff):
+            tariff_state = inspect(tariff, raiseerr=False)
+            if tariff_state is not None and tariff_state.identity is not None:
+                if tariff_state.attrs.allowed_promo_groups.loaded_value is NO_VALUE:
+                    db = async_object_session(tariff)
+                    if db is None:
+                        raise RuntimeError('Tariff promo availability must be explicitly loaded before pricing')
+                    with db.no_autoflush:
+                        await db.execute(
+                            select(Tariff)
+                            .where(Tariff.id == tariff_state.identity[0])
+                            .options(selectinload(Tariff.allowed_promo_groups).lazyload(PromoGroup.server_squads))
+                        )
         if promo_group is not None and not tariff.is_available_for_promo_group(promo_group.id):
             promo_group = None
         if promo_group is not None:
@@ -741,6 +771,7 @@ class PricingEngine:
                 )
 
         # --- Per-category discount percents (resolve_promo_group: get_primary_promo_group first) ---
+        await ensure_user_promo_groups_loaded(db, user)
         period_pct = 0
         servers_pct = 0
         traffic_pct = 0

@@ -14,6 +14,8 @@ def test_changed_runtime_paths_have_no_undefined_or_unbound_names():
             'ruff',
             'check',
             '--isolated',
+            '--target-version',
+            'py314',
             '--select',
             'F821,F823',
             'app/handlers/menu.py',

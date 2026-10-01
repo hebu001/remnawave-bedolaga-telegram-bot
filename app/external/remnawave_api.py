@@ -408,7 +408,7 @@ def _retry_after_seconds(headers: Any) -> float | None:
         return None
     try:
         return max(0.0, float(raw))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -1828,7 +1828,7 @@ class RemnaWaveAPI:
                 remaining = len(payload.get('devices') or [])
             try:
                 remaining = int(remaining)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 remaining = 0
             if remaining > 0:
                 logger.error(
@@ -2174,7 +2174,7 @@ class RemnaWaveAPI:
             return default
         try:
             return int(value)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return default
 
     def _parse_inbound(self, inbound_data: dict) -> RemnaWaveInbound:

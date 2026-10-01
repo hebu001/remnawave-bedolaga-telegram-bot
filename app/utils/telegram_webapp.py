@@ -68,7 +68,7 @@ def parse_webapp_init_data(
     if auth_date_raw is not None:
         try:
             auth_date = int(auth_date_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             raise TelegramWebAppAuthError('Invalid auth_date value') from None
 
         if max_age_seconds and auth_date:

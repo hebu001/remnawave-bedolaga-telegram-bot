@@ -1271,7 +1271,7 @@ async def toggle_traffic_package(
     try:
         _, gb_raw = callback.data.split(':', 1)
         gb_value = int(gb_raw)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await callback.answer()
         return
 
@@ -1322,7 +1322,7 @@ async def toggle_period_option(
     try:
         _, target, value_raw = callback.data.split(':', 2)
         days = int(value_raw)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         await callback.answer()
         return
 
