@@ -27,7 +27,7 @@ class StubPublicKeyProvider:
     def __init__(self, public_key_pem: str | None) -> None:
         self.public_key_pem = public_key_pem
 
-    async def get_public_key(self) -> str | None:
+    async def get_public_key(self, **kwargs) -> str | None:
         return self.public_key_pem
 
 
@@ -62,7 +62,7 @@ async def test_verify_signature_success() -> None:
         public_key_provider=StubPublicKeyProvider(public_key),
     )
 
-    assert await handler._verify_signature(payload, signature) is True
+    assert await handler._verify_signature(payload.encode('utf-8'), signature) is True
 
 
 @pytest.mark.anyio('asyncio')
@@ -85,7 +85,7 @@ async def test_verify_signature_fails_with_invalid_signature() -> None:
         public_key_provider=StubPublicKeyProvider(public_key),
     )
 
-    assert await handler._verify_signature(payload, bad_signature) is False
+    assert await handler._verify_signature(payload.encode('utf-8'), bad_signature) is False
 
 
 @pytest.mark.anyio('asyncio')
@@ -95,4 +95,4 @@ async def test_verify_signature_fails_without_public_key() -> None:
         public_key_provider=StubPublicKeyProvider(None),
     )
 
-    assert await handler._verify_signature('{}', 'signature') is False
+    assert await handler._verify_signature(b'{}', 'c2lnbmF0dXJl') is False

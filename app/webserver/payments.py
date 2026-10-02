@@ -750,15 +750,15 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                 )
 
             signature = request.headers.get('X-Signature') or ''
-            if not await wata_handler._verify_signature(raw_body.decode('utf-8'), signature):  # type: ignore[attr-defined]
+            if not await wata_handler._verify_signature(raw_body, signature):  # type: ignore[attr-defined]
                 return JSONResponse(
                     {'status': 'error', 'reason': 'invalid_signature'},
                     status_code=status.HTTP_401_UNAUTHORIZED,
                 )
 
             try:
-                payload = json.loads(raw_body.decode('utf-8'))
-            except json.JSONDecodeError:
+                payload = json.loads(raw_body)
+            except json.JSONDecodeError, UnicodeDecodeError:
                 return JSONResponse(
                     {'status': 'error', 'reason': 'invalid_json'},
                     status_code=status.HTTP_400_BAD_REQUEST,

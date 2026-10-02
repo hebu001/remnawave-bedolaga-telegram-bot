@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from datetime import UTC, datetime, timedelta
+import math
+import time
+from collections.abc import Callable
 from typing import Any
 
 import structlog
 from aiohttp import ClientSession, ClientTimeout, ContentTypeError, web
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from app.config import settings
 from app.database.database import AsyncSessionLocal
@@ -23,31 +25,74 @@ logger = structlog.get_logger(__name__)
 class WataPublicKeyProvider:
     """Loads and caches the WATA public key used for webhook signature validation."""
 
-    def __init__(self, *, cache_seconds: int | None = None) -> None:
-        self._cache_seconds = cache_seconds or int(settings.WATA_PUBLIC_KEY_CACHE_SECONDS)
+    def __init__(
+        self,
+        *,
+        cache_seconds: int | None = None,
+        refresh_interval_seconds: float = 30,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not math.isfinite(refresh_interval_seconds) or refresh_interval_seconds <= 0:
+            raise ValueError('WATA key refresh interval must be positive')
+        self._cache_seconds = int(settings.WATA_PUBLIC_KEY_CACHE_SECONDS) if cache_seconds is None else cache_seconds
+        self._refresh_interval_seconds = refresh_interval_seconds
+        self._clock = clock
         self._cached_key: str | None = None
-        self._expires_at: datetime | None = None
+        self._expires_at: float = 0
+        self._next_normal_fetch_at: float = float('-inf')
+        self._next_forced_fetch_at: float = float('-inf')
+        self._attempt_generation = 0
         self._lock = asyncio.Lock()
 
-    async def get_public_key(self) -> str | None:
-        """Returns a cached public key or fetches a new one from WATA."""
+    async def get_public_key(self, *, force_refresh: bool = False, observed_key: str | None = None) -> str | None:
+        """Share refreshes and retain the last valid RSA key when WATA is unavailable.
 
-        now = datetime.now(UTC)
-        if self._cached_key and self._expires_at and now < self._expires_at:
+        A successful ordinary fetch permits one immediate forced refresh for rotation.
+        Forced attempts and failed ordinary attempts share a monotonic cooldown.
+        The limit is local to this provider instance, including its concurrent callers.
+        """
+
+        now = self._clock()
+        if not force_refresh and self._cached_key and now < self._expires_at:
             return self._cached_key
 
+        observed_generation = self._attempt_generation
         async with self._lock:
-            now = datetime.now(UTC)
-            if self._cached_key and self._expires_at and now < self._expires_at:
+            # Waiters share even an unsuccessful or unchanged-key fetch. Generation
+            # prevents another fetch when the preceding request outlasts the cooldown.
+            if observed_generation != self._attempt_generation:
+                return self._cached_key
+            if force_refresh and observed_key is not None and self._cached_key != observed_key:
                 return self._cached_key
 
-            key = await self._fetch_public_key()
-            if key:
-                self._cached_key = key
-                if self._cache_seconds > 0:
-                    self._expires_at = datetime.now(UTC) + timedelta(seconds=self._cache_seconds)
-                else:
-                    self._expires_at = None
+            now = self._clock()
+            if not force_refresh and self._cached_key and now < self._expires_at:
+                return self._cached_key
+            next_fetch_at = self._next_forced_fetch_at if force_refresh else self._next_normal_fetch_at
+            if now < next_fetch_at:
+                return self._cached_key
+
+            next_attempt_at = now + self._refresh_interval_seconds
+            self._next_normal_fetch_at = next_attempt_at
+            if force_refresh:
+                self._next_forced_fetch_at = next_attempt_at
+            valid_key = False
+            try:
+                key = await self._fetch_public_key()
+                if isinstance(key, str):
+                    try:
+                        valid_key = isinstance(serialization.load_pem_public_key(key.encode('utf-8')), rsa.RSAPublicKey)
+                    except ValueError, TypeError, UnsupportedAlgorithm:
+                        pass
+                if valid_key:
+                    self._cached_key = key
+                    self._expires_at = self._clock() + max(0, self._cache_seconds)
+            finally:
+                self._attempt_generation += 1
+                if not valid_key:
+                    self._next_forced_fetch_at = max(self._next_forced_fetch_at, next_attempt_at)
+
+            if valid_key:
                 logger.debug('Получен и закеширован публичный ключ WATA')
                 return self._cached_key
 
@@ -100,10 +145,16 @@ class WataWebhookHandler:
         self.payment_service = payment_service
         self.public_key_provider = public_key_provider or WataPublicKeyProvider()
 
-    async def _verify_signature(self, raw_body: str, signature: str) -> bool:
+    async def _verify_signature(self, raw_body: bytes, signature: str) -> bool:
         signature = (signature or '').strip()
         if not signature:
             logger.error('WATA webhook без подписи')
+            return False
+
+        try:
+            signature_bytes = base64.b64decode(signature, validate=True)
+        except ValueError, TypeError:
+            logger.error('Некорректная подпись WATA (не Base64)')
             return False
 
         public_key_pem = await self.public_key_provider.get_public_key()
@@ -111,39 +162,35 @@ class WataWebhookHandler:
             logger.error('Публичный ключ WATA отсутствует, проверка подписи невозможна')
             return False
 
-        try:
-            signature_bytes = base64.b64decode(signature)
-        except ValueError, TypeError:
-            logger.error('Некорректная подпись WATA (не Base64)')
-            return False
-
-        try:
-            public_key = serialization.load_pem_public_key(public_key_pem.encode('utf-8'))
-        except ValueError as error:
-            logger.error('Ошибка загрузки публичного ключа WATA', error=error)
-            return False
-
-        try:
-            public_key.verify(
-                signature_bytes,
-                raw_body.encode('utf-8'),
-                padding.PKCS1v15(),
-                hashes.SHA512(),
-            )
-            return True
-        except InvalidSignature:
-            logger.warning('Подпись WATA webhook не прошла проверку')
-            return False
-        except Exception as error:
-            logger.error('Ошибка проверки подписи WATA', error=error)
-            return False
+        for attempt in range(2):
+            try:
+                public_key = serialization.load_pem_public_key(public_key_pem.encode('utf-8'))
+                if not isinstance(public_key, rsa.RSAPublicKey):
+                    logger.error('Публичный ключ WATA не является RSA')
+                    return False
+                public_key.verify(signature_bytes, raw_body, padding.PKCS1v15(), hashes.SHA512())
+                return True
+            except InvalidSignature:
+                if attempt == 0:
+                    public_key_pem = await self.public_key_provider.get_public_key(
+                        force_refresh=True,
+                        observed_key=public_key_pem,
+                    )
+                    if public_key_pem:
+                        continue
+                logger.warning('Подпись WATA webhook не прошла проверку')
+                return False
+            except Exception as error:
+                logger.error('Ошибка проверки подписи WATA', error=error)
+                return False
+        return False
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
         if not settings.is_wata_enabled():
             logger.warning('Получен WATA webhook, но сервис отключен')
             return web.json_response({'status': 'error', 'reason': 'wata_disabled'}, status=503)
 
-        raw_body = await request.text()
+        raw_body = await request.read()
         if not raw_body:
             logger.warning('Получен пустой WATA webhook')
             return web.json_response({'status': 'error', 'reason': 'empty_body'}, status=400)
@@ -154,7 +201,7 @@ class WataWebhookHandler:
 
         try:
             payload: dict[str, Any] = json.loads(raw_body)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError, UnicodeDecodeError:
             logger.error('Некорректный JSON WATA webhook')
             return web.json_response({'status': 'error', 'reason': 'invalid_json'}, status=400)
 
