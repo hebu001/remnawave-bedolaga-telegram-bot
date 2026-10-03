@@ -4013,6 +4013,9 @@
 - `tests/database/test_users_statistics_blocked_count.py` — Python-модуль
   Классы: нет
   Функции: `test_blocked_counts_only_the_blocked_status`
+- `tests/database/test_wata_callback_idempotency_postgres.py` — Python-модуль
+  Классы: нет
+  Функции: `test_repeated_paid_wata_callback_credits_and_counts_income_once`, `test_competing_paid_wata_callbacks_credit_and_count_income_once`
 
 #### tests/database/crud
 
@@ -4067,6 +4070,9 @@
 - `tests/external/test_users_stream_size_clamp.py` — Python-модуль
   Классы: нет
   Функции: `test_stream_size_clamped_to_panel_contract`
+- `tests/external/test_wata_key_rotation.py` — Python-модуль
+  Классы: `Clock` (3 методов), `QueueProvider` (2 методов)
+  Функции: `anyio_backend`, `keys`, `pem`, `sign`, `handler`, `test_refresh_interval_must_be_finite_and_positive`, `test_immediate_rotation_after_successful_initial_fetch`, `test_invalid_signature_retries_only_once_after_refresh`, `test_valid_cached_signature_does_not_refresh`, `test_malformed_base64_does_not_fetch_key`, `test_outage_retains_old_key_and_allows_later_rotation`, `test_bad_endpoint_key_never_replaces_known_rsa_key`, `test_non_rsa_endpoint_key_never_replaces_known_rsa_key`, `test_actual_fetch_failure_retains_cached_key_and_recovers`, `test_spoofed_webhooks_are_rate_limited_including_unchanged_key`, `test_initial_outage_rate_limits_all_repeated_requests`, `test_expired_key_outage_rate_limits_normal_and_forced_requests`, `test_concurrent_signature_failures_share_slow_refresh`, `test_concurrent_initial_requests_share_slow_fetch`, `test_concurrent_expired_requests_share_slow_outage`, `test_late_request_with_observed_old_key_reuses_rotated_key`, `test_cancelled_refresh_keeps_old_key_and_releases_lock`, `test_verification_uses_exact_signed_bytes`, `test_changed_bytes_fail_signature`, `test_aiohttp_signed_invalid_json_does_not_open_database`, `test_aiohttp_invalid_signature_never_opens_database`, `test_aiohttp_rotated_key_processes_payment_exactly_once`
 - `tests/external/test_wata_webhook.py` — Python-модуль
   Классы: `DummyPaymentService` (1 методов), `StubPublicKeyProvider` (2 методов)
   Функции: `anyio_backend`, `test_verify_signature_success`, `test_verify_signature_fails_with_invalid_signature`, `test_verify_signature_fails_without_public_key`
@@ -5754,6 +5760,9 @@
 - `tests/webserver/test_unified_app.py` — Python-модуль
   Классы: нет
   Функции: `test_cabinet_cors_allows_refresh_token_rotation_header`, `test_unified_app_health_reports_features`, `test_unified_app_apple_iap_only_mounts_only_apple_cabinet_routes`, `test_unified_app_health_path_without_admin`, `test_unified_app_docs_disabled`, `test_unified_app_docs_enabled_with_alias`
+- `tests/webserver/test_wata_signature_rotation.py` — Python-модуль
+  Классы: `Clock` (1 методов)
+  Функции: `anyio_backend`, `signing_keys`, `test_mounted_route_accepts_rotation_before_cache_expiry`, `test_mounted_route_rejects_signature_invalid_after_refresh`, `test_mounted_route_rejects_signed_invalid_encoding_after_crypto`, `test_mounted_route_verifies_original_utf8_whitespace_and_unicode`, `test_mounted_route_verifies_original_bom_and_utf16_bytes`, `test_mounted_route_keeps_old_key_during_outage_and_can_retry`, `test_mounted_concurrent_routes_share_one_refresh`, `test_mounted_bad_webhooks_cannot_bypass_refresh_cooldown`
 - `tests/webserver/test_webhook_bg_tasks_drain.py` — Python-модуль
   Классы: нет
   Функции: `test_spawned_task_is_held_until_it_finishes` — Ссылка на задачу живёт, пока та работает, и снимается после., `test_drain_waits_for_unfinished_processing` — Дренаж не отпускает остановку, пока платёж дорабатывается., `test_drain_returns_immediately_without_tasks` — Пустой набор — выкат не задерживается., `test_drain_gives_up_by_timeout_and_shouts` — Застрявшая задача не держит выкат вечно, но и не уходит молча., `test_drain_is_registered_before_the_other_shutdowns` — Дренаж обязан идти раньше остановки telegram-процессора и БД., `test_webhook_acks_before_processing_finishes` — Ответ 200 уходит НЕ дожидаясь обработки платежа.
