@@ -8,12 +8,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from aiogram.types import BufferedInputFile
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from starlette.responses import Response
 
-from app.bot_factory import create_bot
 from app.database.database import AsyncSessionLocal
 from app.database.models import Transaction, TransactionType, User
 from app.services.remnawave_service import RemnaWaveService
@@ -21,15 +19,17 @@ from app.services.remnawave_service import RemnaWaveService
 from ..dependencies import require_permission
 from ..schemas.traffic import (
     ExportCsvRequest,
-    ExportCsvResponse,
     SubscriptionEnrichmentInfo,
     SubscriptionTrafficInfo,
-    TrafficEnrichmentResponse,
     TrafficNodeInfo,
+    TrafficTopNodesResponse,
+    TrafficTopRequest,
+    TrafficTopResponse,
     TrafficUsageResponse,
     UserTrafficEnrichment,
     UserTrafficItem,
 )
+from . import traffic_top
 from .traffic_runtime import (
     DB_BATCH_SIZE,
     MAX_TRAFFIC_CELLS,
@@ -58,6 +58,29 @@ _user_cache: tuple[float, bool, dict[int, TrafficUser]] | None = None
 _traffic_cache: OrderedDict = OrderedDict()
 _enrichment_cache: tuple[float, dict] | None = None
 _page_enrichment_cache: OrderedDict = OrderedDict()
+
+
+def _retired_report():
+    raise HTTPException(
+        status_code=410,
+        detail={
+            'code': 'TRAFFIC_REPORT_REPLACED',
+            'message': 'Отчёт обновлён. Обновите кабинет и откройте расход трафика снова.',
+        },
+    )
+
+
+@router.get('/nodes', response_model=TrafficTopNodesResponse)
+async def get_traffic_nodes(admin: User = Depends(require_permission('traffic:read'))):
+    return await traffic_top.get_nodes()
+
+
+@router.post('/top', response_model=TrafficTopResponse)
+async def get_traffic_top(
+    request: TrafficTopRequest,
+    admin: User = Depends(require_permission('traffic:read')),
+):
+    return await traffic_top.get_top(request)
 
 
 def _get_status(sub) -> str | None:
@@ -469,23 +492,11 @@ def _render_usage(
     )
 
 
-@router.get('', response_model=TrafficUsageResponse)
+@router.get('', responses={410: {'description': 'Full report replaced by Top 100'}})
 async def get_traffic_usage(
     admin: User = Depends(require_permission('traffic:read')),
-    period: int = Query(30, ge=1, le=30),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    search: str = Query('', max_length=100),
-    sort_by: str = Query('total_bytes', max_length=100),
-    sort_desc: bool = Query(True),
-    tariffs: str = Query('', max_length=500),
-    statuses: str = Query('', max_length=500),
-    nodes: str = Query('', max_length=2000),
-    start_date: str = Query('', max_length=10),
-    end_date: str = Query('', max_length=10),
 ):
-    args = (period, limit, offset, search, sort_by, sort_desc, tariffs, statuses, nodes, start_date, end_date)
-    return await _jobs.run(('usage', *args), lambda: _get_traffic_usage(*args))
+    _retired_report()
 
 
 async def _get_bulk_spending(user_ids: list[int]) -> dict[int, int]:
@@ -711,20 +722,11 @@ async def _enrichment_response(user_ids):
     return await run_cpu(_enrichment_json_response, data)
 
 
-@router.get('/enrichment', response_model=TrafficEnrichmentResponse)
+@router.get('/enrichment', responses={410: {'description': 'Full report replaced by Top 100'}})
 async def get_traffic_enrichment(
     admin: User = Depends(require_permission('traffic:read')),
-    user_ids: str = Query('', max_length=4000),
 ):
-    ids = None
-    if user_ids.strip():
-        try:
-            ids = tuple(sorted({int(value) for value in user_ids.split(',')}))
-        except ValueError:
-            raise HTTPException(status_code=400, detail='user_ids must contain comma-separated integers.') from None
-        if not ids or len(ids) > 200 or ids[0] < 1:
-            raise HTTPException(status_code=400, detail='user_ids must contain 1 to 200 positive user IDs.')
-    return await _jobs.run(('enrichment', ids), lambda: _enrichment_response(ids))
+    _retired_report()
 
 
 @dataclass(slots=True)
@@ -897,29 +899,8 @@ def _render_csv(request, user_map, user_traffic, nodes_info, enrichment, period_
     return output.getvalue().encode('utf-8-sig'), row_count
 
 
-@router.post('/export-csv', response_model=ExportCsvResponse)
+@router.post('/export-csv', responses={410: {'description': 'Full report replaced by Top 100'}})
 async def export_traffic_csv_endpoint(
-    request: ExportCsvRequest,
     admin: User = Depends(require_permission('traffic:export')),
 ):
-    if not admin.telegram_id:
-        raise HTTPException(status_code=400, detail='Admin has no Telegram ID configured')
-    # Only pure preparation outlives the caller. A timeout/cancellation here
-    # never sends a Telegram document later from a detached background task.
-    key = ('export', admin.id, request.model_dump_json())
-    prepared = await _jobs.run(key, lambda: export_traffic_csv(request))
-    try:
-        bot = create_bot()
-        async with bot:
-            await bot.send_document(
-                chat_id=admin.telegram_id,
-                document=BufferedInputFile(prepared.content, filename=prepared.filename),
-                caption=prepared.caption,
-            )
-    except Exception:
-        logger.error('Failed to send CSV to admin', telegram_id=admin.telegram_id, exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail='Failed to send CSV report. Please try again later.',
-        )
-    return ExportCsvResponse(success=True, message=f'CSV sent ({prepared.row_count} users)')
+    _retired_report()

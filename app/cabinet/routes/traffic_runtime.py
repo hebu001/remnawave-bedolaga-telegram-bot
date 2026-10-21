@@ -224,7 +224,16 @@ async def load_user_map() -> dict[int, TrafficUser]:
     return panel_map
 
 
-async def panel_request(api, method: str, endpoint: str, *, params=None, data=None, allow_missing=False):
+async def panel_request(
+    api,
+    method: str,
+    endpoint: str,
+    *,
+    params=None,
+    data=None,
+    allow_missing=False,
+    max_body_bytes: int = MAX_PANEL_BODY_BYTES,
+):
     """Read a bounded JSON document without decoding it on the bot event loop.
 
     Reuse the established client's authentication, TLS, timeout, shared rate
@@ -244,12 +253,12 @@ async def panel_request(api, method: str, endpoint: str, *, params=None, data=No
             RemnaWaveAPI._throttle(5)
         if response.status >= 400:
             raise unavailable(f'Panel returned HTTP {response.status}; report was not cached.')
-        if response.content_length and response.content_length > MAX_PANEL_BODY_BYTES:
+        if response.content_length and response.content_length > max_body_bytes:
             raise unavailable('Panel report exceeds the response size budget.')
         body = bytearray()
         async for chunk in response.content.iter_chunked(64 * 1024):
             body.extend(chunk)
-            if len(body) > MAX_PANEL_BODY_BYTES:
+            if len(body) > max_body_bytes:
                 raise unavailable('Panel report exceeds the response size budget.')
         try:
             payload = await run_cpu(json.loads, body)

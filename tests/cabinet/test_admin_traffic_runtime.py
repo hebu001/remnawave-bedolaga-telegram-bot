@@ -342,30 +342,6 @@ async def test_global_enrichment_streams_cursor_and_fails_premature_device_end(m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('raw', ['0', '-1,2', 'a', '1,,2', ','.join(str(x) for x in range(1, 202))])
-async def test_page_enrichment_rejects_invalid_ids_without_starting_work(raw):
-    with pytest.raises(HTTPException) as error:
-        await traffic.get_traffic_enrichment(admin=SimpleNamespace(id=1), user_ids=raw)
-    assert error.value.status_code == 400
-    assert not traffic._jobs.jobs
-
-
-@pytest.mark.asyncio
-async def test_old_client_enrichment_no_ids_and_new_ids_share_response_shape(monkeypatch):
-    captured = []
-
-    async def response(ids):
-        captured.append(ids)
-        return traffic._json_response(traffic.TrafficEnrichmentResponse(data={1: UserTrafficEnrichment()}))
-
-    monkeypatch.setattr(traffic, '_enrichment_response', response)
-    for raw in ['', '2,1,2']:
-        result = await traffic.get_traffic_enrichment(admin=SimpleNamespace(id=1), user_ids=raw)
-        assert set(json.loads(result.body)) == {'data'}
-    assert captured == [None, (1, 2)]
-
-
-@pytest.mark.asyncio
 async def test_traffic_cache_has_bounded_date_cardinality_and_no_failed_entry(monkeypatch):
     api = SimpleNamespace(
         get_all_nodes=AsyncMock(return_value=[SimpleNamespace(uuid='a', name='A', country_code='FI')])
@@ -620,64 +596,6 @@ async def test_projection_preserves_newest_subscription_order_through_report_and
     assert rows['1']['Tariff'] == 'Z New' and rows['2']['Tariff'] == 'B New'
     assert rows['1']['Sub Start'] == newer_active_start.isoformat()
     assert rows['2']['Sub End'] == records[3][4].isoformat()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('outcome', ['timeout', 'cancel', 'success'])
-async def test_csv_delivery_only_after_successful_request_await(monkeypatch, outcome):
-    """Use the actual coordinator/CSV preparation; never call real Telegram."""
-    started, finish = asyncio.Event(), asyncio.Event()
-    jobs = runtime.TrafficJobs(wait_timeout=0.01 if outcome == 'timeout' else 5)
-    monkeypatch.setattr(traffic, '_jobs', jobs)
-
-    async def load():
-        started.set()
-        await finish.wait()
-        return {101: user(1, 'One')}
-
-    monkeypatch.setattr(traffic, '_load_user_map', load)
-    monkeypatch.setattr(traffic, '_aggregate_traffic', AsyncMock(return_value=({}, [])))
-    monkeypatch.setattr(traffic, '_get_enrichment', AsyncMock(return_value={}))
-    bot = AsyncMock()
-    bot.__aenter__.return_value = bot
-    factories = []
-
-    def create_bot():
-        factories.append(True)
-        return bot
-
-    monkeypatch.setattr(traffic, 'create_bot', create_bot)
-    request = asyncio.create_task(
-        traffic.export_traffic_csv_endpoint(ExportCsvRequest(period=30), SimpleNamespace(id=123, telegram_id=456))
-    )
-    await started.wait()
-    background = next(iter(jobs.jobs.values()))
-    if outcome == 'timeout':
-        with pytest.raises(HTTPException) as error:
-            await request
-        assert error.value.status_code == 503
-        assert not background.done()
-    elif outcome == 'cancel':
-        request.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await request
-        assert not background.done()
-    finish.set()
-    prepared = await background
-    assert isinstance(prepared, traffic.PreparedTrafficCsv)
-    assert prepared.row_count == 1
-    if outcome == 'success':
-        response = await request
-        assert response.success is True
-        assert response.message == 'CSV sent (1 users)'
-        assert factories == [True]
-        bot.send_document.assert_awaited_once()
-        assert bot.send_document.await_args.kwargs['chat_id'] == 456
-        assert bot.send_document.await_args.kwargs['document'].data == prepared.content
-    else:
-        await asyncio.sleep(0)
-        assert factories == []
-        bot.send_document.assert_not_awaited()
 
 
 def install_node_api(monkeypatch, count=32):
