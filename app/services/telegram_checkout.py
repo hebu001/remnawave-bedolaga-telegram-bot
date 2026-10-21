@@ -161,24 +161,17 @@ async def complete_checkout(token: str, db) -> str:
     method = intent['method']
     if method not in SUPPORTED_METHODS:
         raise CheckoutError('Способ оплаты недоступен.')
-    from app.cabinet.routes.balance import get_payment_methods
-
-    methods = await get_payment_methods(user=user, db=db)
-    provider = next((m for m in methods if m.id == ('yookassa' if method == 'yookassa_sbp' else method)), None)
-    option = 'sbp' if method == 'yookassa_sbp' else 'card'
-    if (
-        not provider
-        or not provider.is_available
-        or not provider.min_amount_kopeks <= amount <= provider.max_amount_kopeks
-        or (
-            method.startswith('yookassa')
-            and provider.options is not None
-            and option not in {o['id'] for o in provider.options}
-        )
-        or (method.startswith('yookassa') and not settings.is_yookassa_enabled())
-        or (method == 'yookassa_sbp' and not settings.YOOKASSA_SBP_ENABLED)
-        or (method == 'wata' and not settings.is_wata_enabled())
-    ):
+    # Telegram payment availability follows the existing bot handlers, not the
+    # cabinet-only PaymentMethodConfig filters and sub-options.
+    if method == 'wata':
+        enabled = settings.is_wata_enabled()
+        minimum = settings.WATA_MIN_AMOUNT_KOPEKS
+        maximum = settings.WATA_MAX_AMOUNT_KOPEKS
+    else:
+        enabled = settings.is_yookassa_enabled() and (method != 'yookassa_sbp' or settings.YOOKASSA_SBP_ENABLED)
+        minimum = settings.YOOKASSA_MIN_AMOUNT_KOPEKS
+        maximum = settings.YOOKASSA_MAX_AMOUNT_KOPEKS
+    if not enabled or not minimum <= amount <= maximum:
         raise CheckoutError('Способ или сумма оплаты недоступны. Вернитесь в бот.')
     if intent['status'] == 'complete':
         return intent['url']

@@ -96,6 +96,9 @@ def setup(monkeypatch):
     monkeypatch.setattr(balance, 'get_payment_methods', AsyncMock(return_value=providers))
     monkeypatch.setattr(Settings, 'is_yookassa_enabled', lambda self: True)
     monkeypatch.setattr(Settings, 'is_wata_enabled', lambda self: True)
+    for provider in ('YOOKASSA', 'WATA'):
+        monkeypatch.setattr(settings, provider + '_MIN_AMOUNT_KOPEKS', 100)
+        monkeypatch.setattr(settings, provider + '_MAX_AMOUNT_KOPEKS', 100000)
     monkeypatch.setattr(settings, 'YOOKASSA_SBP_ENABLED', True)
     monkeypatch.setattr(settings, 'WEBHOOK_URL', 'https://checkout.example')
     monkeypatch.setattr(m.maintenance_service, 'is_maintenance_active', lambda: False)
@@ -186,7 +189,7 @@ async def test_unknown_outcome_never_recreates_on_retry(setup, failure):
 
 @pytest.mark.parametrize(
     'reason',
-    ['expired', 'cart', 'balance', 'restricted', 'blocked', 'deleted', 'maintenance', 'limits', 'disabled', 'option'],
+    ['expired', 'cart', 'balance', 'restricted', 'blocked', 'deleted', 'maintenance', 'limits', 'disabled'],
 )
 async def test_fail_closed_before_provider(setup, reason, monkeypatch):
     token = await m.issue_token(1, setup.cart, 'yookassa', 5000)
@@ -203,11 +206,52 @@ async def test_fail_closed_before_provider(setup, reason, monkeypatch):
     if reason == 'restricted':
         setup.user.restriction_topup = True
     if reason == 'limits':
-        setup.providers[0].min_amount_kopeks = 6000
+        monkeypatch.setattr(settings, 'YOOKASSA_MIN_AMOUNT_KOPEKS', 6000)
     if reason == 'disabled':
         monkeypatch.setattr(Settings, 'is_yookassa_enabled', lambda self: False)
-    if reason == 'option':
-        setup.providers[0].options = [{'id': 'sbp'}]
+    with pytest.raises(m.CheckoutError):
+        await m.complete_checkout(token, AsyncMock())
+    setup.create.assert_not_awaited()
+
+
+@pytest.mark.parametrize('method', ['yookassa', 'yookassa_sbp', 'wata'])
+async def test_telegram_checkout_ignores_cabinet_only_filters(setup, method):
+    from app.cabinet.routes import balance
+
+    # Production cabinet configuration can hide SBP/WATA and use other limits.
+    setup.providers[0].options = [{'id': 'card'}]
+    setup.providers[0].min_amount_kopeks = 999999
+    setup.providers[1].is_available = False
+    token = await m.issue_token(1, setup.cart, method, 5000)
+    assert await m.complete_checkout(token, AsyncMock()) == 'https://pay.example/test'
+    balance.get_payment_methods.assert_not_awaited()
+    setup.create.assert_awaited_once()
+
+
+@pytest.mark.parametrize('method', ['yookassa', 'yookassa_sbp', 'wata'])
+@pytest.mark.parametrize('amount,allowed', [(4999, False), (5000, True), (6000, True), (6001, False)])
+async def test_telegram_provider_limits_are_inclusive(setup, monkeypatch, method, amount, allowed):
+    provider = 'WATA' if method == 'wata' else 'YOOKASSA'
+    monkeypatch.setattr(settings, provider + '_MIN_AMOUNT_KOPEKS', 5000)
+    monkeypatch.setattr(settings, provider + '_MAX_AMOUNT_KOPEKS', 6000)
+    setup.user.balance_kopeks = setup.cart['total_price'] - amount
+    token = await m.issue_token(1, setup.cart, method, amount)
+    if allowed:
+        assert await m.complete_checkout(token, AsyncMock()) == 'https://pay.example/test'
+        setup.create.assert_awaited_once()
+    else:
+        with pytest.raises(m.CheckoutError):
+            await m.complete_checkout(token, AsyncMock())
+        setup.create.assert_not_awaited()
+
+
+@pytest.mark.parametrize('method', ['yookassa', 'yookassa_sbp', 'wata'])
+async def test_telegram_provider_disabled_rejected(setup, monkeypatch, method):
+    if method == 'yookassa_sbp':
+        monkeypatch.setattr(settings, 'YOOKASSA_SBP_ENABLED', False)
+    else:
+        monkeypatch.setattr(Settings, 'is_' + method + '_enabled', lambda self: False)
+    token = await m.issue_token(1, setup.cart, method, 5000)
     with pytest.raises(m.CheckoutError):
         await m.complete_checkout(token, AsyncMock())
     setup.create.assert_not_awaited()
