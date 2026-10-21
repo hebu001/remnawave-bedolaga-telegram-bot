@@ -19,6 +19,7 @@ from app.services.payment_service import PaymentService
 from app.services.rbac_bootstrap_service import is_protected_from_blocking
 from app.services.support_settings_service import SupportSettingsService
 from app.services.user_cart_service import user_cart_service
+from app.utils.cache import RateLimitCache
 
 
 TTL = 900
@@ -63,6 +64,10 @@ return 1
 
 class CheckoutError(Exception):
     """Safe text suitable for the checkout page; never includes credentials."""
+
+
+class CheckoutRateLimited(CheckoutError):
+    """The server-side checkout owner exceeded the request budget."""
 
 
 def cart_fingerprint(cart: dict) -> str:
@@ -137,6 +142,12 @@ async def complete_checkout(token: str, db) -> str:
     if not raw:
         raise CheckoutError('Ссылка истекла. Вернитесь в бот и откройте оплату заново.')
     intent = json.loads(raw)
+    async with asyncio.timeout(3):
+        limited = await RateLimitCache.is_rate_limited(
+            intent['user_id'], 'telegram_checkout', limit=30, window=60, fail_closed=True
+        )
+    if limited:
+        raise CheckoutRateLimited('Слишком много запросов. Повторно откройте ссылку позже.')
     user = await get_user_by_id(db, intent['user_id'])
     if (
         user is None

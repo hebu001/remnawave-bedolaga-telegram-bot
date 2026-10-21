@@ -12,6 +12,9 @@ from app.config import Settings, settings
 from app.services import telegram_checkout as m
 
 
+_REAL_OWNER_LIMITER = m.RateLimitCache.is_rate_limited
+
+
 class Redis:
     """Atomic in-memory model; production Lua also needs an actual Redis smoke."""
 
@@ -55,7 +58,7 @@ class Redis:
 
 @pytest.fixture
 def setup(monkeypatch):
-    from app.cabinet.routes import balance, telegram_checkout as routes
+    from app.cabinet.routes import balance
 
     redis = Redis()
     cart = dict(
@@ -102,7 +105,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(settings, 'YOOKASSA_SBP_ENABLED', True)
     monkeypatch.setattr(settings, 'WEBHOOK_URL', 'https://checkout.example')
     monkeypatch.setattr(m.maintenance_service, 'is_maintenance_active', lambda: False)
-    monkeypatch.setattr(routes.RateLimitCache, 'is_ip_rate_limited', AsyncMock(return_value=False))
+    monkeypatch.setattr(m.RateLimitCache, 'is_rate_limited', AsyncMock(return_value=False))
     return SimpleNamespace(redis=redis, cart=cart, user=user, create=create, service=service, providers=providers)
 
 
@@ -257,6 +260,51 @@ async def test_telegram_provider_disabled_rejected(setup, monkeypatch, method):
     setup.create.assert_not_awaited()
 
 
+async def test_owner_rate_budget_is_independent_behind_same_proxy(setup):
+    counts = {}
+
+    async def limit(user_id, action, *, limit, window, fail_closed):
+        assert (action, limit, window, fail_closed) == ('telegram_checkout', 30, 60, True)
+        counts[user_id] = counts.get(user_id, 0) + 1
+        return counts[user_id] > limit
+
+    m.RateLimitCache.is_rate_limited.side_effect = limit
+    first = await m.issue_token(1, setup.cart, 'yookassa', 5000)
+    second = await m.issue_token(2, setup.cart, 'yookassa', 5000)
+    for _ in range(30):
+        await m.complete_checkout(first, AsyncMock())
+    m.get_user_by_id.reset_mock()
+    setup.create.reset_mock()
+    with pytest.raises(m.CheckoutRateLimited):
+        await m.complete_checkout(first, AsyncMock())
+    m.get_user_by_id.assert_not_awaited()
+    setup.create.assert_not_awaited()
+    await m.complete_checkout(second, AsyncMock())
+    assert counts == {1: 31, 2: 1}
+    setup.create.assert_awaited_once()
+
+
+async def test_unknown_token_never_allocates_owner_budget_or_loads_user(setup):
+    with pytest.raises(m.CheckoutError):
+        await m.complete_checkout('x' * 43, AsyncMock())
+    m.RateLimitCache.is_rate_limited.assert_not_awaited()
+    m.get_user_by_id.assert_not_awaited()
+    setup.create.assert_not_awaited()
+
+
+async def test_unavailable_owner_limiter_fails_closed_before_user_lookup(setup, monkeypatch):
+    from app.utils.cache import RateLimitCache, cache
+
+    # Exercise the actual cache implementation, rather than its fixture stub.
+    monkeypatch.setattr(cache, '_connected', False)
+    monkeypatch.setattr(RateLimitCache, 'is_rate_limited', _REAL_OWNER_LIMITER)
+    token = await m.issue_token(1, setup.cart, 'yookassa', 5000)
+    with pytest.raises(m.CheckoutRateLimited):
+        await m.complete_checkout(token, AsyncMock())
+    m.get_user_by_id.assert_not_awaited()
+    setup.create.assert_not_awaited()
+
+
 async def test_static_page_and_origin_csrf_checks(setup):
     from app.cabinet.dependencies import get_cabinet_db
     from app.cabinet.routes import telegram_checkout as routes
@@ -286,9 +334,27 @@ async def test_static_page_and_origin_csrf_checks(setup):
             headers={'Origin': 'https://checkout.example'},
         )
         assert good.status_code == 200 and good.json()['url'] == 'https://pay.example/test'
+        m.RateLimitCache.is_rate_limited.side_effect = lambda user_id, *args, **kwargs: user_id == 1
+        m.get_user_by_id.reset_mock()
+        setup.create.reset_mock()
+        limited = await client.post(
+            '/cabinet/telegram-checkout',
+            json={'token': token, 'csrf': csrf},
+            headers={'Origin': 'https://checkout.example'},
+        )
+        assert limited.status_code == 429
+        m.get_user_by_id.assert_not_awaited()
+        setup.create.assert_not_awaited()
+        other_token = await m.issue_token(2, setup.cart, 'yookassa', 5000)
+        other = await client.post(
+            '/cabinet/telegram-checkout',
+            json={'token': other_token, 'csrf': csrf},
+            headers={'Origin': 'https://checkout.example'},
+        )
+        assert other.status_code == 200  # Same client/proxy IP, independent intent owner.
 
 
-@pytest.mark.parametrize('reason', ['token', 'extra', 'type', 'json', 'content_type', 'oversized_stream', 'rate_limit'])
+@pytest.mark.parametrize('reason', ['token', 'extra', 'type', 'json', 'content_type', 'oversized_stream'])
 async def test_ingress_rejects_before_checkout_without_echoing_credentials(setup, monkeypatch, reason):
     from app.cabinet.dependencies import get_cabinet_db
     from app.cabinet.routes import telegram_checkout as routes
@@ -309,9 +375,6 @@ async def test_ingress_rejects_before_checkout_without_echoing_credentials(setup
             body['user_id'] = 999
         elif reason == 'type':
             body['csrf'] = 123
-        elif reason == 'rate_limit':
-            routes.RateLimitCache.is_ip_rate_limited.return_value = True
-            expected = 429
         content = json.dumps(body)
         content_type = 'application/json'
         if reason == 'json':
@@ -337,9 +400,7 @@ async def test_ingress_rejects_before_checkout_without_echoing_credentials(setup
     assert token not in result.text and 'csrf' not in result.text
     complete.assert_not_awaited()
     setup.create.assert_not_awaited()
-    routes.RateLimitCache.is_ip_rate_limited.assert_awaited_once_with(
-        '127.0.0.1', 'telegram_checkout', limit=30, window=60, fail_closed=True
-    )
+    m.RateLimitCache.is_rate_limited.assert_not_awaited()
 
 
 @pytest.mark.parametrize('restore', [False, True])

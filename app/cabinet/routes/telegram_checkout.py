@@ -7,9 +7,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.cabinet.dependencies import get_cabinet_db
-from app.cabinet.ip_utils import get_client_ip
-from app.services.telegram_checkout import CheckoutError, checkout_origin, complete_checkout
-from app.utils.cache import RateLimitCache
+from app.services.telegram_checkout import CheckoutError, CheckoutRateLimited, checkout_origin, complete_checkout
 
 
 router = APIRouter(prefix='/telegram-checkout', tags=['Telegram checkout'])
@@ -99,16 +97,14 @@ async def checkout_submit(request: Request, db=Depends(get_cabinet_db)):
         raise HTTPException(503, str(error)) from None
     if request.headers.get('origin') != origin:
         raise HTTPException(403, 'Откройте ссылку оплаты из бота заново.')
-    if await RateLimitCache.is_ip_rate_limited(
-        get_client_ip(request), 'telegram_checkout', limit=30, window=60, fail_closed=True
-    ):
-        raise HTTPException(429, 'Слишком много запросов. Повторно откройте ссылку позже.')
     body = await _read_checkout_body(request)
     cookie = request.cookies.get('telegram_checkout_csrf', '')
     if not secrets.compare_digest(cookie, body.csrf):
         raise HTTPException(403, 'Откройте ссылку оплаты из бота заново.')
     try:
         url = await complete_checkout(body.token, db)
+    except CheckoutRateLimited as error:
+        raise HTTPException(429, str(error)) from None
     except CheckoutError as error:
         raise HTTPException(409, str(error)) from None
     except Exception:
