@@ -149,7 +149,7 @@ async def test_proceed_normal_selection_uses_menu_buy_back(monkeypatch):
     await m._proceed_with_selected_tariff(callback, db_user, AsyncMock(), _state(), 77)
 
     m.get_tariff_periods_keyboard.assert_awaited_once()
-    assert m.get_tariff_periods_keyboard.call_args.kwargs['back_callback'] == 'menu_buy'
+    assert m.get_tariff_periods_keyboard.call_args.kwargs['back_callback'] == 'tariff_list'
 
 
 async def test_back_target_survives_a_redraw_of_the_custom_screen(monkeypatch):
@@ -207,13 +207,99 @@ async def test_single_owned_tariff_shows_the_list_instead_of_a_dead_button(monke
     monkeypatch.setattr(m, 'get_tariffs_keyboard', MagicMock(return_value='LIST KB'))
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: True)
 
-    import app.database.crud.subscription as sub_crud
-
     owned = SimpleNamespace(tariff_id=42, is_trial=False)
-    monkeypatch.setattr(sub_crud, 'get_active_subscriptions_by_user_id', AsyncMock(return_value=[owned]))
+    monkeypatch.setattr(m, 'get_active_subscriptions_by_user_id', AsyncMock(return_value=[owned]))
 
     callback = _callback()
     await m.show_tariffs_list.__wrapped__(callback, _user(), AsyncMock(), _state())
 
     proceed.assert_not_awaited()
     callback.message.edit_text.assert_awaited_once(), 'пользователю должен показаться список, а не пустой экран'
+
+
+@pytest.mark.parametrize('entry', ['menu_buy', 'subscription_purchase', 'subscription_upgrade'])
+async def test_assigned_tariff_skips_catalog_with_multiple_choices(monkeypatch, entry):
+    tariffs = [_period_tariff(1), _period_tariff(2)]
+    monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(m, 'get_tariffs_for_user', AsyncMock(return_value=tariffs))
+    monkeypatch.setattr(m, 'get_subscription_by_user_id', AsyncMock(return_value=SimpleNamespace(tariff_id=2)))
+    proceed = AsyncMock()
+    monkeypatch.setattr(m, '_proceed_with_selected_tariff', proceed)
+    callback, user, db, state = _callback(entry), _user(), AsyncMock(), _state()
+    await m.show_tariffs_list.__wrapped__(callback, user, db, state)
+    proceed.assert_awaited_once_with(callback, user, db, state, 2, skip_selection=True)
+    callback.message.edit_text.assert_not_awaited()
+
+
+@pytest.mark.parametrize('case', ['no_tariff', 'inaccessible', 'inactive', 'explicit_catalog', 'multi'])
+async def test_catalog_remains_available_when_assigned_tariff_cannot_be_used(monkeypatch, case):
+    tariffs = [_period_tariff(1), _period_tariff(2)]
+    if case == 'inactive':
+        tariffs[1].is_active = False
+    assigned_id = {'no_tariff': None, 'inaccessible': 99}.get(case, 2)
+    monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: case == 'multi')
+    monkeypatch.setattr(m, 'get_active_subscriptions_by_user_id', AsyncMock(return_value=[]))
+    monkeypatch.setattr(m, 'get_tariffs_for_user', AsyncMock(return_value=tariffs))
+    monkeypatch.setattr(
+        m, 'get_subscription_by_user_id', AsyncMock(return_value=SimpleNamespace(tariff_id=assigned_id))
+    )
+    monkeypatch.setattr(m, 'format_tariffs_list_text', AsyncMock(return_value='CATALOG'))
+    monkeypatch.setattr(m, 'get_tariffs_keyboard', MagicMock(return_value='KEYBOARD'))
+    proceed = AsyncMock()
+    monkeypatch.setattr(m, '_proceed_with_selected_tariff', proceed)
+    callback = _callback('tariff_list' if case == 'explicit_catalog' else 'menu_buy')
+    await m.show_tariffs_list.__wrapped__(callback, _user(), AsyncMock(), _state())
+    proceed.assert_not_awaited()
+    assert callback.message.edit_text.await_args.args[0] == 'CATALOG'
+
+
+@pytest.mark.parametrize(
+    'entry,selected_id,expected_back', [('menu_buy', 2, 'back_to_menu'), ('tariff_list', 1, 'tariff_list')]
+)
+async def test_confirmation_back_preserves_origin_through_real_handlers(monkeypatch, entry, selected_id, expected_back):
+    from app.services.pricing_engine import pricing_engine
+
+    tariffs = [_period_tariff(1), _period_tariff(2)]
+    monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(m, 'get_tariffs_for_user', AsyncMock(return_value=tariffs))
+    monkeypatch.setattr(m, 'get_tariff_by_id', AsyncMock(side_effect=lambda db, tid: tariffs[tid - 1]))
+    monkeypatch.setattr(
+        m, 'get_subscription_by_user_id', AsyncMock(return_value=SimpleNamespace(id=11, tariff_id=2, device_limit=2))
+    )
+    monkeypatch.setattr(m, 'format_tariffs_list_text', AsyncMock(return_value='CATALOG'))
+    monkeypatch.setattr(m, 'format_tariff_info_for_user', MagicMock(return_value='PERIODS'))
+    monkeypatch.setattr(
+        pricing_engine,
+        'calculate_tariff_purchase_price',
+        AsyncMock(
+            return_value=SimpleNamespace(
+                original_total=10000, final_total=10000, promo_group_discount=0, promo_offer_discount=0
+            )
+        ),
+    )
+    data = {}
+    state = SimpleNamespace(
+        clear=AsyncMock(side_effect=data.clear),
+        get_data=AsyncMock(side_effect=lambda: dict(data)),
+        update_data=AsyncMock(side_effect=lambda **kw: data.update(kw)),
+        set_state=AsyncMock(),
+    )
+    callback, user, db = _callback(entry), _user(), AsyncMock()
+    await m.show_tariffs_list.__wrapped__(callback, user, db, state)
+    if entry == 'tariff_list':
+        callback.data = f'tariff_select:{selected_id}'
+        await m.select_tariff.__wrapped__(callback, user, db, state)
+    assert (
+        callback.message.edit_text.await_args.kwargs['reply_markup'].inline_keyboard[-1][0].callback_data
+        == expected_back
+    )
+    callback.data = f'tariff_period:{selected_id}:30'
+    await m.select_tariff_period.__wrapped__(callback, user, db, state)
+    callback.data = callback.message.edit_text.await_args.kwargs['reply_markup'].inline_keyboard[-1][0].callback_data
+    assert callback.data == f'tariff_select:{selected_id}'
+    await m.select_tariff.__wrapped__(callback, user, db, state)
+    assert (
+        callback.message.edit_text.await_args.kwargs['reply_markup'].inline_keyboard[-1][0].callback_data
+        == expected_back
+    )
+    assert await m._tariff_back_callback(state) == expected_back

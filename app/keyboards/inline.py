@@ -1745,6 +1745,23 @@ def _apply_payment_name_overrides(keyboard: list[list[InlineKeyboardButton]]) ->
                 row[idx] = button.model_copy(update={'text': override})
 
 
+def style_payment_method_buttons(keyboard: list[list[InlineKeyboardButton]]) -> None:
+    """Style provider choices after filtering, preserving callbacks and order."""
+    # Assign icons after filtering disabled methods, in the displayed order.
+    payment_icons = ('5192678313415434135', '5192803468762441581')
+    payment_index = 0
+    for row in keyboard:
+        for button in row:
+            if (button.callback_data or '').startswith(
+                ('topup_amount|', 'topup_', 'tariff_sbp:', 'tariff_lava:', 'tariff_cashera:')
+            ):
+                button.style = 'primary'
+                if payment_index < len(payment_icons):
+                    button.icon_custom_emoji_id = payment_icons[payment_index]
+                    button.text = strip_leading_emoji(button.text)
+                payment_index += 1
+
+
 def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
     texts = get_texts(language)
     keyboard = []
@@ -2461,6 +2478,8 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
     keyboard.append([InlineKeyboardButton(text=texts.BACK, callback_data='menu_balance')])
 
     _apply_payment_name_overrides(keyboard)
+
+    style_payment_method_buttons(keyboard)
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 

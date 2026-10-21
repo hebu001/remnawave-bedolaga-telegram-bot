@@ -318,7 +318,13 @@ async def get_tariff_periods_keyboard(
             price_text = format_price_kopeks(price)
 
         button_text = _period_button_text(tariff, period, price_text, texts)
-        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f'tariff_period:{tariff.id}:{period}')])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=button_text, callback_data=f'tariff_period:{tariff.id}:{period}', style='success'
+                )
+            ]
+        )
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=back_callback)])
 
@@ -358,12 +364,23 @@ async def get_tariff_periods_keyboard_with_traffic(
         button_text = _period_button_text(tariff, period, price_text, texts)
         # Используем другой callback для перехода к настройке трафика
         buttons.append(
-            [InlineKeyboardButton(text=button_text, callback_data=f'tariff_period_traffic:{tariff.id}:{period}')]
+            [
+                InlineKeyboardButton(
+                    text=button_text, callback_data=f'tariff_period_traffic:{tariff.id}:{period}', style='success'
+                )
+            ]
         )
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=back_callback)])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _payment_markup(*, inline_keyboard: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    from app.keyboards.inline import style_payment_method_buttons
+
+    style_payment_method_buttons(inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
 
 
 def get_tariff_confirm_keyboard(
@@ -376,7 +393,9 @@ def get_tariff_confirm_keyboard(
     buttons = [
         [
             InlineKeyboardButton(
-                text=texts.t('TARIFF_PURCHASE_CONFIRM_BUTTON', '✅ Подтвердить покупку'),
+                text=texts.t('TARIFF_PURCHASE_CONFIRM_BUTTON', 'Оплатить балансом'),
+                style='primary',
+                icon_custom_emoji_id='5375112143144263548',
                 callback_data=f'tariff_confirm:{tariff_id}:{period}',
             )
         ],
@@ -412,7 +431,7 @@ def get_tariff_confirm_keyboard(
             ]
         )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'tariff_select:{tariff_id}')])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return _payment_markup(inline_keyboard=buttons)
 
 
 def get_tariff_insufficient_balance_keyboard(
@@ -447,9 +466,9 @@ def get_tariff_insufficient_balance_keyboard(
             if row and all((button.callback_data or '').startswith('topup_amount|') for button in row)
         ]
         if payment_rows:
-            return InlineKeyboardMarkup(inline_keyboard=[*payment_rows, *sbp_rows, [back_button]])
+            return _payment_markup(inline_keyboard=[*payment_rows, *sbp_rows, [back_button]])
 
-    return InlineKeyboardMarkup(
+    return _payment_markup(
         inline_keyboard=[
             [InlineKeyboardButton(text=texts.t('BALANCE_TOPUP', '💳 Пополнить баланс'), callback_data='balance_topup')],
             *sbp_rows,
@@ -500,9 +519,9 @@ def get_tariff_extend_insufficient_balance_keyboard(
             if row and all((button.callback_data or '').startswith('topup_amount|') for button in row)
         ]
         if payment_rows:
-            return InlineKeyboardMarkup(inline_keyboard=[*payment_rows, [back_button]])
+            return _payment_markup(inline_keyboard=[*payment_rows, [back_button]])
 
-    return InlineKeyboardMarkup(
+    return _payment_markup(
         inline_keyboard=[
             [InlineKeyboardButton(text=texts.t('BALANCE_TOPUP', '💳 Пополнить баланс'), callback_data='balance_topup')],
             [back_button],
@@ -589,7 +608,9 @@ def get_daily_tariff_confirm_keyboard(
     buttons = [
         [
             InlineKeyboardButton(
-                text=texts.t('TARIFF_PURCHASE_CONFIRM_BUTTON', '✅ Подтвердить покупку'),
+                text=texts.t('TARIFF_PURCHASE_CONFIRM_BUTTON', 'Оплатить балансом'),
+                style='primary',
+                icon_custom_emoji_id='5375112143144263548',
                 callback_data=f'daily_tariff_confirm:{tariff_id}',
             )
         ],
@@ -622,7 +643,7 @@ def get_daily_tariff_confirm_keyboard(
             ]
         )
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=back_callback)])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return _payment_markup(inline_keyboard=buttons)
 
 
 def get_daily_tariff_insufficient_balance_keyboard(
@@ -632,7 +653,7 @@ def get_daily_tariff_insufficient_balance_keyboard(
 ) -> InlineKeyboardMarkup:
     """Создает клавиатуру при недостаточном балансе для суточного тарифа."""
     texts = get_texts(language)
-    return InlineKeyboardMarkup(
+    return _payment_markup(
         inline_keyboard=[
             [InlineKeyboardButton(text=texts.t('BALANCE_TOPUP', '💳 Пополнить баланс'), callback_data='balance_topup')],
             *_sbp_purchase_rows(tariff_id, texts),
@@ -724,7 +745,9 @@ def get_custom_tariff_keyboard(
     buttons.append(
         [
             InlineKeyboardButton(
-                text=texts.t('TARIFF_PURCHASE_CONFIRM_BUTTON', '✅ Подтвердить покупку'),
+                text=texts.t('TARIFF_PURCHASE_CONFIRM_BUTTON', 'Оплатить балансом'),
+                style='primary',
+                icon_custom_emoji_id='5375112143144263548',
                 callback_data=f'custom_confirm:{tariff_id}',
             )
         ]
@@ -894,6 +917,19 @@ async def show_tariffs_list(
         await callback.answer()
         return
 
+    # Обычная покупка в однотарифном режиме продолжает назначенный тариф.
+    # Явный каталог / смена тарифа и мультитарифный выбор остаются доступны.
+    if (
+        callback.data in {'menu_buy', 'subscription_purchase', 'subscription_upgrade'}
+        and not settings.is_multi_tariff_enabled()
+    ):
+        subscription = await get_subscription_by_user_id(db, db_user.id)
+        if subscription and subscription.tariff_id:
+            assigned = next((tariff for tariff in tariffs if tariff.id == subscription.tariff_id), None)
+            if assigned is not None and assigned.is_active:
+                await _proceed_with_selected_tariff(callback, db_user, db, state, assigned.id, skip_selection=True)
+                return
+
     # Один доступный тариф — сразу к периоду/подтверждению, без экрана «выбора из одной кнопки».
     # Кроме случая, когда покупать нечего: в мультитарифе `_proceed_with_selected_tariff`
     # на уже активном тарифе только показывает всплывающее уведомление и выходит,
@@ -902,8 +938,6 @@ async def show_tariffs_list(
     if len(tariffs) == 1:
         _already_owned = False
         if settings.is_multi_tariff_enabled():
-            from app.database.crud.subscription import get_active_subscriptions_by_user_id
-
             _active = await get_active_subscriptions_by_user_id(db, db_user.id)
             _already_owned = any(s.tariff_id == tariffs[0].id and not s.is_trial for s in _active)
         if not _already_owned:
@@ -966,7 +1000,7 @@ async def _tariff_back_callback(state: FSMContext) -> str:
     тот же экран, попутно сбрасывая уже выбранные дни.
     """
     data = await state.get_data()
-    return 'back_to_menu' if data.get('tariff_selection_skipped') else 'menu_buy'
+    return 'back_to_menu' if data.get('tariff_selection_skipped') else 'tariff_list'
 
 
 async def _proceed_with_selected_tariff(
@@ -987,7 +1021,7 @@ async def _proceed_with_selected_tariff(
     ведёт в главное меню (``back_to_menu``), а не в ``menu_buy`` / список.
     """
     texts = get_texts(db_user.language)
-    back_callback = 'back_to_menu' if skip_selection else 'menu_buy'
+    back_callback = 'back_to_menu' if skip_selection else 'tariff_list'
     # Признак нужен последующим перерисовкам в других хендлерах.
     await state.update_data(tariff_selection_skipped=skip_selection)
     tariff = await get_tariff_by_id(db, tariff_id)
@@ -1117,10 +1151,6 @@ async def _proceed_with_selected_tariff(
                     discount=discount_text,
                     balance=format_price_kopeks(user_balance),
                     missing=format_price_kopeks(missing),
-                )
-                + texts.t(
-                    'TARIFF_PURCHASE_CART_SAVED_HINT',
-                    '\n\n🛒 <i>Корзина сохранена! После пополнения баланса подписка будет оформлена автоматически.</i>',
                 ),
                 reply_markup=get_daily_tariff_insufficient_balance_keyboard(
                     tariff_id, db_user.language, back_callback=back_callback
@@ -1229,7 +1259,12 @@ async def select_tariff(
 ):
     """Обрабатывает выбор тарифа."""
     tariff_id = int(callback.data.split(':')[1])
-    await _proceed_with_selected_tariff(callback, db_user, db, state, tariff_id)
+    data = await state.get_data()
+    # Returning from confirmation must retain the original navigation target.
+    if data.get('tariff_selection_skipped') and data.get('selected_tariff_id') == tariff_id:
+        await _proceed_with_selected_tariff(callback, db_user, db, state, tariff_id, skip_selection=True)
+    else:
+        await _proceed_with_selected_tariff(callback, db_user, db, state, tariff_id)
 
 
 @error_handler
@@ -1887,10 +1922,6 @@ async def select_tariff_period(
                 price=format_price_kopeks(final_price),
                 balance=format_price_kopeks(user_balance),
                 missing=format_price_kopeks(missing),
-            )
-            + texts.t(
-                'TARIFF_PURCHASE_CART_SAVED_HINT',
-                '\n\n🛒 <i>Корзина сохранена! После пополнения баланса подписка будет оформлена автоматически.</i>',
             ),
             reply_markup=get_tariff_insufficient_balance_keyboard(
                 tariff_id, period, db_user.language, missing_kopeks=missing
@@ -2757,6 +2788,7 @@ def get_tariff_extend_keyboard(
                 InlineKeyboardButton(
                     text=button_text,
                     callback_data=f'tariff_extend:{subscription_id}:{tariff.id}:{period}',
+                    style='success',
                 )
             ]
         )
@@ -2778,7 +2810,9 @@ def get_tariff_extend_confirm_keyboard(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=texts.t('TARIFF_RENEW_CONFIRM_BUTTON', '✅ Подтвердить продление'),
+                    text=texts.t('TARIFF_RENEW_CONFIRM_BUTTON', 'Оплатить балансом'),
+                    style='primary',
+                    icon_custom_emoji_id='5375112143144263548',
                     callback_data=f'tariff_ext_confirm:{subscription_id}:{tariff_id}:{period}',
                 )
             ],
@@ -3098,10 +3132,6 @@ async def select_tariff_extend_period(
                 price=format_price_kopeks(final_price),
                 balance=format_price_kopeks(user_balance),
                 missing=format_price_kopeks(missing),
-            )
-            + texts.t(
-                'TARIFF_RENEW_CART_SAVED_HINT',
-                '\n\n🛒 <i>Корзина сохранена! После пополнения баланса подписка будет продлена автоматически.</i>',
             ),
             reply_markup=get_tariff_extend_insufficient_balance_keyboard(
                 tariff_id,
@@ -3472,7 +3502,13 @@ def get_tariff_switch_periods_keyboard(
             price_text = format_price_kopeks(price)
 
         button_text = _period_button_text(tariff, period, price_text, texts)
-        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f'tariff_sw_period:{tariff.id}:{period}')])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=button_text, callback_data=f'tariff_sw_period:{tariff.id}:{period}', style='success'
+                )
+            ]
+        )
 
     buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data='tariff_switch')])
 
@@ -5741,7 +5777,9 @@ async def return_to_saved_tariff_cart(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text=texts.t('TARIFF_RENEW_CONFIRM_BUTTON', '✅ Подтвердить продление'),
+                            text=texts.t('TARIFF_RENEW_CONFIRM_BUTTON', 'Оплатить балансом'),
+                            style='primary',
+                            icon_custom_emoji_id='5375112143144263548',
                             callback_data=f'tariff_ext_confirm:{_extend_sub_id}:{tariff_id}:{period}',
                         )
                     ],
