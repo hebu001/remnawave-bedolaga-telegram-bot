@@ -77,6 +77,7 @@ from .subpage import router as subpage_router
 from .subscription import router as subscription_router
 from .subscription_modules.multi_tariff import router as multi_tariff_subscription_router
 from .support_ws import router as support_ws_router
+from .telegram_checkout import router as telegram_checkout_router
 from .ticket_notifications import (
     admin_router as admin_ticket_notifications_router,
     router as ticket_notifications_router,
@@ -110,6 +111,7 @@ router.include_router(abuse_router)
 router.include_router(subscription_router)
 router.include_router(multi_tariff_subscription_router)
 router.include_router(balance_router)
+router.include_router(telegram_checkout_router)
 router.include_router(referral_router)
 
 # Apple IAP routes

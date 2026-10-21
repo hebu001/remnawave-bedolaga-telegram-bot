@@ -30,6 +30,7 @@ from app.services.admin_notification_service import AdminNotificationService
 from app.services.panel_sync import should_create_panel_account
 from app.services.subscription_service import SubscriptionService
 from app.services.tariff_switch_policy import remaining_days_for_switch, should_reset_used_traffic
+from app.services.telegram_checkout import checkout_keyboard
 from app.services.user_cart_service import user_cart_service
 from app.utils.decorators import error_handler
 from app.utils.formatting import format_period, format_price_kopeks, format_traffic
@@ -1996,8 +1997,10 @@ async def select_tariff_period(
                 balance=format_price_kopeks(user_balance),
                 missing=format_price_kopeks(missing),
             ),
-            reply_markup=get_tariff_insufficient_balance_keyboard(
-                tariff_id, period, db_user.language, missing_kopeks=missing
+            reply_markup=await checkout_keyboard(
+                get_tariff_insufficient_balance_keyboard(tariff_id, period, db_user.language, missing_kopeks=missing),
+                db_user.id,
+                cart_data,
             ),
             parse_mode='HTML',
         )
@@ -5777,8 +5780,12 @@ async def return_to_saved_tariff_cart(
                     balance=format_price_kopeks(user_balance),
                     missing=format_price_kopeks(missing),
                 ),
-                reply_markup=get_tariff_insufficient_balance_keyboard(
-                    tariff_id, period, db_user.language, missing_kopeks=missing
+                reply_markup=await checkout_keyboard(
+                    get_tariff_insufficient_balance_keyboard(
+                        tariff_id, period, db_user.language, missing_kopeks=missing
+                    ),
+                    db_user.id,
+                    cart_data,
                 ),
                 parse_mode='HTML',
             )
