@@ -388,6 +388,7 @@ def _purchase_payment_summary(texts, *, name, traffic, devices, period, total, b
         else ''
     )
     discount_line = '\n' + discount.strip() if discount.strip() else ''
+    display_total = total - balance if 0 < balance < total else total
     return texts.t(
         'TARIFF_PURCHASE_PAYMENT_SUMMARY',
         '<b>Подтверждение покупки</b>\n\n'
@@ -402,7 +403,7 @@ def _purchase_payment_summary(texts, *, name, traffic, devices, period, total, b
         devices=devices,
         period=format_period(period),
         discount=discount_line,
-        total=format_price_kopeks(total),
+        total=format_price_kopeks(display_total),
         balance_line=balance_line,
     )
 

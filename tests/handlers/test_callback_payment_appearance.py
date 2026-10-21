@@ -137,6 +137,7 @@ def test_renewal_period_preserves_target_and_has_green_payload():
     [
         (15000, 0),
         (15000, 10000),
+        (15000, 6501),
         (15000, 15000),
         (15000, 20000),
         (12000, 0),
@@ -194,7 +195,10 @@ async def test_purchase_preview_keeps_extra_devices_and_new_fields(monkeypatch, 
     from app.utils.formatting import format_price_kopeks
 
     emoji = '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji>'
-    assert emoji + '<b>Итого: ' + format_price_kopeks(cost) + '</b>' in text
+    display_total = cost - balance if 0 < balance < cost else cost
+    assert emoji + '<b>Итого: ' + format_price_kopeks(display_total) + '</b>' in text
+    if (cost, balance) == (15000, 6501):
+        assert '<b>Итого: 84.99 ₽</b>' in text
     if cost < 15000:
         assert 'Скидка:' in text
     buttons = [
