@@ -1015,7 +1015,7 @@
   "TARIFF_PURCHASE_DISCOUNT_LINE": "\n🎁 <b>Скидка: {percent}%</b>\n",
   "TARIFF_PURCHASE_DISCOUNT_SHORT_LINE": "\n🎁 Скидка: {percent}% (-{amount})",
   "TARIFF_PURCHASE_ERROR": "❌ Произошла ошибка при оформлении подписки",
-  "TARIFF_PURCHASE_INFO": "📦 <b>{name}</b>\n\n<b>Параметры:</b>\n• Трафик: {traffic}\n• Устройств: {devices}\n",
+  "TARIFF_PURCHASE_INFO": "Тариф: <b>{name}</b>\n\n<b>Параметры:</b>\n• Трафик: {traffic}\n• Устройств: {devices}\n",
   "TARIFF_PURCHASE_INSUFFICIENT": "❌ <b>Недостаточно средств</b>\n\n📦 Тариф: <b>{name}</b>\n📅 Период: {period}\n💰 Стоимость: {price}\n\n💳 Ваш баланс: {balance}\n⚠️ Не хватает: <b>{missing}</b>",
   "TARIFF_PURCHASE_PAYMENT_INSUFFICIENT": "❌ <b>Недостаточно средств</b>\n\n• Тариф: <b>{name}</b>\n• Трафик: {traffic}\n• Период: {period}\n• Устройств: {devices}\n\nВаш баланс: {balance}\n<tg-emoji emoji-id=\"5278613311858959074\">🛒</tg-emoji> Не хватает: <b>{missing}</b>",
   "TARIFF_PURCHASE_INSUFFICIENT_FUNDS": "❌ Недостаточно средств",

@@ -621,7 +621,7 @@ def format_tariff_info_for_user(
 
     text = texts.t(
         'TARIFF_PURCHASE_INFO',
-        '📦 <b>{name}</b>\n\n<b>Параметры:</b>\n• Трафик: {traffic}\n• Устройств: {devices}\n',
+        'Тариф: <b>{name}</b>\n\n<b>Параметры:</b>\n• Трафик: {traffic}\n• Устройств: {devices}\n',
     ).format(
         name=html.escape(tariff.name),
         traffic=traffic,
