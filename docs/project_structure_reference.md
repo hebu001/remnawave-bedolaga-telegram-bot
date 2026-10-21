@@ -317,8 +317,8 @@
   Классы: `AdminTicketUserInfo`, `AdminTicketResponse`, `AdminTicketDetailResponse`, `AdminTicketListResponse`, `AdminReplyRequest` (1 методов), `AdminStatusUpdateRequest`, `AdminPriorityUpdateRequest`, `AdminStatsResponse`, `TicketSettingsResponse`, `TicketSettingsUpdateRequest`
   Функции: `get_ticket_stats` — Get ticket statistics., `get_ticket_settings` — Get ticket system settings., `update_ticket_settings` — Update ticket system settings — всё в system_settings: SLA формой, режим и уведомления через сервис., `get_all_tickets` — Get all tickets for admin., `get_ticket_detail` — Get ticket with all messages for admin., `reply_to_ticket` — Reply to a ticket as admin., `update_ticket_status` — Update ticket status., `update_ticket_priority` — Update ticket priority.
 - `app/cabinet/routes/admin_traffic.py` — Python-модуль
-  Классы: нет
-  Функции: `get_traffic_usage` — Get paginated per-user traffic usage by node., `get_traffic_enrichment` — Return enrichment data: device counts, spending, dates, last node., `export_traffic_csv` — Generate CSV with traffic usage and send to admin's Telegram DM.
+  Классы: `TrafficRow` (1 методов), `EnrichmentRow` (1 методов), `PreparedTrafficCsv`
+  Функции: `get_traffic_usage`, `get_traffic_enrichment`, `export_traffic_csv` — Prepare an export without external side effects in the shared job., `export_traffic_csv_endpoint`
 - `app/cabinet/routes/admin_updates.py` — Python-модуль
   Классы: `ReleaseItem`, `ProjectReleasesInfo`, `ReleasesResponse`
   Функции: `get_releases` — Get release information for bot and cabinet.
@@ -413,6 +413,9 @@
 - `app/cabinet/routes/tickets.py` — Python-модуль
   Классы: нет
   Функции: `get_tickets` — Get user's support tickets., `create_ticket` — Create a new support ticket., `get_ticket` — Get ticket with all messages., `add_ticket_message` — Add message to existing ticket.
+- `app/cabinet/routes/traffic_runtime.py` — Python-модуль
+  Классы: `TrafficJobs` (3 методов), `TrafficTariff`, `TrafficSubscription`, `TrafficUser`
+  Функции: `unavailable`, `run_cpu` — Never release the job slot while a cancelled thread is still computing., `load_user_map` — Two scalar streams, never ORM instances or a six-figure IN parameter list., `panel_request` — Read a bounded JSON document without decoding it on the bot event loop., `monotonic`
 - `app/cabinet/routes/unsubscribe.py` — Python-модуль
   Классы: нет
   Функции: `unsubscribe_page` — Ничего не меняет — только отдаёт самоотправляющуюся форму., `unsubscribe_one_click` — Единственное место, где отписка применяется.
@@ -3451,6 +3454,9 @@
 - `tests/cabinet/test_admin_traffic_period_days.py` — Python-модуль
   Классы: нет
   Функции: `test_dates_are_read_only_where_they_are_assigned` — Чтение start_dt/end_dt не должно жить вне ветки, которая их задаёт., `test_period_days_is_set_in_every_branch` — Обе ветки разбора дат обязаны задать period_days.
+- `tests/cabinet/test_admin_traffic_runtime.py` — Python-модуль
+  Классы: `Stream` (3 методов), `Database` (4 методов)
+  Функции: `reset_caches`, `user`, `nodes`, `test_same_job_coalesces_and_client_cancellation_cannot_duplicate_work`, `test_distinct_jobs_and_waiters_have_backpressure`, `test_wait_timeout_keeps_single_flight_alive`, `test_worker_cancellation_does_not_release_active_slot_early`, `test_snapshot_streams_scalars_preserves_multi_tariff_priority_and_closes_session`, `test_snapshot_cache_is_before_expensive_load`, `test_global_sort_filter_pagination_and_multisubscription_contract`, `test_csv_keeps_filters_enrichment_and_risk_math_without_retaining_all_row_dicts`, `test_spending_deduplicates_and_bounds_bind_parameters`, `test_page_enrichment_never_exceeds_four_requests_and_sums_panel_aliases`, `test_panel_page_failure_is_not_silently_ignored_or_cached`, `test_global_enrichment_streams_cursor_and_fails_premature_device_end`, `test_page_enrichment_rejects_invalid_ids_without_starting_work`, `test_old_client_enrichment_no_ids_and_new_ids_share_response_shape`, `test_traffic_cache_has_bounded_date_cardinality_and_no_failed_entry`, `test_pure_cpu_report_keeps_event_loop_heartbeat_with_90000_users`, `test_90000_user_legacy_enrichment_json_and_csv_keep_heartbeat` — Include the full old-client response, JSON decode and CSV, not only page sort., `test_projection_preserves_newest_subscription_order_through_report_and_csv` — Execute the real SELECTs so fake preordered result rows cannot hide an ORDER BY regression., `test_csv_delivery_only_after_successful_request_await` — Use the actual coordinator/CSV preparation; never call real Telegram.
 - `tests/cabinet/test_admin_user_activity.py` — Python-модуль
   Классы: нет
   Функции: `test_activity_route_registered`, `test_activity_sources_shape`, `test_activity_dedup_filters_in_sql` — Транзакции, покрытые событиями/начислениями, исключаются на уровне SQL;, `test_activity_unknown_user_404`, `test_activity_unknown_type_400`, `test_activity_merges_and_sorts_desc` — Записи из разных источников сливаются и сортируются по времени убыванию., `test_activity_types_filter_limits_sources`, `test_button_click_sources_split_by_type` — Клики бота и действия кабинета — раздельные источники одной таблицы.

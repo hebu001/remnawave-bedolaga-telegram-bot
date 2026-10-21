@@ -1,24 +1,24 @@
-"""Admin routes for traffic usage statistics."""
+"""Admin traffic reports with bounded work in the shared bot process."""
 
 import asyncio
 import csv
 import io
-import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import structlog
 from aiogram.types import BufferedInputFile
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import and_, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy import func, select
+from starlette.responses import Response
 
 from app.bot_factory import create_bot
-from app.database.models import Subscription, Transaction, TransactionType, User
+from app.database.database import AsyncSessionLocal
+from app.database.models import Transaction, TransactionType, User
 from app.services.remnawave_service import RemnaWaveService
 
-from ..dependencies import get_cabinet_db, require_permission
+from ..dependencies import require_permission
 from ..schemas.traffic import (
     ExportCsvRequest,
     ExportCsvResponse,
@@ -30,299 +30,273 @@ from ..schemas.traffic import (
     UserTrafficEnrichment,
     UserTrafficItem,
 )
+from .traffic_runtime import (
+    DB_BATCH_SIZE,
+    MAX_TRAFFIC_CELLS,
+    PANEL_CONCURRENCY,
+    TrafficJobs,
+    TrafficSubscription,
+    TrafficUser,
+    load_user_map,
+    monotonic,
+    panel_request,
+    run_cpu,
+    unavailable,
+)
 
 
 logger = structlog.get_logger(__name__)
-
 router = APIRouter(prefix='/admin/traffic', tags=['Admin Traffic'])
-
 _ALLOWED_PERIODS = frozenset({1, 3, 7, 14, 30})
-
-# In-memory cache: {(start_str, end_str): (timestamp, aggregated_data, nodes_info)}
-_traffic_cache: dict[tuple[str, str], tuple[float, dict[int, dict[str, int]], list[TrafficNodeInfo]]] = {}
-_CACHE_TTL = 300  # 5 minutes
-_cache_lock = asyncio.Lock()
-
-# Valid sort fields for the GET endpoint
 _SORT_FIELDS = frozenset({'total_bytes', 'full_name', 'tariff_name', 'device_limit', 'traffic_limit_gb'})
 _ENRICHMENT_SORT_FIELDS = frozenset({'connected', 'total_spent', 'sub_start', 'sub_end', 'last_node'})
+_CACHE_TTL = 300
+_jobs = TrafficJobs()
+# All cache access is inside the single active job. Never store ORM objects or
+# unbounded date/query keys. Failed/incomplete snapshots are never published.
+_user_cache: tuple[float, bool, dict[int, TrafficUser]] | None = None
+_traffic_cache: OrderedDict = OrderedDict()
+_enrichment_cache: tuple[float, dict] | None = None
+_page_enrichment_cache: OrderedDict = OrderedDict()
 
 
 def _get_status(sub) -> str | None:
-    """Get subscription status via actual_status property."""
     return sub.actual_status
 
 
 def _validate_period(period: int) -> None:
     if period not in _ALLOWED_PERIODS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Period must be one of: {sorted(_ALLOWED_PERIODS)}',
-        )
-
-
-async def _aggregate_traffic(
-    start_str: str, end_str: str, panel_user_ids: list[int]
-) -> tuple[dict[int, dict[str, int]], list[TrafficNodeInfo]]:
-    """Aggregate per-user traffic across all nodes for a given date range.
-
-    Remnawave 3.0.0 удалил legacy-эндпоинт с построчной разбивкой
-    ({userUuid, nodeUuid, total}), а его нелегаси-замена
-    ``GET /api/bandwidth-stats/nodes/{uuid}/users`` отдаёт ``topUsers`` вообще
-    без идентификатора пользователя — для таблицы «пользователь × узел» она
-    непригодна. Поэтому берём ``POST /api/bandwidth-stats/nodes/usage``:
-    ``{nodes: [{uuid, users: [{id, totalBytes}]}]}`` — один запрос на все узлы
-    вместо O(nodes), ценой потери разбивки по дням (страница её и не показывала).
-
-    Returns (user_traffic, nodes_info) where:
-      user_traffic = {remnawave_id: {node_uuid: total_bytes, ...}}
-      nodes_info = [TrafficNodeInfo, ...]
-    """
-    cache_key = (start_str, end_str)
-
-    # Quick check without lock
-    now = time.time()
-    cached = _traffic_cache.get(cache_key)
-    if cached and (now - cached[0]) < _CACHE_TTL:
-        return cached[1], cached[2]
-
-    # Acquire lock for the slow path
-    async with _cache_lock:
-        # Re-check after acquiring lock
-        now = time.time()
-        cached = _traffic_cache.get(cache_key)
-        if cached and (now - cached[0]) < _CACHE_TTL:
-            return cached[1], cached[2]
-
-        service = RemnaWaveService()
-        if not service.is_configured:
-            return {}, []
-
-        known_panel_user_ids = set(panel_user_ids)
-
-        async with service.get_api_client() as api:
-            try:
-                nodes = await api.get_all_nodes()
-            except Exception:
-                logger.warning('Failed to fetch nodes for traffic aggregation', exc_info=True)
-                # Не кэшируем: `_cache_lock` и так сериализует медленный путь в
-                # один запрос к панели, поэтому «завалить» её нельзя, а вот
-                # запомнить пустой результат — значит показывать всем админам и
-                # CSV-экспорту пустую таблицу ещё пять минут после того, как
-                # панель уже поднялась. Тот же довод, что и у сбоя usage ниже.
-                return {}, []
-
-            usage: dict[str, Any] = {}
-            usage_failed = False
-            node_uuids = [node.uuid for node in nodes]
-            if node_uuids:
-                try:
-                    # Эндпоинт принимает даты только как YYYY-MM-DD; ISO с `Z`
-                    # (в котором строятся ключи кэша) панель отвергает с 400.
-                    usage = await api.get_bandwidth_stats_nodes_usage(node_uuids, start_str[:10], end_str[:10])
-                except Exception:
-                    logger.warning('Failed to get per-user traffic for nodes', exc_info=True)
-                    usage = {}
-                    usage_failed = True
-
-        nodes_info: list[TrafficNodeInfo] = [
-            TrafficNodeInfo(node_uuid=node.uuid, node_name=node.name, country_code=node.country_code) for node in nodes
-        ]
-        nodes_info.sort(key=lambda n: n.node_name)
-
-        # Response: {nodes: [{uuid, users: [{id, totalBytes}, ...]}, ...]}
-        user_traffic: dict[int, dict[str, int]] = {}
-        for node_entry in usage.get('nodes') or []:
-            node_uuid = node_entry.get('uuid')
-            if not node_uuid:
-                continue
-            for user_entry in node_entry.get('users') or []:
-                try:
-                    panel_user_id = int(user_entry['id'])
-                    total = int(user_entry.get('totalBytes') or 0)
-                except KeyError, TypeError, ValueError:
-                    continue
-                if total > 0 and panel_user_id in known_panel_user_ids:
-                    per_node = user_traffic.setdefault(panel_user_id, {})
-                    per_node[node_uuid] = per_node.get(node_uuid, 0) + total
-
-        # Раньше трафик собирался по одной ноде за раз, и сбой одной ноды терял
-        # только её колонку. Теперь это один запрос на все ноды, поэтому его
-        # провал обнуляет ВСЮ таблицу — и закэшировать такой результат значит
-        # показывать всем админам (и отдавать в CSV-экспорт) нули следующие
-        # пять минут. Отдаём пустой результат, но не запоминаем его.
-        if not usage_failed:
-            _traffic_cache[cache_key] = (now, user_traffic, nodes_info)
-
-        # Evict expired entries to prevent unbounded growth
-        expired = [k for k, (ts, _, _) in _traffic_cache.items() if (now - ts) >= _CACHE_TTL]
-        for k in expired:
-            del _traffic_cache[k]
-
-        return user_traffic, nodes_info
+        raise HTTPException(status_code=400, detail=f'Period must be one of: {sorted(_ALLOWED_PERIODS)}')
 
 
 def _compute_date_range(period_days: int) -> tuple[str, str]:
-    """Compute ISO date-time range from period days.
-
-    Truncates to 5-minute intervals for stable cache keys.
-    """
     end_dt = datetime.now(UTC).replace(second=0, microsecond=0)
     end_dt = end_dt.replace(minute=(end_dt.minute // 5) * 5)
     start_dt = end_dt - timedelta(days=period_days)
     return start_dt.strftime('%Y-%m-%dT%H:%M:%SZ'), end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
-async def _load_user_map(db: AsyncSession) -> dict[int, User]:
-    """Load all users with remnawave_id, eagerly loading subscription + tariff.
-
-    In multi-tariff mode panel ids live on Subscription rows, not on User.
-    Both sources are merged so the caller gets a complete panel id → User map.
-    """
+async def _load_user_map() -> dict[int, TrafficUser]:
+    global _user_cache
     from app.config import settings
 
-    # Build user map from both user-level and subscription-level panel ids
-    user_map: dict[int, User] = {}
+    multi = settings.is_multi_tariff_enabled()
+    if _user_cache and _user_cache[1] == multi and monotonic() - _user_cache[0] < _CACHE_TTL:
+        return _user_cache[2]
+    users = await load_user_map()
+    _user_cache = (monotonic(), multi, users)
+    return users
 
-    # Legacy: user-level panel ids
-    stmt_users = (
-        select(User)
-        .where(User.remnawave_id.isnot(None))
-        .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
-    )
-    result_users = await db.execute(stmt_users)
-    users = result_users.scalars().all()
-    for u in users:
-        if u.remnawave_id:
-            user_map[u.remnawave_id] = u
 
-    # Multi-tariff: subscription-level panel ids
-    if settings.is_multi_tariff_enabled():
-        stmt_subs = (
-            select(Subscription)
-            .where(Subscription.remnawave_id.isnot(None))
-            .options(selectinload(Subscription.user).selectinload(User.subscriptions).selectinload(Subscription.tariff))
+def _merge_node_usage(usage, known_ids, traffic):
+    if not isinstance(usage, dict) or not isinstance(usage.get('nodes'), list):
+        raise unavailable('Panel returned incomplete traffic data.')
+    cells = sum(len(nodes) for nodes in traffic.values())
+    for node in usage['nodes']:
+        node_uuid = node.get('uuid')
+        if not node_uuid or not isinstance(node.get('users'), list):
+            raise unavailable('Panel returned incomplete node traffic.')
+        for entry in node['users']:
+            try:
+                panel_id, total = int(entry['id']), int(entry.get('totalBytes') or 0)
+            except KeyError, TypeError, ValueError:
+                raise unavailable('Panel returned invalid user traffic.') from None
+            if total > 0 and panel_id in known_ids:
+                per_node = traffic.setdefault(panel_id, {})
+                if node_uuid not in per_node:
+                    cells += 1
+                if cells > MAX_TRAFFIC_CELLS:
+                    raise unavailable('Traffic report exceeds the configured cell budget.')
+                per_node[node_uuid] = per_node.get(node_uuid, 0) + total
+
+
+async def _aggregate_traffic(start_str: str, end_str: str, user_map):
+    key = (start_str[:10], end_str[:10])
+    cached = _traffic_cache.get(key)
+    if cached and monotonic() - cached[0] < _CACHE_TTL:
+        _traffic_cache.move_to_end(key)
+        return cached[1], cached[2]
+    service = RemnaWaveService()
+    if not service.is_configured:
+        raise unavailable('Remnawave is not configured.')
+    traffic = {}
+    async with service.get_api_client() as api:
+        nodes = await api.get_all_nodes()
+        nodes_info = sorted(
+            (
+                TrafficNodeInfo(
+                    node_uuid=n.uuid,
+                    node_name=n.name,
+                    country_code=n.country_code,
+                )
+                for n in nodes
+            ),
+            key=lambda n: n.node_name,
         )
-        result_subs = await db.execute(stmt_subs)
-        subs = result_subs.scalars().all()
-        for sub in subs:
-            if sub.remnawave_id and sub.user and sub.remnawave_id not in user_map:
-                user_map[sub.remnawave_id] = sub.user
+        # One node document at a time limits peak JSON allocation and decoding
+        # latency. Large installations never hold an all-nodes raw response.
+        for node in nodes:
+            usage = await panel_request(
+                api,
+                'POST',
+                '/api/bandwidth-stats/nodes/usage',
+                params={'start': start_str[:10], 'end': end_str[:10], 'minTotalBytes': 0},
+                data={'nodesUuids': [node.uuid]},
+            )
+            await run_cpu(_merge_node_usage, usage, user_map, traffic)
+    _traffic_cache[key] = (monotonic(), traffic, nodes_info)
+    _traffic_cache.move_to_end(key)
+    while len(_traffic_cache) > 2:
+        _traffic_cache.popitem(last=False)
+    return traffic, nodes_info
 
-    return user_map
+
+@dataclass(slots=True)
+class TrafficRow:
+    user_id: int
+    telegram_id: int | None
+    username: str | None
+    email: str | None
+    full_name: str
+    tariff_name: str | None
+    subscription_status: str | None
+    traffic_limit_gb: float
+    device_limit: int
+    node_traffic: dict[str, int]
+    total_bytes: int
+    subscriptions: list[TrafficSubscription]
+
+    def to_schema(self):
+        return UserTrafficItem(
+            user_id=self.user_id,
+            telegram_id=self.telegram_id,
+            username=self.username,
+            email=self.email,
+            full_name=self.full_name,
+            tariff_name=self.tariff_name,
+            subscription_status=self.subscription_status,
+            traffic_limit_gb=self.traffic_limit_gb,
+            device_limit=self.device_limit,
+            node_traffic=self.node_traffic,
+            total_bytes=self.total_bytes,
+            subscriptions=[
+                SubscriptionTrafficInfo(
+                    subscription_id=s.id,
+                    tariff_name=s.tariff.name if s.tariff else None,
+                    status=_get_status(s),
+                    traffic_limit_gb=float(s.traffic_limit_gb or 0),
+                    device_limit=s.device_limit or 1,
+                )
+                for s in self.subscriptions
+            ],
+        )
+
+
+def _json_response(model):
+    # Called in the worker. Returning Response bypasses FastAPI's second
+    # synchronous validation/serialization of legacy 90000-user responses.
+    return Response(model.model_dump_json(), media_type='application/json')
+
+
+def _primary_subscription(user):
+    subs = user.subscriptions
+    return next((sub for sub in subs if sub.is_active), subs[0] if subs else None)
+
+
+def _select_traffic_ids(
+    user_traffic,
+    user_map,
+    search='',
+    sort_by='total_bytes',
+    sort_desc=True,
+    tariff_filter=None,
+    status_filter=None,
+    node_filter=None,
+):
+    """Sort scalar panel IDs globally; materialize rows only after pagination.
+
+    A temporary graph of 90000 TrafficRow/Pydantic instances also triggers long
+    stop-the-world collections in a worker thread. An integer-ID vector avoids
+    that graph and is sufficient for both global ordering and streaming CSV.
+    """
+    ids = []
+    search_lower = search.lower().strip()
+    for panel_id, user in user_map.items():
+        if search_lower and not any(
+            search_lower in (value or '').lower() for value in (user.full_name, user.username, user.email)
+        ):
+            continue
+        primary = _primary_subscription(user)
+        tariff = primary.tariff.name if primary and primary.tariff else ''
+        sub_status = _get_status(primary) if primary else ''
+        if tariff_filter is not None and (tariff or '') not in tariff_filter:
+            continue
+        if status_filter is not None and (sub_status or '') not in status_filter:
+            continue
+        ids.append(panel_id)
+
+    def key(panel_id):
+        user = user_map[panel_id]
+        usage = user_traffic.get(panel_id, {})
+        if sort_by.startswith('node_'):
+            node = sort_by[5:]
+            return usage.get(node, 0) if node_filter is None or node in node_filter else 0
+        if sort_by == 'full_name':
+            return user.full_name.lower()
+        if sort_by in ('tariff_name', 'device_limit', 'traffic_limit_gb'):
+            primary = _primary_subscription(user)
+            if sort_by == 'tariff_name':
+                return (primary.tariff.name if primary and primary.tariff else '').lower()
+            if sort_by == 'device_limit':
+                return (primary.device_limit or 1) if primary else 1
+            return float(primary.traffic_limit_gb or 0) if primary else 0.0
+        return sum(value for node, value in usage.items() if node_filter is None or node in node_filter)
+
+    ids.sort(key=key, reverse=sort_desc)
+    return ids
+
+
+def _traffic_row(panel_id, user_traffic, user_map, node_filter=None):
+    user = user_map[panel_id]
+    primary = _primary_subscription(user)
+    usage = user_traffic.get(panel_id, {})
+    if node_filter is not None:
+        usage = {node: value for node, value in usage.items() if node in node_filter}
+    return TrafficRow(
+        user_id=user.id,
+        telegram_id=user.telegram_id,
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        tariff_name=primary.tariff.name if primary and primary.tariff else None,
+        subscription_status=_get_status(primary) if primary else None,
+        traffic_limit_gb=float(primary.traffic_limit_gb or 0) if primary else 0.0,
+        device_limit=(primary.device_limit or 1) if primary else 1,
+        node_traffic=usage,
+        total_bytes=sum(usage.values()),
+        subscriptions=user.subscriptions,
+    )
 
 
 def _build_traffic_items(
-    user_traffic: dict[int, dict[str, int]],
-    user_map: dict[int, User],
-    nodes_info: list[TrafficNodeInfo],
-    search: str = '',
-    sort_by: str = 'total_bytes',
-    sort_desc: bool = True,
-    tariff_filter: set[str] | None = None,
-    status_filter: set[str] | None = None,
-    node_filter: set[str] | None = None,
-) -> list[UserTrafficItem]:
-    """Merge traffic data with user data, apply search/tariff/status/node filters, return sorted list."""
-    items: list[UserTrafficItem] = []
-    search_lower = search.lower().strip()
-
-    all_panel_user_ids = set(user_traffic.keys()) | set(user_map.keys())
-    for panel_user_id in all_panel_user_ids:
-        user = user_map.get(panel_user_id)
-        if not user:
-            continue
-
-        traffic = user_traffic.get(panel_user_id, {})
-
-        full_name = user.full_name
-        username = user.username
-        email = user.email
-
-        if search_lower:
-            if (
-                search_lower not in (full_name or '').lower()
-                and search_lower not in (username or '').lower()
-                and search_lower not in (email or '').lower()
-            ):
-                continue
-
-        subs = getattr(user, 'subscriptions', None) or []
-
-        # Primary subscription for backward-compat top-level fields
-        primary_sub = next((s for s in subs if s.is_active), subs[0] if subs else None)
-        tariff_name = None
-        subscription_status = None
-        traffic_limit_gb = 0.0
-        device_limit = 1
-
-        if primary_sub:
-            subscription_status = _get_status(primary_sub)
-            traffic_limit_gb = float(primary_sub.traffic_limit_gb or 0)
-            device_limit = primary_sub.device_limit or 1
-            if primary_sub.tariff:
-                tariff_name = primary_sub.tariff.name
-
-        # Filtering uses primary sub values (keeps existing filter semantics)
-        if tariff_filter is not None:
-            if (tariff_name or '') not in tariff_filter:
-                continue
-
-        if status_filter is not None:
-            if (subscription_status or '') not in status_filter:
-                continue
-
-        # Apply node filter: keep only selected nodes, recalculate total
-        if node_filter is not None:
-            traffic = {k: v for k, v in traffic.items() if k in node_filter}
-
-        total_bytes = sum(traffic.values())
-
-        # Build per-subscription detail list for multi-subscription display
-        subscriptions_traffic = [
-            SubscriptionTrafficInfo(
-                subscription_id=sub.id,
-                tariff_name=sub.tariff.name if sub.tariff else None,
-                status=_get_status(sub),
-                traffic_limit_gb=float(sub.traffic_limit_gb or 0),
-                device_limit=sub.device_limit or 1,
-            )
-            for sub in subs
-        ]
-
-        items.append(
-            UserTrafficItem(
-                user_id=user.id,
-                telegram_id=user.telegram_id,
-                username=username,
-                email=email,
-                full_name=full_name,
-                tariff_name=tariff_name,
-                subscription_status=subscription_status,
-                traffic_limit_gb=traffic_limit_gb,
-                device_limit=device_limit,
-                node_traffic=traffic,
-                total_bytes=total_bytes,
-                subscriptions=subscriptions_traffic,
-            )
-        )
-
-    # Sort by the requested field; node columns use 'node_<uuid>' prefix
-    if sort_by.startswith('node_'):
-        node_uuid = sort_by[5:]
-        items.sort(key=lambda x: x.node_traffic.get(node_uuid, 0), reverse=sort_desc)
-    elif sort_by in ('full_name', 'tariff_name'):
-        items.sort(key=lambda x: (getattr(x, sort_by, None) or '').lower(), reverse=sort_desc)
-    else:
-        items.sort(key=lambda x: getattr(x, sort_by, 0) or 0, reverse=sort_desc)
-
-    return items
+    user_traffic,
+    user_map,
+    nodes_info,
+    search='',
+    sort_by='total_bytes',
+    sort_desc=True,
+    tariff_filter=None,
+    status_filter=None,
+    node_filter=None,
+):
+    """Compatibility helper for small callers; HTTP/CSV only retain scalar IDs."""
+    ids = _select_traffic_ids(
+        user_traffic, user_map, search, sort_by, sort_desc, tariff_filter, status_filter, node_filter
+    )
+    return [_traffic_row(panel_id, user_traffic, user_map, node_filter) for panel_id in ids]
 
 
-@router.get('', response_model=TrafficUsageResponse)
-async def get_traffic_usage(
-    admin: User = Depends(require_permission('traffic:read')),
-    db: AsyncSession = Depends(get_cabinet_db),
+async def _get_traffic_usage(
     period: int = Query(30, ge=1, le=30),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -361,28 +335,8 @@ async def get_traffic_usage(
         start_str, end_str = _compute_date_range(period)
         effective_period = period
 
-    user_map = await _load_user_map(db)
-    user_traffic, nodes_info = await _aggregate_traffic(start_str, end_str, list(user_map.keys()))
-
-    # Collect all available tariff names (before filtering)
-    available_tariffs = sorted(
-        {
-            sub.tariff.name
-            for u in user_map.values()
-            for sub in (getattr(u, 'subscriptions', None) or [])
-            if sub.tariff and sub.tariff.name
-        }
-    )
-
-    # Collect all available statuses (before filtering)
-    available_statuses = sorted(
-        {
-            _get_status(sub)
-            for u in user_map.values()
-            for sub in (getattr(u, 'subscriptions', None) or [])
-            if _get_status(sub)
-        }
-    )
+    user_map = await _load_user_map()
+    user_traffic, nodes_info = await _aggregate_traffic(start_str, end_str, user_map)
 
     # Parse tariff filter
     tariff_filter: set[str] | None = None
@@ -408,14 +362,71 @@ async def get_traffic_usage(
     if sort_by not in _SORT_FIELDS and not is_node_sort and not is_enrichment_sort:
         sort_by = 'total_bytes'
 
-    # For enrichment sort, build items unsorted then sort by enrichment field
-    effective_sort = 'total_bytes' if is_enrichment_sort else sort_by
-    items = _build_traffic_items(
-        user_traffic, user_map, nodes_info, search, effective_sort, sort_desc, tariff_filter, status_filter, node_filter
+    enrichment_data = await _get_enrichment(user_map) if is_enrichment_sort else None
+    return await run_cpu(
+        _render_usage,
+        user_traffic,
+        user_map,
+        nodes_info,
+        search,
+        sort_by,
+        sort_desc,
+        tariff_filter,
+        status_filter,
+        node_filter,
+        enrichment_data,
+        offset,
+        limit,
+        effective_period,
     )
 
-    if is_enrichment_sort:
-        enrichment_data, _ = await _build_enrichment(db, user_map)
+
+def _render_usage(
+    user_traffic,
+    user_map,
+    nodes_info,
+    search,
+    sort_by,
+    sort_desc,
+    tariff_filter,
+    status_filter,
+    node_filter,
+    enrichment_data,
+    offset,
+    limit,
+    effective_period,
+):
+    # Collect all available tariff names (before filtering)
+    available_tariffs = sorted(
+        {
+            sub.tariff.name
+            for u in user_map.values()
+            for sub in (getattr(u, 'subscriptions', None) or [])
+            if sub.tariff and sub.tariff.name
+        }
+    )
+
+    # Collect all available statuses (before filtering)
+    available_statuses = sorted(
+        {
+            _get_status(sub)
+            for u in user_map.values()
+            for sub in (getattr(u, 'subscriptions', None) or [])
+            if _get_status(sub)
+        }
+    )
+
+    items = _select_traffic_ids(
+        user_traffic,
+        user_map,
+        search,
+        'total_bytes' if enrichment_data is not None else sort_by,
+        sort_desc,
+        tariff_filter,
+        status_filter,
+        node_filter,
+    )
+    if enrichment_data is not None:
         enr_key_map = {
             'connected': lambda e: e.devices_connected,
             'total_spent': lambda e: e.total_spent_kopeks,
@@ -425,219 +436,292 @@ async def get_traffic_usage(
         }
         key_fn = enr_key_map[sort_by]
         empty = UserTrafficEnrichment()
-        items.sort(key=lambda x: key_fn(enrichment_data.get(x.user_id, empty)), reverse=sort_desc)
-
-    total = len(items)
-    paginated = items[offset : offset + limit]
-
-    return TrafficUsageResponse(
-        items=paginated,
-        nodes=nodes_info,
-        total=total,
-        offset=offset,
-        limit=limit,
-        period_days=effective_period,
-        available_tariffs=available_tariffs,
-        available_statuses=available_statuses,
+        items.sort(key=lambda pid: key_fn(enrichment_data.get(user_map[pid].id, empty)), reverse=sort_desc)
+    return _json_response(
+        TrafficUsageResponse(
+            items=[
+                _traffic_row(pid, user_traffic, user_map, node_filter).to_schema()
+                for pid in items[offset : offset + limit]
+            ],
+            nodes=nodes_info,
+            total=len(items),
+            offset=offset,
+            limit=limit,
+            period_days=effective_period,
+            available_tariffs=available_tariffs,
+            available_statuses=available_statuses,
+        )
     )
 
 
-# ============== Enrichment endpoint ==============
+@router.get('', response_model=TrafficUsageResponse)
+async def get_traffic_usage(
+    admin: User = Depends(require_permission('traffic:read')),
+    period: int = Query(30, ge=1, le=30),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    search: str = Query('', max_length=100),
+    sort_by: str = Query('total_bytes', max_length=100),
+    sort_desc: bool = Query(True),
+    tariffs: str = Query('', max_length=500),
+    statuses: str = Query('', max_length=500),
+    nodes: str = Query('', max_length=2000),
+    start_date: str = Query('', max_length=10),
+    end_date: str = Query('', max_length=10),
+):
+    args = (period, limit, offset, search, sort_by, sort_desc, tariffs, statuses, nodes, start_date, end_date)
+    return await _jobs.run(('usage', *args), lambda: _get_traffic_usage(*args))
 
-_enrichment_cache: dict[str, tuple[float, dict[int, UserTrafficEnrichment]]] = {}
-_ENRICHMENT_CACHE_TTL = 300  # 5 minutes
-_enrichment_lock = asyncio.Lock()
+
+async def _get_bulk_spending(user_ids: list[int]) -> dict[int, int]:
+    """Chunk bind parameters below asyncpg's limit; release DB before panel I/O."""
+    spending = {}
+    ids = sorted(set(user_ids))
+    async with AsyncSessionLocal() as db:
+        for start in range(0, len(ids), DB_BATCH_SIZE):
+            result = await db.execute(
+                select(Transaction.user_id, func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0))
+                .where(
+                    Transaction.user_id.in_(ids[start : start + DB_BATCH_SIZE]),
+                    Transaction.is_completed.is_(True),
+                    Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+                )
+                .group_by(Transaction.user_id)
+            )
+            spending.update((row[0], int(row[1])) for row in result.all())
+            await asyncio.sleep(0)
+    return spending
 
 
-async def _get_bulk_spending(db: AsyncSession, user_ids: list[int]) -> dict[int, int]:
-    """Get total spent kopeks for multiple users in a single query."""
-    if not user_ids:
+def _panel_last_nodes(users, panel_map, last_nodes):
+    for user in users:
+        uid = panel_map.get(user['id'])
+        node = (user.get('userTraffic') or {}).get('lastConnectedNodeUuid')
+        if uid is not None and node:
+            last_nodes[uid] = node
+
+
+async def _full_panel_enrichment(api, panel_map):
+    """Stream compact facts; never materialize all panel users/devices."""
+    last_nodes, devices = {}, {}
+    cursor = None
+    seen_cursors = set()
+    while True:
+        params = {'size': 500}
+        if cursor is not None:
+            params['cursor'] = cursor
+        page = await panel_request(api, 'GET', '/api/users/stream', params=params)
+        if not isinstance(page, dict) or not isinstance(page.get('users'), list) or 'hasMore' not in page:
+            raise unavailable('Panel returned an incomplete user page.')
+        _panel_last_nodes(page['users'], panel_map, last_nodes)
+        if not page['hasMore']:
+            break
+        cursor = page.get('nextCursor')
+        if not page['users'] or cursor is None or cursor in seen_cursors:
+            raise unavailable('Panel user pagination did not advance.')
+        seen_cursors.add(cursor)
+        await asyncio.sleep(0)
+
+    start = 0
+    while True:
+        page = await panel_request(api, 'GET', '/api/hwid/devices', params={'start': start, 'size': 1000})
+        if (
+            not isinstance(page, dict)
+            or not isinstance(page.get('devices'), list)
+            or not isinstance(page.get('total'), int)
+        ):
+            raise unavailable('Panel returned an incomplete device page.')
+        rows, total = page['devices'], page['total']
+        if not rows and start < total:
+            raise unavailable('Panel device pagination ended prematurely.')
+        for device in rows:
+            uid = panel_map.get(device.get('userId'))
+            if uid is not None:
+                devices[uid] = devices.get(uid, 0) + 1
+        start += len(rows)
+        if start >= total:
+            break
+        await asyncio.sleep(0)
+    return devices, last_nodes
+
+
+async def _page_panel_enrichment(api, panel_map):
+    """At most four requests and four raw user/device records live at once."""
+    devices, last_nodes = {}, {}
+    panel_ids = sorted(panel_map)
+
+    async def read(panel_id):
+        user = await panel_request(api, 'GET', f'/api/users/{panel_id}', allow_missing=True)
+        if user is None:
+            return panel_id, 0, None
+        device_page = await panel_request(api, 'GET', f'/api/hwid/devices/{panel_id}', allow_missing=True)
+        if device_page is not None and not isinstance(device_page.get('devices'), list):
+            raise unavailable('Panel returned incomplete user devices.')
+        count = len(device_page['devices']) if device_page is not None else 0
+        return panel_id, count, (user.get('userTraffic') or {}).get('lastConnectedNodeUuid')
+
+    for start in range(0, len(panel_ids), PANEL_CONCURRENCY):
+        batch = await asyncio.gather(
+            *(read(pid) for pid in panel_ids[start : start + PANEL_CONCURRENCY]), return_exceptions=True
+        )
+        for result in batch:
+            if isinstance(result, BaseException):
+                raise result
+            panel_id, count, node = result
+            uid = panel_map[panel_id]
+            devices[uid] = devices.get(uid, 0) + count
+            if node:
+                last_nodes[uid] = node
+    return devices, last_nodes
+
+
+@dataclass(slots=True)
+class EnrichmentRow:
+    devices_connected: int
+    total_spent_kopeks: int
+    subscription_start_date: str | None
+    subscription_end_date: str | None
+    last_node_name: str | None
+    subscriptions: list[TrafficSubscription]
+
+    def to_schema(self):
+        return UserTrafficEnrichment(
+            devices_connected=self.devices_connected,
+            total_spent_kopeks=self.total_spent_kopeks,
+            subscription_start_date=self.subscription_start_date,
+            subscription_end_date=self.subscription_end_date,
+            last_node_name=self.last_node_name,
+            subscriptions=[
+                SubscriptionEnrichmentInfo(
+                    subscription_id=s.id,
+                    tariff_name=s.tariff.name if s.tariff else None,
+                    start_date=s.start_date.isoformat() if s.start_date else None,
+                    end_date=s.end_date.isoformat() if s.end_date else None,
+                )
+                for s in self.subscriptions
+            ],
+        )
+
+
+def _render_enrichment(users, spending, devices, last_nodes, node_names):
+    enrichment = {}
+    for uid, user in users.items():
+        subs = user.subscriptions
+        primary = next((s for s in subs if s.is_active), subs[0] if subs else None)
+        enrichment[uid] = EnrichmentRow(
+            devices_connected=devices.get(uid, 0),
+            total_spent_kopeks=spending.get(uid, 0),
+            subscription_start_date=primary.start_date.isoformat() if primary and primary.start_date else None,
+            subscription_end_date=primary.end_date.isoformat() if primary and primary.end_date else None,
+            last_node_name=node_names.get(last_nodes.get(uid)),
+            subscriptions=subs,
+        )
+    return enrichment
+
+
+def _enrichment_json_response(data):
+    # Serialize small validated records independently: a single giant Pydantic
+    # dump holds the GIL even from a worker and stalls Telegram's event loop.
+    output = io.BytesIO()
+    output.write(b'{"data":{')
+    for index, (uid, row) in enumerate(data.items()):
+        if index:
+            output.write(b',')
+        output.write(f'"{uid}":'.encode())
+        model = row.to_schema() if isinstance(row, EnrichmentRow) else row
+        output.write(model.model_dump_json().encode())
+    output.write(b'}}')
+    return Response(output.getvalue(), media_type='application/json')
+
+
+async def _get_enrichment(user_map, user_ids: tuple[int, ...] | None = None):
+    global _enrichment_cache
+    now = monotonic()
+    if _enrichment_cache and now - _enrichment_cache[0] < _CACHE_TTL:
+        data = _enrichment_cache[1]
+        return data if user_ids is None else {uid: data[uid] for uid in user_ids if uid in data}
+    requested = set(user_ids) if user_ids is not None else None
+    users, panel_map = await run_cpu(_enrichment_maps, user_map, requested)
+    if not users:
         return {}
-    result = await db.execute(
-        select(Transaction.user_id, func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0))
-        .where(
-            and_(
-                Transaction.user_id.in_(user_ids),
-                Transaction.is_completed.is_(True),
-                Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
-            )
-        )
-        .group_by(Transaction.user_id)
-    )
-    return {row[0]: int(row[1]) for row in result.all()}
+    cached = {}
+    if requested is not None:
+        for uid in users:
+            entry = _page_enrichment_cache.get(uid)
+            if entry and now - entry[0] < _CACHE_TTL:
+                cached[uid] = entry[1]
+                _page_enrichment_cache.move_to_end(uid)
+        missing = users.keys() - cached.keys()
+        if not missing:
+            return cached
+        users = {uid: users[uid] for uid in missing}
+        panel_map = {pid: uid for pid, uid in panel_map.items() if uid in missing}
 
-
-async def _build_enrichment(
-    db: AsyncSession, user_map: dict[int, User]
-) -> tuple[dict[int, UserTrafficEnrichment], bool]:
-    """Build enrichment data for all users: devices, spending, dates, last node.
-
-    Второй элемент — признак того, что панельные данные получить не удалось.
-    Без него результат с обнулёнными «устройствами» и «последней нодой» попадал
-    в общий 5-минутный кэш и продолжал показываться всем админам и CSV-экспорту
-    ещё долго после того, как панель поднялась.
-    """
-    panel_degraded = False
-    panel_user_id_to_user_id: dict[int, int] = {}
-    for panel_user_id, user in user_map.items():
-        panel_user_id_to_user_id[panel_user_id] = user.id
-
+    spending = await _get_bulk_spending(list(users))
     service = RemnaWaveService()
-    devices_by_user: dict[int, int] = {}
-    last_node_uuid_by_user: dict[int, str] = {}
-    node_uuid_to_name: dict[str, str] = {}
+    if not service.is_configured:
+        raise unavailable('Remnawave is not configured.')
+    async with service.get_api_client() as api:
+        nodes = await api.get_all_nodes()
+        node_names = {node.uuid: node.name for node in nodes}
+        if requested is None:
+            devices, last_nodes = await _full_panel_enrichment(api, panel_map)
+        else:
+            devices, last_nodes = await _page_panel_enrichment(api, panel_map)
+    enrichment = await run_cpu(_render_enrichment, users, spending, devices, last_nodes, node_names)
+    if requested is None:
+        _enrichment_cache = (monotonic(), enrichment)
+    else:
+        for uid, entry in enrichment.items():
+            _page_enrichment_cache[uid] = (monotonic(), entry)
+            _page_enrichment_cache.move_to_end(uid)
+        while len(_page_enrichment_cache) > 2000:
+            _page_enrichment_cache.popitem(last=False)
+        enrichment.update(cached)
+    return enrichment
 
-    if service.is_configured:
-        async with service.get_api_client() as api:
-            # 3 bulk calls: nodes + users (paginated) + devices
-            try:
-                nodes_list = await api.get_all_nodes()
-            except Exception:
-                logger.warning('Failed to fetch nodes for enrichment', exc_info=True)
-                nodes_list = []
-                panel_degraded = True
 
-            for node in nodes_list:
-                node_uuid_to_name[node.uuid] = node.name
+def _enrichment_maps(user_map, requested):
+    users, panel_map = {}, {}
+    for panel_id, user in user_map.items():
+        if requested is None or user.id in requested:
+            users[user.id] = user
+            panel_map[panel_id] = user.id
+    return users, panel_map
 
-            # Fetch all panel users (paginated) for last connected node
-            panel_users = []
-            try:
-                first_page = await api.get_all_users(start=0, size=500)
-                panel_users.extend(first_page['users'])
-                total_panel = first_page['total']
 
-                if total_panel > 500:
-                    remaining_tasks = [
-                        api.get_all_users(start=offset, size=500) for offset in range(500, total_panel, 500)
-                    ]
-                    pages = await asyncio.gather(*remaining_tasks, return_exceptions=True)
-                    for page in pages:
-                        if isinstance(page, dict):
-                            panel_users.extend(page['users'])
-            except Exception:
-                logger.warning('Failed to fetch panel users for enrichment', exc_info=True)
-                panel_degraded = True
-
-            # HWID-устройства ссылаются на пользователя по числовому panel id
-            # (device['userId']) — тем же, которым панельная запись теперь и
-            # идентифицируется, поэтому отдельная карта больше не нужна: берём
-            # только тех панельных юзеров, которых знаем локально.
-            for pu in panel_users:
-                uid = panel_user_id_to_user_id.get(pu.id)
-                if uid is None:
-                    continue
-                if pu.user_traffic and pu.user_traffic.last_connected_node_uuid:
-                    last_node_uuid_by_user[uid] = pu.user_traffic.last_connected_node_uuid
-
-            # Bulk device fetch — single API call (paginated with start/size)
-            try:
-                devices_data = await api.get_all_hwid_devices()
-                for device in devices_data.get('devices', []):
-                    uid = panel_user_id_to_user_id.get(device.get('userId'))
-                    if uid is not None:
-                        devices_by_user[uid] = devices_by_user.get(uid, 0) + 1
-            except Exception:
-                logger.warning('Failed to fetch bulk devices for enrichment', exc_info=True)
-                panel_degraded = True
-
-    # Bulk spending stats
-    all_user_ids = [u.id for u in user_map.values()]
-    spending_map = await _get_bulk_spending(db, all_user_ids)
-
-    # Build enrichment data
-    enrichment: dict[int, UserTrafficEnrichment] = {}
-    for user in user_map.values():
-        uid = user.id
-        subs_list = getattr(user, 'subscriptions', None) or []
-
-        # Primary subscription for backward-compat top-level date fields
-        primary_sub = next((s for s in subs_list if s.is_active), subs_list[0] if subs_list else None)
-
-        start_date = None
-        end_date = None
-        if primary_sub:
-            if primary_sub.start_date:
-                start_date = primary_sub.start_date.isoformat()
-            if primary_sub.end_date:
-                end_date = primary_sub.end_date.isoformat()
-
-        last_node_name = None
-        last_uuid = last_node_uuid_by_user.get(uid)
-        if last_uuid:
-            last_node_name = node_uuid_to_name.get(last_uuid)
-
-        # Build per-subscription enrichment list for multi-subscription display
-        subscriptions_enrichment = [
-            SubscriptionEnrichmentInfo(
-                subscription_id=sub.id,
-                tariff_name=sub.tariff.name if sub.tariff else None,
-                start_date=sub.start_date.isoformat() if sub.start_date else None,
-                end_date=sub.end_date.isoformat() if sub.end_date else None,
-            )
-            for sub in subs_list
-        ]
-
-        enrichment[uid] = UserTrafficEnrichment(
-            devices_connected=devices_by_user.get(uid, 0),
-            total_spent_kopeks=spending_map.get(uid, 0),
-            subscription_start_date=start_date,
-            subscription_end_date=end_date,
-            last_node_name=last_node_name,
-            subscriptions=subscriptions_enrichment,
-        )
-
-    return enrichment, panel_degraded
+async def _enrichment_response(user_ids):
+    user_map = await _load_user_map()
+    data = await _get_enrichment(user_map, user_ids)
+    return await run_cpu(_enrichment_json_response, data)
 
 
 @router.get('/enrichment', response_model=TrafficEnrichmentResponse)
 async def get_traffic_enrichment(
     admin: User = Depends(require_permission('traffic:read')),
-    db: AsyncSession = Depends(get_cabinet_db),
+    user_ids: str = Query('', max_length=4000),
 ):
-    """Return enrichment data: device counts, spending, dates, last node."""
-    cache_key = 'enrichment'
-    now = time.time()
-
-    cached = _enrichment_cache.get(cache_key)
-    if cached and (now - cached[0]) < _ENRICHMENT_CACHE_TTL:
-        return TrafficEnrichmentResponse(data=cached[1])
-
-    async with _enrichment_lock:
-        now = time.time()
-        cached = _enrichment_cache.get(cache_key)
-        if cached and (now - cached[0]) < _ENRICHMENT_CACHE_TTL:
-            return TrafficEnrichmentResponse(data=cached[1])
-
-        user_map = await _load_user_map(db)
-        enrichment, panel_degraded = await _build_enrichment(db, user_map)
-
-        # Тот же довод, что и у _aggregate_traffic: запомнить деградированный
-        # ответ значит показывать нули ещё пять минут после восстановления.
-        if not panel_degraded:
-            _enrichment_cache[cache_key] = (now, enrichment)
-
-        # Evict expired
-        expired = [k for k, (ts, _) in _enrichment_cache.items() if (now - ts) >= _ENRICHMENT_CACHE_TTL]
-        for k in expired:
-            del _enrichment_cache[k]
-
-        return TrafficEnrichmentResponse(data=enrichment)
+    ids = None
+    if user_ids.strip():
+        try:
+            ids = tuple(sorted({int(value) for value in user_ids.split(',')}))
+        except ValueError:
+            raise HTTPException(status_code=400, detail='user_ids must contain comma-separated integers.') from None
+        if not ids or len(ids) > 200 or ids[0] < 1:
+            raise HTTPException(status_code=400, detail='user_ids must contain 1 to 200 positive user IDs.')
+    return await _jobs.run(('enrichment', ids), lambda: _enrichment_response(ids))
 
 
-@router.post('/export-csv', response_model=ExportCsvResponse)
-async def export_traffic_csv(
-    request: ExportCsvRequest,
-    admin: User = Depends(require_permission('traffic:export')),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Generate CSV with traffic usage and send to admin's Telegram DM."""
-    if not admin.telegram_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Admin has no Telegram ID configured',
-        )
+@dataclass(slots=True)
+class PreparedTrafficCsv:
+    content: bytes
+    filename: str
+    caption: str
+    row_count: int
 
+
+async def export_traffic_csv(request: ExportCsvRequest) -> PreparedTrafficCsv:
+    """Prepare an export without external side effects in the shared job."""
     # Determine date range: custom dates or period-based
     if request.start_date and request.end_date:
         try:
@@ -670,10 +754,32 @@ async def export_traffic_csv(
         period_label = f'{request.period}d'
         period_days = request.period
 
-    user_map = await _load_user_map(db)
-    user_traffic, nodes_info = await _aggregate_traffic(start_str, end_str, list(user_map.keys()))
-    enrichment, _ = await _build_enrichment(db, user_map)
+    user_map = await _load_user_map()
+    user_traffic, nodes_info = await _aggregate_traffic(start_str, end_str, user_map)
+    enrichment = await _get_enrichment(user_map)
 
+    csv_bytes, row_count = await run_cpu(
+        _render_csv,
+        request,
+        user_map,
+        user_traffic,
+        nodes_info,
+        enrichment,
+        period_days,
+    )
+
+    timestamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
+    filename = f'traffic_usage_{period_label}_{timestamp}.csv'
+
+    return PreparedTrafficCsv(
+        content=csv_bytes,
+        filename=filename,
+        caption=f'Traffic usage report ({period_label})\nUsers: {row_count}',
+        row_count=row_count,
+    )
+
+
+def _render_csv(request, user_map, user_traffic, nodes_info, enrichment, period_days):
     # Parse filters
     tariff_filter: set[str] | None = None
     if request.tariffs and request.tariffs.strip():
@@ -690,10 +796,9 @@ async def export_traffic_csv(
         if not node_filter:
             node_filter = None
 
-    items = _build_traffic_items(
+    items = _select_traffic_ids(
         user_traffic,
         user_map,
-        nodes_info,
         sort_by='total_bytes',
         sort_desc=True,
         tariff_filter=tariff_filter,
@@ -709,8 +814,11 @@ async def export_traffic_csv(
     has_risk = total_thr > 0 or node_thr > 0
 
     # Build CSV rows
-    rows: list[dict] = []
-    for item in items:
+    output = io.StringIO()
+    writer = None
+    row_count = 0
+    for panel_id in items:
+        item = _traffic_row(panel_id, user_traffic, user_map, node_filter)
         row: dict = {
             'User ID': item.user_id,
             'Telegram ID': item.telegram_id or '',
@@ -765,32 +873,38 @@ async def export_traffic_csv(
             row['Risk Ratio'] = round(ratio, 3)
             row['Risk GB/day'] = round(daily_total if total_ratio >= max_node_ratio else worst_node_daily, 4)
 
-        rows.append(row)
+        if writer is None:
+            writer = csv.DictWriter(output, fieldnames=row.keys())
+            writer.writeheader()
+        writer.writerow(row)
+        row_count += 1
 
-    # Generate CSV
-    output = io.StringIO()
-    if rows:
-        writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-    csv_bytes = output.getvalue().encode('utf-8-sig')
+    return output.getvalue().encode('utf-8-sig'), row_count
 
-    timestamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
-    filename = f'traffic_usage_{period_label}_{timestamp}.csv'
 
+@router.post('/export-csv', response_model=ExportCsvResponse)
+async def export_traffic_csv_endpoint(
+    request: ExportCsvRequest,
+    admin: User = Depends(require_permission('traffic:export')),
+):
+    if not admin.telegram_id:
+        raise HTTPException(status_code=400, detail='Admin has no Telegram ID configured')
+    # Only pure preparation outlives the caller. A timeout/cancellation here
+    # never sends a Telegram document later from a detached background task.
+    key = ('export', admin.id, request.model_dump_json())
+    prepared = await _jobs.run(key, lambda: export_traffic_csv(request))
     try:
         bot = create_bot()
         async with bot:
             await bot.send_document(
                 chat_id=admin.telegram_id,
-                document=BufferedInputFile(csv_bytes, filename=filename),
-                caption=f'Traffic usage report ({period_label})\nUsers: {len(rows)}',
+                document=BufferedInputFile(prepared.content, filename=prepared.filename),
+                caption=prepared.caption,
             )
     except Exception:
         logger.error('Failed to send CSV to admin', telegram_id=admin.telegram_id, exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail='Failed to send CSV report. Please try again later.',
         )
-
-    return ExportCsvResponse(success=True, message=f'CSV sent ({len(rows)} users)')
+    return ExportCsvResponse(success=True, message=f'CSV sent ({prepared.row_count} users)')
