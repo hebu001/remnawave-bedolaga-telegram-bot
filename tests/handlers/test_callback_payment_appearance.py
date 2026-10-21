@@ -129,3 +129,109 @@ def test_renewal_period_preserves_target_and_has_green_payload():
     assert button.callback_data == 'tariff_extend:11:7:30'
     assert button.style == 'success'
     assert 'style="success"' in render_keyboard_as_rich_html(keyboard)
+
+
+@pytest.mark.parametrize('restore', [False, True])
+@pytest.mark.parametrize('balance', [10000, 20000])
+async def test_purchase_preview_keeps_extra_devices_and_new_fields(monkeypatch, restore, balance):
+    monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(m, 'get_tariff_by_id', AsyncMock(return_value=_tariff()))
+    monkeypatch.setattr(
+        m, 'get_subscription_by_user_id', AsyncMock(return_value=SimpleNamespace(id=11, tariff_id=7, device_limit=5))
+    )
+    monkeypatch.setattr(pricing_engine, 'calculate_tariff_purchase_price', AsyncMock(return_value=_price()))
+    monkeypatch.setattr(m.user_cart_service, 'save_user_cart', AsyncMock())
+    callback = SimpleNamespace(
+        data='tariff_period:7:30', message=SimpleNamespace(edit_text=AsyncMock()), answer=AsyncMock()
+    )
+    state = SimpleNamespace(get_data=AsyncMock(return_value={}), update_data=AsyncMock(), set_state=AsyncMock())
+    user = SimpleNamespace(id=123, language='ru', balance_kopeks=balance)
+    if restore:
+        await m.return_to_saved_tariff_cart(
+            callback,
+            state,
+            user,
+            AsyncMock(),
+            dict(
+                cart_mode='tariff_purchase',
+                tariff_id=7,
+                subscription_id=11,
+                period_days=30,
+                device_limit=5,
+                total_price=15000,
+            ),
+        )
+    else:
+        await m.select_tariff_period.__wrapped__(callback, user, AsyncMock(), state)
+    text = callback.message.edit_text.await_args.args[0]
+    assert '• Тариф: <b>Plan</b>\n• Трафик: 300 ГБ\n• Период: 30 дней\n• Устройств: 5' in text
+    assert 'После оплаты' not in text
+    assert 'Стоимость:' not in text
+    assert '\nВаш баланс:' in text
+    assert '\n\n\n' not in text
+    emoji = '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji>'
+    if balance < 15000:
+        assert text.count('Не хватает:') == 1
+        assert text.index('Ваш баланс:') < text.index('Не хватает:')
+        assert emoji + ' Не хватает: <b>50' in text
+    else:
+        assert text.startswith('✅ <b>Подтверждение покупки</b>\n• Тариф:')
+        assert emoji + '<b>Итого: 150' in text
+        assert (
+            callback.message.edit_text.await_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+            == 'tariff_confirm:7:30'
+        )
+
+
+@pytest.mark.parametrize('language', ['en', 'fa', 'ua', 'zh'])
+@pytest.mark.parametrize('restore', [False, True])
+async def test_non_russian_insufficient_purchase_keeps_existing_locale(monkeypatch, language, restore):
+    from app.localization.texts import get_texts
+    from app.utils.formatting import format_period, format_price_kopeks
+
+    monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
+    monkeypatch.setattr(m, 'get_tariff_by_id', AsyncMock(return_value=_tariff()))
+    monkeypatch.setattr(m, 'get_subscription_by_user_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(pricing_engine, 'calculate_tariff_purchase_price', AsyncMock(return_value=_price()))
+    monkeypatch.setattr(m.user_cart_service, 'save_user_cart', AsyncMock())
+    callback = SimpleNamespace(
+        data='tariff_period:7:30', message=SimpleNamespace(edit_text=AsyncMock()), answer=AsyncMock()
+    )
+    state = SimpleNamespace(get_data=AsyncMock(return_value={}), update_data=AsyncMock(), set_state=AsyncMock())
+    user = SimpleNamespace(id=123, language=language, balance_kopeks=10000)
+    if restore:
+        await m.return_to_saved_tariff_cart(
+            callback,
+            state,
+            user,
+            AsyncMock(),
+            dict(cart_mode='tariff_purchase', tariff_id=7, period_days=30, total_price=15000),
+        )
+    else:
+        await m.select_tariff_period.__wrapped__(callback, user, AsyncMock(), state)
+    key = 'TARIFF_PURCHASE_STILL_INSUFFICIENT' if restore else 'TARIFF_PURCHASE_INSUFFICIENT'
+    expected = (
+        get_texts(language)
+        .t(key)
+        .format(
+            name='Plan',
+            period=format_period(30),
+            price=format_price_kopeks(15000),
+            balance=format_price_kopeks(10000),
+            missing=format_price_kopeks(5000),
+        )
+    )
+    assert callback.message.edit_text.await_args.args[0] == expected
+
+
+@pytest.mark.parametrize('stored,expected', [({}, 2), ({'device_limit': 0, 'traffic_limit_gb': 600}, 0)])
+@pytest.mark.parametrize('balance', [10000, 20000])
+async def test_saved_cart_devices_fallback_preserves_explicit_zero(monkeypatch, stored, expected, balance):
+    monkeypatch.setattr(m, 'get_tariff_by_id', AsyncMock(return_value=_tariff()))
+    callback = SimpleNamespace(message=SimpleNamespace(edit_text=AsyncMock()), answer=AsyncMock())
+    state = SimpleNamespace(update_data=AsyncMock())
+    user = SimpleNamespace(id=123, language='ru', balance_kopeks=balance)
+    cart = dict(cart_mode='tariff_purchase', tariff_id=7, period_days=30, total_price=15000, **stored)
+    await m.return_to_saved_tariff_cart(callback, state, user, AsyncMock(), cart)
+    assert f'• Устройств: {expected}\n' in callback.message.edit_text.await_args.args[0]
+    assert f'• Трафик: {stored.get("traffic_limit_gb", 300)} ГБ\n' in callback.message.edit_text.await_args.args[0]

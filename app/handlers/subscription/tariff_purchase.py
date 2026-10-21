@@ -1862,20 +1862,20 @@ async def select_tariff_period(
         await callback.message.edit_text(
             texts.t(
                 'TARIFF_PURCHASE_CONFIRM',
-                '✅ <b>Подтверждение покупки</b>\n\n'
-                'Тариф: <b>{name}</b>\n'
-                'Трафик: {traffic}\n'
-                'Устройств: {devices}\n'
-                'Период: {period}\n'
+                '✅ <b>Подтверждение покупки</b>\n'
+                '• Тариф: <b>{name}</b>\n'
+                '• Трафик: {traffic}\n'
+                '• Период: {period}\n'
+                '• Устройств: {devices}\n'
                 '{discount}\n'
-                '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji> <b>Итого: {total}</b>\n\n'
+                '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji><b>Итого: {total}</b>\n'
                 'Ваш баланс: {balance}',
             ).format(
                 name=html.escape(tariff.name),
                 traffic=traffic,
                 devices=device_limit,
                 period=format_period(period),
-                discount=discount_text,
+                discount=discount_text.strip(),
                 total=format_price_kopeks(final_price),
                 balance=format_price_kopeks(user_balance),
                 after=format_price_kopeks(user_balance - final_price),
@@ -1908,15 +1908,22 @@ async def select_tariff_period(
 
         await callback.message.edit_text(
             texts.t(
-                'TARIFF_PURCHASE_INSUFFICIENT',
-                '❌ <b>Недостаточно средств</b>\n\n'
-                '📦 Тариф: <b>{name}</b>\n'
-                '📅 Период: {period}\n'
-                '💰 Стоимость: {price}\n\n'
-                '💳 Ваш баланс: {balance}\n'
-                '⚠️ Не хватает: <b>{missing}</b>',
+                'TARIFF_PURCHASE_PAYMENT_INSUFFICIENT'
+                if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
+                else 'TARIFF_PURCHASE_INSUFFICIENT',
+                '❌ <b>Недостаточно средств</b>\n'
+                '\n'
+                '• Тариф: <b>{name}</b>\n'
+                '• Трафик: {traffic}\n'
+                '• Период: {period}\n'
+                '• Устройств: {devices}\n'
+                '\n'
+                'Ваш баланс: {balance}\n'
+                '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji> Не хватает: <b>{missing}</b>',
             ).format(
                 name=html.escape(tariff.name),
+                traffic=traffic,
+                devices=device_limit,
                 period=format_period(period),
                 price=format_price_kopeks(final_price),
                 balance=format_price_kopeks(user_balance),
@@ -5671,15 +5678,22 @@ async def return_to_saved_tariff_cart(
             period = cart_data.get('period_days', 30)
             await callback.message.edit_text(
                 texts.t(
-                    'TARIFF_PURCHASE_STILL_INSUFFICIENT',
-                    '❌ <b>Все еще недостаточно средств</b>\n\n'
-                    '📦 Тариф: <b>{name}</b>\n'
-                    '📅 Период: {period}\n'
-                    '💰 Стоимость: {price}\n\n'
-                    '💳 Ваш баланс: {balance}\n'
-                    '⚠️ Не хватает: <b>{missing}</b>',
+                    'TARIFF_PURCHASE_PAYMENT_INSUFFICIENT'
+                    if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
+                    else 'TARIFF_PURCHASE_STILL_INSUFFICIENT',
+                    '❌ <b>Недостаточно средств</b>\n'
+                    '\n'
+                    '• Тариф: <b>{name}</b>\n'
+                    '• Трафик: {traffic}\n'
+                    '• Период: {period}\n'
+                    '• Устройств: {devices}\n'
+                    '\n'
+                    'Ваш баланс: {balance}\n'
+                    '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji> Не хватает: <b>{missing}</b>',
                 ).format(
                     name=html.escape(tariff.name),
+                    traffic=format_traffic(cart_data.get('traffic_limit_gb', tariff.traffic_limit_gb)),
+                    devices=cart_data.get('device_limit', tariff.device_limit),
                     period=format_period(period),
                     price=format_price_kopeks(total_price),
                     balance=format_price_kopeks(user_balance),
@@ -5804,20 +5818,20 @@ async def return_to_saved_tariff_cart(
         await callback.message.edit_text(
             texts.t(
                 'TARIFF_PURCHASE_CONFIRM',
-                '✅ <b>Подтверждение покупки</b>\n\n'
-                'Тариф: <b>{name}</b>\n'
-                'Трафик: {traffic}\n'
-                'Устройств: {devices}\n'
-                'Период: {period}\n'
+                '✅ <b>Подтверждение покупки</b>\n'
+                '• Тариф: <b>{name}</b>\n'
+                '• Трафик: {traffic}\n'
+                '• Период: {period}\n'
+                '• Устройств: {devices}\n'
                 '{discount}\n'
-                '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji> <b>Итого: {total}</b>\n\n'
+                '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji><b>Итого: {total}</b>\n'
                 'Ваш баланс: {balance}',
             ).format(
                 name=html.escape(tariff.name),
-                traffic=traffic,
-                devices=tariff.device_limit,
+                traffic=format_traffic(cart_data.get('traffic_limit_gb', tariff.traffic_limit_gb)),
+                devices=cart_data.get('device_limit', tariff.device_limit),
                 period=format_period(period),
-                discount=discount_text,
+                discount=discount_text.strip(),
                 total=format_price_kopeks(total_price),
                 balance=format_price_kopeks(user_balance),
                 after=format_price_kopeks(user_balance - total_price),
