@@ -133,9 +133,8 @@ async def _aggregate_traffic(start_str: str, end_str: str, user_map):
             ),
             key=lambda n: n.node_name,
         )
-        # One node document at a time limits peak JSON allocation and decoding
-        # latency. Large installations never hold an all-nodes raw response.
-        for node in nodes:
+
+        async def read_node(node):
             usage = await panel_request(
                 api,
                 'POST',
@@ -143,7 +142,23 @@ async def _aggregate_traffic(start_str: str, end_str: str, user_map):
                 params={'start': start_str[:10], 'end': end_str[:10], 'minTotalBytes': 0},
                 data={'nodesUuids': [node.uuid]},
             )
+            # Merge immediately in the one CPU worker; do not accumulate raw
+            # node documents in gather's result list or decode them on the loop.
             await run_cpu(_merge_node_usage, usage, user_map, traffic)
+
+        # Real panels have dozens of nodes: serial network latency can exceed
+        # the 25-second caller deadline. At most four bounded node documents
+        # are live, and every request still obeys shared pacing/429 cooldown.
+        for start in range(0, len(nodes), PANEL_CONCURRENCY):
+            results = await asyncio.gather(
+                *(read_node(node) for node in nodes[start : start + PANEL_CONCURRENCY]),
+                return_exceptions=True,
+            )
+            # Wait for the whole batch before propagating a failure, so no
+            # sibling work escapes the admission slot. Publish only all-success.
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
     _traffic_cache[key] = (monotonic(), traffic, nodes_info)
     _traffic_cache.move_to_end(key)
     while len(_traffic_cache) > 2:

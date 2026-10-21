@@ -678,3 +678,176 @@ async def test_csv_delivery_only_after_successful_request_await(monkeypatch, out
         await asyncio.sleep(0)
         assert factories == []
         bot.send_document.assert_not_awaited()
+
+
+def install_node_api(monkeypatch, count=32):
+    api = SimpleNamespace(
+        get_all_nodes=AsyncMock(
+            return_value=[SimpleNamespace(uuid=f'node-{i}', name=f'Node {i}', country_code='FI') for i in range(count)]
+        )
+    )
+
+    class APIContext:
+        async def __aenter__(self):
+            return api
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(
+        traffic, 'RemnaWaveService', lambda: SimpleNamespace(is_configured=True, get_api_client=APIContext)
+    )
+    return api
+
+
+@pytest.mark.asyncio
+async def test_slow_32_nodes_fit_deadline_with_four_bounded_documents(monkeypatch, record_property):
+    """Scaled latency reproduces >25s serial / <25s bounded-parallel production scenario."""
+    api = install_node_api(monkeypatch)
+    users = {1: user(1, 'One'), 2: user(2, 'Two')}
+    counts = {'active': 0, 'peak': 0, 'documents': 0, 'documents_peak': 0, 'requests': 0}
+    delay, deadline = 0.025, 0.5
+
+    class Payload(dict):
+        def __init__(self, value):
+            super().__init__(value)
+            counts['documents'] += 1
+            counts['documents_peak'] = max(counts['documents_peak'], counts['documents'])
+
+        def __del__(self):
+            counts['documents'] -= 1
+
+    async def request(client, method, endpoint, *, params, data):
+        assert client is api
+        assert method == 'POST' and endpoint == '/api/bandwidth-stats/nodes/usage'
+        assert params == {'start': '2026-10-01', 'end': '2026-10-21', 'minTotalBytes': 0}
+        assert len(data['nodesUuids']) == 1
+        counts['active'] += 1
+        counts['requests'] += 1
+        counts['peak'] = max(counts['peak'], counts['active'])
+        try:
+            await asyncio.sleep(delay)
+            node = data['nodesUuids'][0]
+            number = int(node.split('-')[1])
+            return Payload(
+                {
+                    'nodes': [
+                        {
+                            'uuid': node,
+                            'users': [
+                                {'id': 1 + number % 2, 'totalBytes': 100 + number},
+                            ],
+                        }
+                    ]
+                }
+            )
+        finally:
+            counts['active'] -= 1
+
+    monkeypatch.setattr(traffic, 'panel_request', request)
+
+    async def old_serial_network():
+        for node in await api.get_all_nodes():
+            await request(
+                api,
+                'POST',
+                '/api/bandwidth-stats/nodes/usage',
+                params={'start': '2026-10-01', 'end': '2026-10-21', 'minTotalBytes': 0},
+                data={'nodesUuids': [node.uuid]},
+            )
+
+    baseline = runtime.TrafficJobs(wait_timeout=deadline)
+    started = time.perf_counter()
+    with pytest.raises(HTTPException) as failure:
+        await baseline.run('serial', old_serial_network)
+    assert failure.value.status_code == 503
+    assert time.perf_counter() - started >= deadline
+    await next(iter(baseline.jobs.values()))
+    assert counts['peak'] == 1
+    for key in counts:
+        counts[key] = 0
+
+    bounded = runtime.TrafficJobs(wait_timeout=deadline)
+    started = time.perf_counter()
+    result, node_list = await bounded.run(
+        'parallel', lambda: traffic._aggregate_traffic('2026-10-01T00:00:00Z', '2026-10-21T00:00:00Z', users)
+    )
+    elapsed = time.perf_counter() - started
+    assert elapsed < deadline
+    assert len(node_list) == 32 and counts['requests'] == 32
+    assert 1 < counts['peak'] <= 4
+    assert counts['documents_peak'] <= 4
+    assert counts['active'] == counts['documents'] == 0
+    assert len(result[1]) == len(result[2]) == 16
+    assert sum(result[1].values()) == sum(100 + i for i in range(0, 32, 2))
+    assert sum(result[2].values()) == sum(100 + i for i in range(1, 32, 2))
+    assert len(traffic._traffic_cache) == 1
+    record_property(
+        'traffic_slow_nodes',
+        json.dumps(
+            {
+                'nodes': 32,
+                'delay_seconds': delay,
+                'caller_deadline_seconds': deadline,
+                'serial_deadline_failed': True,
+                'parallel_seconds': elapsed,
+                'max_http_requests': counts['peak'],
+                'max_raw_documents': counts['documents_peak'],
+            }
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_node_batch_failure_waits_for_siblings_and_never_publishes_partial_cache(monkeypatch):
+    install_node_api(monkeypatch)
+    active = 0
+    completed = []
+
+    async def request(api, method, endpoint, *, params, data):
+        nonlocal active
+        node = data['nodesUuids'][0]
+        active += 1
+        try:
+            if node == 'node-1':
+                await asyncio.sleep(0)
+                raise runtime.unavailable('One node failed')
+            await asyncio.sleep(0.01)
+            return {'nodes': [{'uuid': node, 'users': [{'id': 1, 'totalBytes': 10}]}]}
+        finally:
+            active -= 1
+            completed.append(node)
+
+    monkeypatch.setattr(traffic, 'panel_request', request)
+    with pytest.raises(HTTPException, match='One node failed'):
+        await traffic._aggregate_traffic('2026-10-01', '2026-10-21', {1: user(1, 'One')})
+    assert active == 0
+    assert set(completed) == {f'node-{i}' for i in range(4)}
+    assert not traffic._traffic_cache
+
+
+@pytest.mark.asyncio
+async def test_node_batch_job_timeout_cleans_up_all_children(monkeypatch):
+    install_node_api(monkeypatch)
+    active = 0
+    started = []
+    finished = []
+
+    async def request(api, method, endpoint, *, params, data):
+        nonlocal active
+        node = data['nodesUuids'][0]
+        active += 1
+        started.append(node)
+        try:
+            await asyncio.sleep(10)
+        finally:
+            active -= 1
+            finished.append(node)
+
+    monkeypatch.setattr(traffic, 'panel_request', request)
+    jobs = runtime.TrafficJobs(wait_timeout=1, job_timeout=0.02)
+    with pytest.raises(HTTPException, match='timed out'):
+        await jobs.run('cancelled', lambda: traffic._aggregate_traffic('2026-10-01', '2026-10-21', {1: user(1, 'One')}))
+    assert active == 0
+    assert len(started) == 4 and set(started) == set(finished)
+    assert not jobs.jobs and not traffic._traffic_cache
