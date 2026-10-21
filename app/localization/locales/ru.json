@@ -994,6 +994,8 @@
   "TARIFF_PURCHASE_CART_SAVED_HINT": "\n\n🛒 <i>Корзина сохранена! После пополнения баланса подписка будет оформлена автоматически.</i>",
   "TARIFF_PURCHASE_CHARGE_ERROR": "❌ Ошибка списания баланса",
   "TARIFF_PURCHASE_CHOOSE_PERIOD": "\nВыберите период подписки:",
+  "TARIFF_PURCHASE_PAYMENT_SUMMARY": "<b>Подтверждение покупки</b>\n\n• Тариф: <b>{name}</b>\n• Трафик: {traffic}\n• Период: {period}\n• Устройств: {devices}{discount}\n\n<tg-emoji emoji-id=\"5278613311858959074\">🛒</tg-emoji><b>Итого: {total}</b>{balance_line}",
+  "TARIFF_PURCHASE_PAYMENT_BALANCE": "Ваш баланс: {balance}",
   "TARIFF_PURCHASE_CONFIRM": "✅ <b>Подтверждение покупки</b>\n• Тариф: <b>{name}</b>\n• Трафик: {traffic}\n• Период: {period}\n• Устройств: {devices}\n{discount}\n<tg-emoji emoji-id=\"5278613311858959074\">🛒</tg-emoji><b>Итого: {total}</b>\nВаш баланс: {balance}",
   "TARIFF_PURCHASE_CONFIRM_BUTTON": "Оплатить балансом",
   "TARIFF_PERIOD_BEST_VALUE_BADGE": "⭐ выгодно",

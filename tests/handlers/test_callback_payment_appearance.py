@@ -132,14 +132,32 @@ def test_renewal_period_preserves_target_and_has_green_payload():
 
 
 @pytest.mark.parametrize('restore', [False, True])
-@pytest.mark.parametrize('balance', [10000, 20000])
-async def test_purchase_preview_keeps_extra_devices_and_new_fields(monkeypatch, restore, balance):
+@pytest.mark.parametrize(
+    'cost,balance',
+    [
+        (15000, 0),
+        (15000, 10000),
+        (15000, 15000),
+        (15000, 20000),
+        (12000, 0),
+        (12000, 10000),
+        (12000, 12000),
+        (12000, 20000),
+        (0, 0),
+    ],
+)
+async def test_purchase_preview_keeps_extra_devices_and_new_fields(monkeypatch, restore, cost, balance):
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
     monkeypatch.setattr(m, 'get_tariff_by_id', AsyncMock(return_value=_tariff()))
     monkeypatch.setattr(
         m, 'get_subscription_by_user_id', AsyncMock(return_value=SimpleNamespace(id=11, tariff_id=7, device_limit=5))
     )
-    monkeypatch.setattr(pricing_engine, 'calculate_tariff_purchase_price', AsyncMock(return_value=_price()))
+    price = SimpleNamespace(
+        original_total=15000, final_total=cost, promo_group_discount=15000 - cost, promo_offer_discount=0
+    )
+    monkeypatch.setattr(pricing_engine, 'calculate_tariff_purchase_price', AsyncMock(return_value=price))
+    monkeypatch.setattr(settings, 'AUTO_PURCHASE_AFTER_TOPUP_ENABLED', True)
+    monkeypatch.setattr(settings, 'TELEGRAM_STARS_ENABLED', True)
     monkeypatch.setattr(m.user_cart_service, 'save_user_cart', AsyncMock())
     callback = SimpleNamespace(
         data='tariff_period:7:30', message=SimpleNamespace(edit_text=AsyncMock()), answer=AsyncMock()
@@ -158,7 +176,8 @@ async def test_purchase_preview_keeps_extra_devices_and_new_fields(monkeypatch, 
                 subscription_id=11,
                 period_days=30,
                 device_limit=5,
-                total_price=15000,
+                total_price=cost,
+                discount_percent=round((1 - cost / 15000) * 100),
             ),
         )
     else:
@@ -167,20 +186,28 @@ async def test_purchase_preview_keeps_extra_devices_and_new_fields(monkeypatch, 
     assert '• Тариф: <b>Plan</b>\n• Трафик: 300 ГБ\n• Период: 30 дней\n• Устройств: 5' in text
     assert 'После оплаты' not in text
     assert 'Стоимость:' not in text
-    assert '\nВаш баланс:' in text
+    assert ('Ваш баланс:' in text) == (balance != 0)
     assert '\n\n\n' not in text
+    assert 'Не хватает' not in text
+    assert 'Недостаточно' not in text
+    assert text.startswith('<b>Подтверждение покупки</b>\n\n• Тариф:')
+    from app.utils.formatting import format_price_kopeks
+
     emoji = '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji>'
-    if balance < 15000:
-        assert text.count('Не хватает:') == 1
-        assert text.index('Ваш баланс:') < text.index('Не хватает:')
-        assert emoji + ' Не хватает: <b>50' in text
+    assert emoji + '<b>Итого: ' + format_price_kopeks(cost) + '</b>' in text
+    if cost < 15000:
+        assert 'Скидка:' in text
+    buttons = [
+        button for row in callback.message.edit_text.await_args.kwargs['reply_markup'].inline_keyboard for button in row
+    ]
+    confirmations = [button for button in buttons if button.callback_data == 'tariff_confirm:7:30']
+    assert bool(confirmations) == (balance >= cost)
+    if confirmations:
+        assert confirmations[0].text == 'Оплатить балансом'
+        assert confirmations[0].style == 'primary'
+        assert confirmations[0].icon_custom_emoji_id == '5375112143144263548'
     else:
-        assert text.startswith('✅ <b>Подтверждение покупки</b>\n• Тариф:')
-        assert emoji + '<b>Итого: 150' in text
-        assert (
-            callback.message.edit_text.await_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
-            == 'tariff_confirm:7:30'
-        )
+        assert any(button.callback_data == f'topup_amount|stars|{cost - balance}' for button in buttons)
 
 
 @pytest.mark.parametrize('language', ['en', 'fa', 'ua', 'zh'])

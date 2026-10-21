@@ -376,6 +376,51 @@ async def get_tariff_periods_keyboard_with_traffic(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def _purchase_payment_summary(texts, *, name, traffic, devices, period, total, balance, discount='') -> str:
+    """Shared Russian purchase preview; payment eligibility stays with the caller."""
+    balance_line = (
+        '\n\n'
+        + texts.t('TARIFF_PURCHASE_PAYMENT_BALANCE', 'Ваш баланс: {balance}').format(
+            balance=format_price_kopeks(balance)
+        )
+        if balance != 0
+        else ''
+    )
+    discount_line = '\n' + discount.strip() if discount.strip() else ''
+    return texts.t(
+        'TARIFF_PURCHASE_PAYMENT_SUMMARY',
+        '<b>Подтверждение покупки</b>\n\n'
+        '• Тариф: <b>{name}</b>\n'
+        '• Трафик: {traffic}\n'
+        '• Период: {period}\n'
+        '• Устройств: {devices}{discount}\n\n'
+        '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji><b>Итого: {total}</b>{balance_line}',
+    ).format(
+        name=html.escape(name),
+        traffic=traffic,
+        devices=devices,
+        period=format_period(period),
+        discount=discount_line,
+        total=format_price_kopeks(total),
+        balance_line=balance_line,
+    )
+
+
+def _purchase_discount_text(texts, percent: int, total: int) -> str:
+    # Old saved carts contain a percentage, but not the original price.
+    # Avoid dividing by zero for a completely discounted purchase.
+    if not 0 < percent < 100:
+        return (
+            texts.t('TARIFF_PURCHASE_DISCOUNT_LINE', '\n🎁 <b>Скидка: {percent}%</b>\n').format(percent=percent)
+            if percent == 100
+            else ''
+        )
+    original = int(total / (1 - percent / 100))
+    return texts.t('TARIFF_PURCHASE_DISCOUNT_SHORT_LINE', '\n🎁 Скидка: {percent}% (-{amount})').format(
+        percent=percent, amount=format_price_kopeks(original - total)
+    )
+
+
 def _payment_markup(*, inline_keyboard: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     from app.keyboards.inline import style_payment_method_buttons
 
@@ -1851,16 +1896,27 @@ async def select_tariff_period(
 
     traffic = format_traffic(tariff.traffic_limit_gb)
 
+    discount_text = ''
+    if discount_percent > 0:
+        discount_text = texts.t('TARIFF_PURCHASE_DISCOUNT_SHORT_LINE', '\n🎁 Скидка: {percent}% (-{amount})').format(
+            percent=discount_percent, amount=format_price_kopeks(total_discount)
+        )
+
     if user_balance >= final_price:
         # Показываем подтверждение
-        discount_text = ''
-        if discount_percent > 0:
-            discount_text = texts.t(
-                'TARIFF_PURCHASE_DISCOUNT_SHORT_LINE', '\n🎁 Скидка: {percent}% (-{amount})'
-            ).format(percent=discount_percent, amount=format_price_kopeks(total_discount))
-
         await callback.message.edit_text(
-            texts.t(
+            _purchase_payment_summary(
+                texts,
+                name=tariff.name,
+                traffic=traffic,
+                devices=device_limit,
+                period=period,
+                total=final_price,
+                balance=user_balance,
+                discount=discount_text,
+            )
+            if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
+            else texts.t(
                 'TARIFF_PURCHASE_CONFIRM',
                 '✅ <b>Подтверждение покупки</b>\n'
                 '• Тариф: <b>{name}</b>\n'
@@ -1907,7 +1963,18 @@ async def select_tariff_period(
         await user_cart_service.save_user_cart(db_user.id, cart_data)
 
         await callback.message.edit_text(
-            texts.t(
+            _purchase_payment_summary(
+                texts,
+                name=tariff.name,
+                traffic=traffic,
+                devices=device_limit,
+                period=period,
+                total=final_price,
+                balance=user_balance,
+                discount=discount_text,
+            )
+            if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
+            else texts.t(
                 'TARIFF_PURCHASE_PAYMENT_INSUFFICIENT'
                 if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
                 else 'TARIFF_PURCHASE_INSUFFICIENT',
@@ -5677,7 +5744,18 @@ async def return_to_saved_tariff_cart(
         else:  # tariff_purchase
             period = cart_data.get('period_days', 30)
             await callback.message.edit_text(
-                texts.t(
+                _purchase_payment_summary(
+                    texts,
+                    name=tariff.name,
+                    traffic=format_traffic(cart_data.get('traffic_limit_gb', tariff.traffic_limit_gb)),
+                    devices=cart_data.get('device_limit', tariff.device_limit),
+                    period=period,
+                    total=total_price,
+                    balance=user_balance,
+                    discount=_purchase_discount_text(texts, cart_data.get('discount_percent', 0), total_price),
+                )
+                if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
+                else texts.t(
                     'TARIFF_PURCHASE_PAYMENT_INSUFFICIENT'
                     if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
                     else 'TARIFF_PURCHASE_STILL_INSUFFICIENT',
@@ -5809,14 +5887,25 @@ async def return_to_saved_tariff_cart(
         period = cart_data.get('period_days', 30)
 
         discount_text = ''
-        if discount_percent > 0:
+        if 0 < discount_percent < 100:
             original_price = int(total_price / (1 - discount_percent / 100))
             discount_text = texts.t(
                 'TARIFF_PURCHASE_DISCOUNT_SHORT_LINE', '\n🎁 Скидка: {percent}% (-{amount})'
             ).format(percent=discount_percent, amount=format_price_kopeks(original_price - total_price))
 
         await callback.message.edit_text(
-            texts.t(
+            _purchase_payment_summary(
+                texts,
+                name=tariff.name,
+                traffic=format_traffic(cart_data.get('traffic_limit_gb', tariff.traffic_limit_gb)),
+                devices=cart_data.get('device_limit', tariff.device_limit),
+                period=period,
+                total=total_price,
+                balance=user_balance,
+                discount=_purchase_discount_text(texts, cart_data.get('discount_percent', 0), total_price),
+            )
+            if texts.language.lower().replace('_', '-').split('-')[0] == 'ru'
+            else texts.t(
                 'TARIFF_PURCHASE_CONFIRM',
                 '✅ <b>Подтверждение покупки</b>\n'
                 '• Тариф: <b>{name}</b>\n'
