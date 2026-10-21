@@ -1863,14 +1863,13 @@ async def select_tariff_period(
             texts.t(
                 'TARIFF_PURCHASE_CONFIRM',
                 '✅ <b>Подтверждение покупки</b>\n\n'
-                '📦 Тариф: <b>{name}</b>\n'
-                '📊 Трафик: {traffic}\n'
-                '📱 Устройств: {devices}\n'
-                '📅 Период: {period}\n'
+                'Тариф: <b>{name}</b>\n'
+                'Трафик: {traffic}\n'
+                'Устройств: {devices}\n'
+                'Период: {period}\n'
                 '{discount}\n'
-                '💰 <b>Итого: {total}</b>\n\n'
-                '💳 Ваш баланс: {balance}\n'
-                'После оплаты: {after}',
+                '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji> <b>Итого: {total}</b>\n\n'
+                'Ваш баланс: {balance}',
             ).format(
                 name=html.escape(tariff.name),
                 traffic=traffic,
@@ -5806,14 +5805,13 @@ async def return_to_saved_tariff_cart(
             texts.t(
                 'TARIFF_PURCHASE_CONFIRM',
                 '✅ <b>Подтверждение покупки</b>\n\n'
-                '📦 Тариф: <b>{name}</b>\n'
-                '📊 Трафик: {traffic}\n'
-                '📱 Устройств: {devices}\n'
-                '📅 Период: {period}\n'
+                'Тариф: <b>{name}</b>\n'
+                'Трафик: {traffic}\n'
+                'Устройств: {devices}\n'
+                'Период: {period}\n'
                 '{discount}\n'
-                '💰 <b>Итого: {total}</b>\n\n'
-                '💳 Ваш баланс: {balance}\n'
-                'После оплаты: {after}',
+                '<tg-emoji emoji-id="5278613311858959074">🛒</tg-emoji> <b>Итого: {total}</b>\n\n'
+                'Ваш баланс: {balance}',
             ).format(
                 name=html.escape(tariff.name),
                 traffic=traffic,
