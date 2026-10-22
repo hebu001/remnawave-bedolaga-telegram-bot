@@ -88,7 +88,16 @@ def setup(monkeypatch):
         create_yookassa_payment=create, create_yookassa_sbp_payment=create, create_wata_payment=create
     )
     providers = [
-        SimpleNamespace(id=method, min_amount_kopeks=100, max_amount_kopeks=100000, is_available=True, options=None)
+        SimpleNamespace(
+            id=method,
+            name=method,
+            min_amount_kopeks=100,
+            max_amount_kopeks=100000,
+            is_available=True,
+            options=[{'id': 'card', 'name': '💳 Карта'}, {'id': 'sbp', 'name': '🏦 СБП'}]
+            if method == 'yookassa'
+            else None,
+        )
         for method in ('yookassa', 'wata')
     ]
     monkeypatch.setattr(m.user_cart_service, '_get_redis_client', lambda: redis)
@@ -133,6 +142,84 @@ async def test_keyboard_only_issues_tokens_and_reuses_context(setup):
     assert button.callback_data is None and button.style == 'primary' and button.icon_custom_emoji_id == '123'
     assert keyboard.inline_keyboard[0][0].callback_data is not None
     assert first.inline_keyboard[2][0].callback_data == 'topup_amount|stars|5000'
+
+
+def _old_purchase_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text='Extra SBP', callback_data='topup_amount|yookassa_sbp|5000')],
+            [InlineKeyboardButton(text='Old card', callback_data='topup_amount|yookassa|5000')],
+            [InlineKeyboardButton(text='Old Wata', callback_data='topup_amount|wata|5000')],
+            [InlineKeyboardButton(text='Crypto', callback_data='topup_amount|cryptobot|5000')],
+            [InlineKeyboardButton(text='Назад', callback_data='tariff_select:7')],
+        ]
+    )
+
+
+async def test_purchase_matches_cabinet_names_order_options_and_urls(setup, monkeypatch):
+    from app.cabinet.routes import balance
+
+    monkeypatch.setattr(settings, 'AUTO_PURCHASE_AFTER_TOPUP_ENABLED', True)
+    card, wata = setup.providers
+    wata.name = 'СБП'
+    card.options = [{'id': 'card', 'name': '💳 Карта'}]
+    # Same configuration as the cabinet: WATA first, YooKassa card second,
+    # CryptoBot and YooKassa SBP omitted even though enabled in the bot ENV.
+    setup.providers[:] = [wata, card]
+    original = _old_purchase_keyboard()
+    db = AsyncMock()
+    keyboard = await m.cabinet_checkout_keyboard(original, setup.user, setup.cart, db)
+    buttons = [row[0] for row in keyboard.inline_keyboard]
+    assert [button.text for button in buttons] == ['СБП', 'Карта', 'Назад']
+    assert [button.icon_custom_emoji_id for button in buttons[:2]] == ['5192678313415434135', '5192803468762441581']
+    assert all(button.style == 'primary' and button.callback_data is None for button in buttons[:2])
+    intents = [json.loads(setup.redis.data['telegram_checkout:token:' + b.url.split('#')[1]]) for b in buttons[:2]]
+    assert [(item['method'], item['amount']) for item in intents] == [('wata', 5000), ('yookassa', 5000)]
+    assert buttons[-1].callback_data == 'tariff_select:7'
+    assert original == _old_purchase_keyboard()
+    balance.get_payment_methods.assert_awaited_once_with(user=setup.user, db=db)
+    setup.create.assert_not_awaited()
+
+
+async def test_new_render_reads_updated_names_and_only_enabled_sbp_option(setup, monkeypatch):
+    monkeypatch.setattr(settings, 'AUTO_PURCHASE_AFTER_TOPUP_ENABLED', True)
+    setup.providers[0].options = [{'id': 'sbp', 'name': '🏦 СБП'}]
+    setup.providers[1].name = 'Банковская карта'
+    keyboard = await m.cabinet_checkout_keyboard(_old_purchase_keyboard(), setup.user, setup.cart, AsyncMock())
+    assert [row[0].text for row in keyboard.inline_keyboard] == ['СБП', 'Банковская карта', 'Назад']
+    intent = json.loads(setup.redis.data['telegram_checkout:token:' + keyboard.inline_keyboard[0][0].url.split('#')[1]])
+    assert intent['method'] == 'yookassa_sbp'
+    setup.providers[1].name = 'Новое название'
+    keyboard = await m.cabinet_checkout_keyboard(_old_purchase_keyboard(), setup.user, setup.cart, AsyncMock())
+    assert keyboard.inline_keyboard[1][0].text == 'Новое название'
+
+
+@pytest.mark.parametrize('reason', ['disabled', 'limit', 'empty'])
+async def test_no_env_fallback_when_cabinet_has_no_payable_method(setup, monkeypatch, reason):
+    monkeypatch.setattr(settings, 'AUTO_PURCHASE_AFTER_TOPUP_ENABLED', True)
+    if reason == 'empty':
+        setup.providers.clear()
+    for method in setup.providers:
+        if reason == 'disabled':
+            method.is_available = False
+        else:
+            method.min_amount_kopeks = 5001
+    keyboard = await m.cabinet_checkout_keyboard(_old_purchase_keyboard(), setup.user, setup.cart, AsyncMock())
+    assert [row[0].callback_data for row in keyboard.inline_keyboard] == [
+        'payment_methods_unavailable',
+        'tariff_select:7',
+    ]
+    assert not setup.redis.data
+    setup.create.assert_not_awaited()
+
+
+async def test_method_lookup_failure_does_not_create_links_or_payment(setup, monkeypatch):
+    monkeypatch.setattr(settings, 'AUTO_PURCHASE_AFTER_TOPUP_ENABLED', True)
+    monkeypatch.setattr(m, '_cabinet_methods', AsyncMock(side_effect=RuntimeError('offline')))
+    with pytest.raises(RuntimeError):
+        await m.cabinet_checkout_keyboard(_old_purchase_keyboard(), setup.user, setup.cart, AsyncMock())
+    assert not setup.redis.data
+    setup.create.assert_not_awaited()
 
 
 @pytest.mark.parametrize('method', ['yookassa', 'yookassa_sbp', 'wata'])
@@ -209,7 +296,7 @@ async def test_fail_closed_before_provider(setup, reason, monkeypatch):
     if reason == 'restricted':
         setup.user.restriction_topup = True
     if reason == 'limits':
-        monkeypatch.setattr(settings, 'YOOKASSA_MIN_AMOUNT_KOPEKS', 6000)
+        setup.providers[0].min_amount_kopeks = 6000
     if reason == 'disabled':
         monkeypatch.setattr(Settings, 'is_yookassa_enabled', lambda self: False)
     with pytest.raises(m.CheckoutError):
@@ -218,25 +305,28 @@ async def test_fail_closed_before_provider(setup, reason, monkeypatch):
 
 
 @pytest.mark.parametrize('method', ['yookassa', 'yookassa_sbp', 'wata'])
-async def test_telegram_checkout_ignores_cabinet_only_filters(setup, method):
+async def test_checkout_rechecks_cabinet_filters_before_creating_payment(setup, method):
     from app.cabinet.routes import balance
 
-    # Production cabinet configuration can hide SBP/WATA and use other limits.
-    setup.providers[0].options = [{'id': 'card'}]
-    setup.providers[0].min_amount_kopeks = 999999
-    setup.providers[1].is_available = False
     token = await m.issue_token(1, setup.cart, method, 5000)
-    assert await m.complete_checkout(token, AsyncMock()) == 'https://pay.example/test'
-    balance.get_payment_methods.assert_not_awaited()
-    setup.create.assert_awaited_once()
+    if method == 'yookassa_sbp':
+        setup.providers[0].options = [{'id': 'card', 'name': '💳 Карта'}]
+    elif method == 'yookassa':
+        setup.providers[0].min_amount_kopeks = 999999
+    else:
+        setup.providers[1].is_available = False
+    with pytest.raises(m.CheckoutError):
+        await m.complete_checkout(token, AsyncMock())
+    balance.get_payment_methods.assert_awaited_once()
+    setup.create.assert_not_awaited()
 
 
 @pytest.mark.parametrize('method', ['yookassa', 'yookassa_sbp', 'wata'])
 @pytest.mark.parametrize('amount,allowed', [(4999, False), (5000, True), (6000, True), (6001, False)])
-async def test_telegram_provider_limits_are_inclusive(setup, monkeypatch, method, amount, allowed):
-    provider = 'WATA' if method == 'wata' else 'YOOKASSA'
-    monkeypatch.setattr(settings, provider + '_MIN_AMOUNT_KOPEKS', 5000)
-    monkeypatch.setattr(settings, provider + '_MAX_AMOUNT_KOPEKS', 6000)
+async def test_cabinet_provider_limits_are_inclusive(setup, method, amount, allowed):
+    provider = setup.providers[1 if method == 'wata' else 0]
+    provider.min_amount_kopeks = 5000
+    provider.max_amount_kopeks = 6000
     setup.user.balance_kopeks = setup.cart['total_price'] - amount
     token = await m.issue_token(1, setup.cart, method, amount)
     if allowed:
@@ -418,7 +508,7 @@ async def test_purchase_wiring_prepares_only_insufficient_links(monkeypatch, res
     )
     state = SimpleNamespace(get_data=AsyncMock(return_value={}), update_data=AsyncMock(), set_state=AsyncMock())
     prepared = AsyncMock(side_effect=lambda keyboard, *args: keyboard)
-    monkeypatch.setattr(purchase, 'checkout_keyboard', prepared)
+    monkeypatch.setattr(purchase, 'cabinet_checkout_keyboard', prepared)
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
     monkeypatch.setattr(purchase, 'get_tariff_by_id', AsyncMock(return_value=tariff))
     monkeypatch.setattr(purchase, 'get_subscription_by_user_id', AsyncMock(return_value=None))

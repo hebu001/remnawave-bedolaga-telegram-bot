@@ -10,10 +10,11 @@ import json
 import secrets
 from urllib.parse import urlsplit
 
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.config import settings
 from app.database.crud.user import get_user_by_id
+from app.localization.texts import get_texts
 from app.services.maintenance_service import maintenance_service
 from app.services.payment_service import PaymentService
 from app.services.rbac_bootstrap_service import is_protected_from_blocking
@@ -132,6 +133,87 @@ async def checkout_keyboard(keyboard: InlineKeyboardMarkup, user_id: int, cart: 
     return result
 
 
+async def _cabinet_methods(db, user):
+    # Reuse the cabinet endpoint's read-only selector, including first-topup and
+    # promo-group filters, configured names, ordering, limits and sub-options.
+    from app.cabinet.routes.balance import get_payment_methods
+
+    async with asyncio.timeout(3):
+        return await get_payment_methods(user=user, db=db)
+
+
+def _cabinet_choices(methods):
+    """Match the cabinet picker; providers with their own chooser keep that flow."""
+    for method in methods:
+        if not method.is_available:
+            continue
+        options = method.options
+        if method.id == 'yookassa' and options:
+            # TopUpPanel puts SBP first within each provider.
+            for option in sorted(options, key=lambda item: item['id'] != 'sbp'):
+                if option['id'] == 'sbp':
+                    if not settings.YOOKASSA_SBP_ENABLED:
+                        continue
+                    callback_method = 'yookassa_sbp'
+                elif option['id'] == 'card':
+                    callback_method = 'yookassa'
+                else:
+                    continue
+                yield method, callback_method, option['name']
+        else:
+            callback_method = 'stars' if method.id == 'telegram_stars' else method.id
+            yield method, callback_method, method.name
+
+
+async def cabinet_checkout_keyboard(keyboard: InlineKeyboardMarkup, user, cart: dict, db) -> InlineKeyboardMarkup:
+    """Use the cabinet's payment list for the new and restored purchase screen."""
+    amount = max(0, cart['total_price'] - (user.balance_kopeks or 0))
+    if not settings.is_auto_purchase_after_topup_enabled() or amount <= 0:
+        return keyboard
+
+    from app.utils.miniapp_buttons import strip_leading_emoji
+
+    texts = get_texts(user.language)
+    methods = await _cabinet_methods(db, user)
+    rows = []
+    icons = ('5192678313415434135', '5192803468762441581')
+    for method, callback_method, name in _cabinet_choices(methods):
+        if not method.min_amount_kopeks <= amount <= method.max_amount_kopeks:
+            continue
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=strip_leading_emoji(name),
+                    callback_data=f'topup_amount|{callback_method}|{amount}',
+                    style='primary',
+                    icon_custom_emoji_id=icons[len(rows)] if len(rows) < len(icons) else None,
+                )
+            ]
+        )
+    if not rows:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=texts.t('PAYMENTS_TEMPORARILY_UNAVAILABLE', '⚠️ Способы оплаты временно недоступны'),
+                    callback_data='payment_methods_unavailable',
+                )
+            ]
+        )
+    # Preserve Back and separate recurring-subscription actions. Never reinsert
+    # providers from the older ENV-only keyboard when the cabinet list is empty.
+    rows.extend(
+        [button.model_copy(deep=True) for button in row]
+        for row in keyboard.inline_keyboard
+        if row
+        and all(
+            not (button.callback_data or '').startswith('topup_')
+            and button.callback_data not in ('balance_topup', 'payment_methods_unavailable')
+            for button in row
+        )
+    )
+    return await checkout_keyboard(InlineKeyboardMarkup(inline_keyboard=rows), user.id, cart)
+
+
 async def complete_checkout(token: str, db) -> str:
     client = user_cart_service._get_redis_client()
     if client is None:
@@ -172,17 +254,17 @@ async def complete_checkout(token: str, db) -> str:
     method = intent['method']
     if method not in SUPPORTED_METHODS:
         raise CheckoutError('Способ оплаты недоступен.')
-    # Telegram payment availability follows the existing bot handlers, not the
-    # cabinet-only PaymentMethodConfig filters and sub-options.
+    # Recheck the same cabinet policy on click: a disabled method or option must
+    # not remain usable through a previously rendered purchase link.
+    methods = await _cabinet_methods(db, user)
+    configured = next((item for item, code, _ in _cabinet_choices(methods) if code == method), None)
+    if not configured or not configured.min_amount_kopeks <= amount <= configured.max_amount_kopeks:
+        raise CheckoutError('Способ или сумма оплаты недоступны. Вернитесь в бот.')
     if method == 'wata':
         enabled = settings.is_wata_enabled()
-        minimum = settings.WATA_MIN_AMOUNT_KOPEKS
-        maximum = settings.WATA_MAX_AMOUNT_KOPEKS
     else:
         enabled = settings.is_yookassa_enabled() and (method != 'yookassa_sbp' or settings.YOOKASSA_SBP_ENABLED)
-        minimum = settings.YOOKASSA_MIN_AMOUNT_KOPEKS
-        maximum = settings.YOOKASSA_MAX_AMOUNT_KOPEKS
-    if not enabled or not minimum <= amount <= maximum:
+    if not enabled:
         raise CheckoutError('Способ или сумма оплаты недоступны. Вернитесь в бот.')
     if intent['status'] == 'complete':
         return intent['url']

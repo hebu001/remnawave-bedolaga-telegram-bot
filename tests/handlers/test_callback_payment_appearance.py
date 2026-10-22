@@ -6,8 +6,29 @@ import pytest
 from app.config import Settings, settings
 from app.handlers.subscription import tariff_purchase as m
 from app.keyboards.inline import get_payment_methods_keyboard
+from app.services import telegram_checkout
 from app.services.pricing_engine import pricing_engine
 from app.utils.rich_buttons import render_keyboard_as_rich_html
+
+
+@pytest.fixture(autouse=True)
+def configured_payment_methods(monkeypatch):
+    monkeypatch.setattr(
+        telegram_checkout,
+        '_cabinet_methods',
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id='telegram_stars',
+                    name='Telegram Stars',
+                    is_available=True,
+                    min_amount_kopeks=100,
+                    max_amount_kopeks=1000000,
+                    options=None,
+                )
+            ]
+        ),
+    )
 
 
 def _price():
