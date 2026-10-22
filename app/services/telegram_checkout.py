@@ -1,4 +1,4 @@
-"""Lazy Telegram purchase checkout. Redis loss expires links; it is not a payment ledger.
+"""Telegram purchase checkout with cached provider URLs; Redis is not a payment ledger.
 
 A claimed attempt is never retried automatically. A new explicit checkout after
 Redis eviction/expiry may create a new invoice, just as a new bot payment request.
@@ -114,8 +114,13 @@ async def issue_token(user_id: int, cart: dict, method: str, amount: int) -> str
     return _text(result)
 
 
-async def checkout_keyboard(keyboard: InlineKeyboardMarkup, user_id: int, cart: dict) -> InlineKeyboardMarkup:
-    """Create only credentials. Provider APIs are called only after a URL click."""
+async def checkout_keyboard(keyboard: InlineKeyboardMarkup, user_id: int, cart: dict, db) -> InlineKeyboardMarkup:
+    """Prepare provider URLs before rendering; never expose a backend redirect URL.
+
+    Each displayed supported method gets a pending invoice. Re-rendering the same
+    cart reuses its cached URL; an ambiguous creation is never retried automatically.
+    Keep creation sequential because callers share a single SQLAlchemy session.
+    """
     result = keyboard.model_copy(deep=True)
     for row in result.inline_keyboard:
         for button in row:
@@ -123,9 +128,8 @@ async def checkout_keyboard(keyboard: InlineKeyboardMarkup, user_id: int, cart: 
             if len(parts) != 3 or parts[0] != 'topup_amount' or parts[1] not in SUPPORTED_METHODS:
                 continue
             try:
-                origin = checkout_origin()
                 token = await issue_token(user_id, cart, parts[1], int(parts[2]))
-                button.url = f'{origin}/cabinet/telegram-checkout#{token}'
+                button.url = await complete_checkout(token, db)
                 button.callback_data = None
             except Exception:
                 button.text = 'Повторить получение ссылки'
@@ -211,7 +215,7 @@ async def cabinet_checkout_keyboard(keyboard: InlineKeyboardMarkup, user, cart: 
             for button in row
         )
     )
-    return await checkout_keyboard(InlineKeyboardMarkup(inline_keyboard=rows), user.id, cart)
+    return await checkout_keyboard(InlineKeyboardMarkup(inline_keyboard=rows), user.id, cart, db)
 
 
 async def complete_checkout(token: str, db) -> str:

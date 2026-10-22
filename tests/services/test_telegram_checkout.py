@@ -118,7 +118,7 @@ def setup(monkeypatch):
     return SimpleNamespace(redis=redis, cart=cart, user=user, create=create, service=service, providers=providers)
 
 
-async def test_keyboard_only_issues_tokens_and_reuses_context(setup):
+async def test_keyboard_prepares_provider_urls_and_reuses_context(setup):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -133,15 +133,64 @@ async def test_keyboard_only_issues_tokens_and_reuses_context(setup):
             [InlineKeyboardButton(text='Stars', callback_data='topup_amount|stars|5000')],
         ]
     )
-    first = await m.checkout_keyboard(keyboard, 1, setup.cart)
-    second = await m.checkout_keyboard(keyboard, 1, setup.cart)
-    setup.create.assert_not_awaited()
+    first = await m.checkout_keyboard(keyboard, 1, setup.cart, AsyncMock())
+    assert setup.create.await_count == 2
+    second = await m.checkout_keyboard(keyboard, 1, setup.cart, AsyncMock())
+    assert setup.create.await_count == 2
     assert first == second
     button = first.inline_keyboard[0][0]
-    assert button.url.startswith('https://checkout.example/cabinet/telegram-checkout#')
+    assert button.url == 'https://pay.example/test'
     assert button.callback_data is None and button.style == 'primary' and button.icon_custom_emoji_id == '123'
     assert keyboard.inline_keyboard[0][0].callback_data is not None
     assert first.inline_keyboard[2][0].callback_data == 'topup_amount|stars|5000'
+
+
+async def test_direct_keyboard_does_not_need_or_expose_backend_origin(setup, monkeypatch):
+    monkeypatch.setattr(settings, 'WEBHOOK_URL', '')
+    setup.service.create_yookassa_sbp_payment = AsyncMock(
+        return_value={'confirmation_url': 'https://yoomoney.ru/checkout/payments/v2/contract/sbp?orderId=synthetic'}
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text='СБП', callback_data='topup_amount|yookassa_sbp|5000')]]
+    )
+    result = await m.checkout_keyboard(keyboard, 1, setup.cart, AsyncMock())
+    button = result.inline_keyboard[0][0]
+    assert button.url == 'https://yoomoney.ru/checkout/payments/v2/contract/sbp?orderId=synthetic'
+    assert button.callback_data is None
+    assert '/cabinet/telegram-checkout' not in result.model_dump_json()
+
+
+async def test_failed_provider_has_no_redirect_and_successful_method_stays_usable(setup):
+    failed = AsyncMock(side_effect=TimeoutError('synthetic ambiguous response'))
+    successful = AsyncMock(return_value={'payment_url': 'https://pay.example/wata'})
+    setup.service.create_yookassa_payment = failed
+    setup.service.create_wata_payment = successful
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text='Карта', callback_data='topup_amount|yookassa|5000')],
+            [InlineKeyboardButton(text='СБП', callback_data='topup_amount|wata|5000')],
+        ]
+    )
+    for _ in range(2):
+        result = await m.checkout_keyboard(keyboard, 1, setup.cart, AsyncMock())
+        assert result.inline_keyboard[0][0].url is None
+        assert result.inline_keyboard[0][0].callback_data == 'return_to_saved_cart'
+        assert result.inline_keyboard[1][0].url == 'https://pay.example/wata'
+        assert '/cabinet/telegram-checkout' not in result.model_dump_json()
+    failed.assert_awaited_once()
+    successful.assert_awaited_once()
+
+
+async def test_direct_keyboard_uses_new_amount_when_balance_changes(setup):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text='Карта', callback_data='topup_amount|yookassa|5000')]]
+    )
+    await m.checkout_keyboard(keyboard, 1, setup.cart, AsyncMock())
+    setup.user.balance_kopeks = 6501
+    # Existing cart is re-rendered with the recalculated shortfall.
+    keyboard.inline_keyboard[0][0].callback_data = 'topup_amount|yookassa|8499'
+    await m.checkout_keyboard(keyboard, 1, setup.cart, AsyncMock())
+    assert [call.kwargs['amount_kopeks'] for call in setup.create.await_args_list] == [5000, 8499]
 
 
 def _old_purchase_keyboard():
@@ -173,12 +222,17 @@ async def test_purchase_matches_cabinet_names_order_options_and_urls(setup, monk
     assert [button.text for button in buttons] == ['СБП', 'Карта', 'Назад']
     assert [button.icon_custom_emoji_id for button in buttons[:2]] == ['5192678313415434135', '5192803468762441581']
     assert all(button.style == 'primary' and button.callback_data is None for button in buttons[:2])
-    intents = [json.loads(setup.redis.data['telegram_checkout:token:' + b.url.split('#')[1]]) for b in buttons[:2]]
+    assert [button.url for button in buttons[:2]] == ['https://pay.example/test'] * 2
+    assert 'checkout.example' not in keyboard.model_dump_json()
+    intents = [
+        json.loads(value) for key, value in setup.redis.data.items() if key.startswith('telegram_checkout:token:')
+    ]
     assert [(item['method'], item['amount']) for item in intents] == [('wata', 5000), ('yookassa', 5000)]
     assert buttons[-1].callback_data == 'tariff_select:7'
     assert original == _old_purchase_keyboard()
-    balance.get_payment_methods.assert_awaited_once_with(user=setup.user, db=db)
-    setup.create.assert_not_awaited()
+    assert balance.get_payment_methods.await_count == 3  # render, WATA, YooKassa
+    balance.get_payment_methods.assert_awaited_with(user=setup.user, db=db)
+    assert setup.create.await_count == 2
 
 
 async def test_new_render_reads_updated_names_and_only_enabled_sbp_option(setup, monkeypatch):
@@ -187,7 +241,9 @@ async def test_new_render_reads_updated_names_and_only_enabled_sbp_option(setup,
     setup.providers[1].name = 'Банковская карта'
     keyboard = await m.cabinet_checkout_keyboard(_old_purchase_keyboard(), setup.user, setup.cart, AsyncMock())
     assert [row[0].text for row in keyboard.inline_keyboard] == ['СБП', 'Банковская карта', 'Назад']
-    intent = json.loads(setup.redis.data['telegram_checkout:token:' + keyboard.inline_keyboard[0][0].url.split('#')[1]])
+    intent = next(
+        json.loads(value) for key, value in setup.redis.data.items() if key.startswith('telegram_checkout:token:')
+    )
     assert intent['method'] == 'yookassa_sbp'
     setup.providers[1].name = 'Новое название'
     keyboard = await m.cabinet_checkout_keyboard(_old_purchase_keyboard(), setup.user, setup.cart, AsyncMock())
@@ -507,7 +563,12 @@ async def test_purchase_wiring_prepares_only_insufficient_links(monkeypatch, res
         data='tariff_period:7:30', message=SimpleNamespace(edit_text=AsyncMock()), answer=AsyncMock()
     )
     state = SimpleNamespace(get_data=AsyncMock(return_value={}), update_data=AsyncMock(), set_state=AsyncMock())
-    prepared = AsyncMock(side_effect=lambda keyboard, *args: keyboard)
+
+    def prepare_after_ack(keyboard, *args):
+        callback.answer.assert_awaited_once()
+        return keyboard
+
+    prepared = AsyncMock(side_effect=prepare_after_ack)
     monkeypatch.setattr(purchase, 'cabinet_checkout_keyboard', prepared)
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: False)
     monkeypatch.setattr(purchase, 'get_tariff_by_id', AsyncMock(return_value=tariff))

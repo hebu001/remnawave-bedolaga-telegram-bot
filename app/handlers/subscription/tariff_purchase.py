@@ -1961,6 +1961,9 @@ async def select_tariff_period(
         }
         await user_cart_service.save_user_cart(db_user.id, cart_data)
 
+        # Provider URLs are prepared before rendering; acknowledge the click
+        # before those potentially slow requests, not after Telegram's deadline.
+        await callback.answer()
         await callback.message.edit_text(
             _purchase_payment_summary(
                 texts,
@@ -2021,7 +2024,8 @@ async def select_tariff_period(
         tariff_discount_percent=discount_percent,
         target_subscription_id=target_subscription_id,
     )
-    await callback.answer()
+    if user_balance >= final_price:
+        await callback.answer()
 
 
 @error_handler
@@ -5690,6 +5694,7 @@ async def return_to_saved_tariff_cart(
     # Проверяем баланс (при 100% скидке — пропускаем)
     if total_price > 0 and user_balance < total_price:
         missing = total_price - user_balance
+        await callback.answer()
 
         if cart_mode == 'daily_tariff_purchase':
             await callback.message.edit_text(
@@ -5789,7 +5794,6 @@ async def return_to_saved_tariff_cart(
                 ),
                 parse_mode='HTML',
             )
-        await callback.answer()
         return
 
     # Баланс достаточен - показываем подтверждение
