@@ -445,6 +445,17 @@ async def _persist_pending_subid_after_registration(
         )
 
 
+async def _is_existing_referral_code(db: AsyncSession, code: str | None) -> bool:
+    """Unknown start payloads are not referral links."""
+    if not code:
+        return False
+    try:
+        return await get_user_by_referral_code(db, code) is not None
+    except Exception:
+        logger.warning('Unable to verify referral link for notification')
+        return False
+
+
 async def _activate_pending_gift_after_registration(
     db: AsyncSession,
     state: FSMContext,
@@ -470,6 +481,7 @@ async def _activate_pending_gift_after_registration(
                 claimant_user_id=user.id,
                 claim_input=gift_token,
                 allow_legacy_short=False,
+                report_already_activated=True,
             )
         except GiftClaimSelfActivationError:
             await answer_func(
@@ -1637,7 +1649,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         if await _open_pending_partner_menu(message, state, user, db):
             return
 
-        if referral_code and not user.referred_by_id:
+        if not user.referred_by_id and await _is_existing_referral_code(db, referral_code):
             await message.answer(
                 texts.t(
                     'ALREADY_REGISTERED_REFERRAL',
@@ -2337,7 +2349,7 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
         texts = get_texts(existing_user.language)
 
         data = await state.get_data() or {}
-        if data.get('referral_code') and not existing_user.referred_by_id:
+        if not existing_user.referred_by_id and await _is_existing_referral_code(db, data.get('referral_code')):
             await callback.message.answer(
                 texts.t(
                     'ALREADY_REGISTERED_REFERRAL',
@@ -2694,7 +2706,7 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
         texts = get_texts(existing_user.language)
 
         data = await state.get_data() or {}
-        if data.get('referral_code') and not existing_user.referred_by_id:
+        if not existing_user.referred_by_id and await _is_existing_referral_code(db, data.get('referral_code')):
             await message.answer(
                 texts.t(
                     'ALREADY_REGISTERED_REFERRAL',

@@ -163,6 +163,10 @@ class GiftClaimAlreadyOwnedError(GiftClaimError, ValueError):
     """Raised when a gift is already claimed by or bound to another user."""
 
 
+class GiftClaimAlreadyActivatedError(GiftClaimAlreadyOwnedError):
+    """Raised when a caller requests explicit feedback for an already delivered gift."""
+
+
 class GiftClaimNotActivatableError(GiftClaimError, ValueError):
     """Raised when a gift is in an unclaimable status (e.g. FAILED, PENDING, REFUNDED)."""
 
@@ -173,6 +177,7 @@ async def claim_gift_for_user(
     claim_input: str,
     *,
     allow_legacy_short: bool = False,
+    report_already_activated: bool = False,
 ) -> GuestPurchase:
     """Claim and activate a gift subscription for an authenticated user.
 
@@ -210,6 +215,8 @@ async def claim_gift_for_user(
 
     # Idempotent return if already delivered to the same user
     if purchase.status == GuestPurchaseStatus.DELIVERED.value:
+        if report_already_activated:
+            raise GiftClaimAlreadyActivatedError('Gift already activated')
         return purchase
 
     # Validate activatable status
@@ -248,6 +255,8 @@ async def claim_bound_gift_for_user(
     db: AsyncSession,
     claimant_user_id: int,
     purchase_id: int,
+    *,
+    report_already_activated: bool = False,
 ) -> GuestPurchase:
     """Activate an already bound gift subscription by purchase ID (directed callback).
 
@@ -294,6 +303,8 @@ async def claim_bound_gift_for_user(
 
     # Idempotent return if already delivered to the same user
     if purchase.status == GuestPurchaseStatus.DELIVERED.value:
+        if report_already_activated:
+            raise GiftClaimAlreadyActivatedError('Gift already activated')
         return purchase
 
     # Validate activatable status

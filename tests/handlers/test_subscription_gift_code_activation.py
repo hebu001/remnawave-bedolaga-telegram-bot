@@ -628,8 +628,8 @@ class TestGiftCodeInputAndResultMapping:
             assert token not in ans_text
 
     @pytest.mark.asyncio
-    async def test_already_activated_by_same_user_idempotent_success(self, monkeypatch):
-        """Re-entering the code of an already delivered gift owned by claimant returns success idempotently."""
+    async def test_already_activated_by_same_user_reports_repeat(self, monkeypatch):
+        """Re-entering the code of an already delivered gift owned by claimant reports that it was already activated."""
         async with memory_session(monkeypatch, _TABLES) as db:
             tariff = await _seed_test_tariffs_and_settings(db)
 
@@ -662,7 +662,8 @@ class TestGiftCodeInputAndResultMapping:
             assert await state.get_state() is None
             msg.answer.assert_awaited_once()
             ans_text = msg.answer.call_args[0][0]
-            assert 'Подарок активирован' in ans_text
+            assert 'уже был активирован' in ans_text
+            assert 'Ваша подписка обновлена' not in ans_text
             assert token not in ans_text
 
     @pytest.mark.asyncio

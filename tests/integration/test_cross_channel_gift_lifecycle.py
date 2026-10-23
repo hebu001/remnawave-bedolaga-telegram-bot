@@ -288,7 +288,7 @@ async def test_lifecycle_bot_purchase_to_bot_activation(monkeypatch):
 
         c1_repeat_msg.answer.assert_awaited_once()
         repeat_text = c1_repeat_msg.answer.call_args[0][0]
-        assert 'Подарок активирован' in repeat_text
+        assert 'уже был активирован' in repeat_text
 
 
 @pytest.mark.asyncio

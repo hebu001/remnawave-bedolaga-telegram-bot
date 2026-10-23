@@ -47,6 +47,7 @@ from app.database.models import (
     tariff_promo_groups,
 )
 from app.services.gift_claim_service import (
+    GiftClaimAlreadyActivatedError,
     GiftClaimAlreadyOwnedError,
     GiftClaimNotActivatableError,
     GiftClaimNotFoundError,
@@ -361,6 +362,15 @@ async def test_idempotent_repeated_claim_by_same_user(monkeypatch):
             res2 = await claim_gift_for_user(db, claimant_user_id=claimant1.id, claim_input=token)
             assert res2.status == GuestPurchaseStatus.DELIVERED.value
             assert res2.id == purchase.id
+
+            with pytest.raises(GiftClaimAlreadyActivatedError):
+                await claim_gift_for_user(
+                    db, claimant_user_id=claimant1.id, claim_input=token, report_already_activated=True
+                )
+            with pytest.raises(GiftClaimAlreadyActivatedError):
+                await claim_bound_gift_for_user(
+                    db, claimant_user_id=claimant1.id, purchase_id=purchase.id, report_already_activated=True
+                )
 
             # Provisioning was NOT called again
             mock_prov.assert_not_called()

@@ -10,6 +10,7 @@ from app.database.crud.user import get_user_by_telegram_id
 from app.database.database import AsyncSessionLocal
 from app.localization.texts import get_texts
 from app.services.gift_claim_service import (
+    GiftClaimAlreadyActivatedError,
     GiftClaimAlreadyOwnedError,
     GiftClaimNotActivatableError,
     GiftClaimNotFoundError,
@@ -60,7 +61,14 @@ async def handle_gift_activate(callback: types.CallbackQuery) -> None:
                 db,
                 claimant_user_id=user.id,
                 purchase_id=purchase_id,
+                report_already_activated=True,
             )
+        except GiftClaimAlreadyActivatedError:
+            await callback.message.edit_text(
+                texts.t('GIFT_ACTIVATION_ALREADY_OWNED_ERROR', 'ℹ️ Этот подарок уже был активирован.'),
+                parse_mode=None,
+            )
+            return
         except GiftClaimNotFoundError, GiftClaimAlreadyOwnedError:
             await callback.message.edit_text(
                 texts.t('GIFT_ACTIVATION_NOT_FOUND', _GIFT_NOT_FOUND),

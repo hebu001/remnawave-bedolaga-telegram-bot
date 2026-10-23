@@ -178,6 +178,7 @@ async def test_pending_gift_drain_delegates_to_the_shared_claim_service(monkeypa
         claimant_user_id=user.id,
         claim_input='T' * 48,
         allow_legacy_short=False,
+        report_already_activated=True,
     )
     assert 'активирован' in answer.await_args.args[0]
 

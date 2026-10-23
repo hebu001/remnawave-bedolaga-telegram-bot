@@ -23,6 +23,7 @@ from app.handlers.subscription.purchase import show_subscription_info
 from app.keyboards.inline import get_insufficient_balance_keyboard
 from app.localization.texts import get_texts
 from app.services.gift_claim_service import (
+    GiftClaimAlreadyActivatedError,
     GiftClaimAlreadyOwnedError,
     GiftClaimNotActivatableError,
     GiftClaimNotFoundError,
@@ -1155,6 +1156,7 @@ async def handle_gift_code_input(
             claimant_user_id=db_user.id,
             claim_input=raw_input,
             allow_legacy_short=False,
+            report_already_activated=True,
         )
     except GiftClaimNotFoundError:
         await message.answer(
@@ -1176,7 +1178,9 @@ async def handle_gift_code_input(
             parse_mode='HTML',
         )
         return
-    except GiftClaimAlreadyOwnedError:
+    except GiftClaimAlreadyOwnedError as exc:
+        if isinstance(exc, GiftClaimAlreadyActivatedError):
+            await state.clear()
         await message.answer(
             texts.t(
                 'GIFT_ACTIVATION_ALREADY_OWNED_ERROR',
