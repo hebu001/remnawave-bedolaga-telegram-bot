@@ -11,6 +11,7 @@ from .media import TELEGRAM_FILE_ID_PATTERN
 # ============ Channel Types ============
 
 BroadcastChannel = Literal['telegram', 'email', 'both']
+BroadcastMessageType = Literal['message', 'main_menu']
 
 
 # ============ Filters ============
@@ -138,15 +139,37 @@ class BroadcastMediaRequest(BaseModel):
 # ============ Create ============
 
 
+def _validate_main_menu_content(
+    request: BroadcastCreateRequest | CombinedBroadcastCreateRequest, *, channel: str = 'telegram'
+) -> None:
+    if channel != 'telegram':
+        raise ValueError('Main menu refresh is only available for Telegram')
+    if request.message_text and request.message_text.strip():
+        raise ValueError('Main menu refresh cannot include custom text')
+    if request.media is not None or request.selected_buttons or request.custom_buttons:
+        raise ValueError('Main menu refresh cannot include media or custom buttons')
+
+
 class BroadcastCreateRequest(BaseModel):
     """Request to create a broadcast."""
 
     target: str
-    message_text: str = Field(..., min_length=1, max_length=4000)
-    selected_buttons: list[str] = Field(default_factory=lambda: ['home'])
+    message_type: BroadcastMessageType = 'message'
+    message_text: str = Field(default='', max_length=4000)
+    selected_buttons: list[str] = Field(
+        default_factory=lambda data: [] if data.get('message_type') == 'main_menu' else ['home']
+    )
     custom_buttons: list[CustomBroadcastButton] = Field(default_factory=list, max_length=10)
     media: BroadcastMediaRequest | None = None
     category: str = Field(default='system', pattern='^(system|news|promo)$')
+
+    @model_validator(mode='after')
+    def validate_message_content(self) -> BroadcastCreateRequest:
+        if self.message_type == 'main_menu':
+            _validate_main_menu_content(self)
+        elif not self.message_text:
+            raise ValueError('Message text must not be empty')
+        return self
 
 
 # ============ Response ============
@@ -274,8 +297,11 @@ class CombinedBroadcastCreateRequest(BaseModel):
     audience: BroadcastAudience | None = None
 
     # Telegram-specific fields
+    message_type: BroadcastMessageType = 'message'
     message_text: str | None = Field(default=None, max_length=4000)
-    selected_buttons: list[str] = Field(default_factory=lambda: ['home'])
+    selected_buttons: list[str] = Field(
+        default_factory=lambda data: [] if data.get('message_type') == 'main_menu' else ['home']
+    )
     custom_buttons: list[CustomBroadcastButton] = Field(default_factory=list, max_length=10)
     media: BroadcastMediaRequest | None = None
 
@@ -285,6 +311,12 @@ class CombinedBroadcastCreateRequest(BaseModel):
     # Email-specific fields
     email_subject: str | None = Field(default=None, max_length=255)
     email_html_content: str | None = Field(default=None, max_length=100000)
+
+    @model_validator(mode='after')
+    def validate_message_content(self) -> CombinedBroadcastCreateRequest:
+        if self.message_type == 'main_menu':
+            _validate_main_menu_content(self, channel=self.channel)
+        return self
 
 
 # ============ Email Preview ============

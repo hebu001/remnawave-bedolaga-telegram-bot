@@ -5,7 +5,7 @@ import functools
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import structlog
 from aiogram import Bot
@@ -115,6 +115,19 @@ class BroadcastConfig:
     # Персональная клавиатура на получателя (у промопредложений в callback_data зашит
     # id его оффера). Если задана — вытесняет selected_buttons/custom_buttons.
     keyboard_factory: Callable[[int], InlineKeyboardMarkup | None] | None = None
+    message_type: Literal['message', 'main_menu'] = 'message'
+
+    def __post_init__(self) -> None:
+        if self.message_type not in ('message', 'main_menu'):
+            raise ValueError('Unknown broadcast message type')
+        if self.message_type == 'main_menu' and (
+            self.message_text.strip()
+            or self.media
+            or self.selected_buttons
+            or self.custom_buttons
+            or self.keyboard_factory
+        ):
+            raise ValueError('Main menu broadcasts cannot contain text, media or custom buttons')
 
 
 @dataclass
@@ -175,6 +188,9 @@ class BroadcastService:
         self._bot: Bot | None = None
         self._tasks: dict[int, _BroadcastTask] = {}
         self._lock = asyncio.Lock()
+        # Menu rendering reads each recipient's current data. Bound concurrent
+        # work across broadcasts so large audiences do not exhaust the DB pool.
+        self._menu_slots = asyncio.Semaphore(5)
 
     def set_bot(self, bot: Bot) -> None:
         self._bot = bot
@@ -371,7 +387,7 @@ class BroadcastService:
         # Отказы Telegram (BadRequest) по тексту причины — для лога и сводки.
         bad_request_causes: dict[str, int] = {}
 
-        async def send_single(telegram_id: int) -> str:
+        async def send_attempts(telegram_id: int) -> str:
             """Returns 'sent', 'blocked', or 'failed'."""
             nonlocal flood_wait_until
 
@@ -382,7 +398,7 @@ class BroadcastService:
                     await asyncio.sleep(flood_wait_until - now)
 
                 if cancel_event.is_set():
-                    return 'failed'
+                    return 'cancelled' if config.message_type == 'main_menu' else 'failed'
 
                 try:
                     await self._deliver_message(
@@ -425,6 +441,16 @@ class BroadcastService:
                     return 'failed'
 
                 except (TelegramNetworkError, TelegramServerError) as exc:
+                    if config.message_type == 'main_menu':
+                        # Delivery may already have happened. Do not duplicate it
+                        # or log a response containing a personal subscription URL.
+                        logger.warning(
+                            'Menu broadcast delivery uncertain',
+                            broadcast_id=broadcast_id,
+                            telegram_id=telegram_id,
+                            error_type=type(exc).__name__,
+                        )
+                        return 'failed'
                     # Транзиентные сетевые/5xx — warning, не error (иначе спам в админ-чат
                     # через TelegramNotifierProcessor при каждом ConnectionReset).
                     logger.warning(
@@ -440,6 +466,14 @@ class BroadcastService:
                         await asyncio.sleep(0.5 * (attempt + 1))
 
                 except Exception as exc:
+                    if config.message_type == 'main_menu':
+                        logger.warning(
+                            'Menu broadcast recipient failed',
+                            broadcast_id=broadcast_id,
+                            telegram_id=telegram_id,
+                            error_type=type(exc).__name__,
+                        )
+                        return 'failed'
                     logger.error(
                         'Ошибка отправки рассылки пользователю (попытка /)',
                         broadcast_id=broadcast_id,
@@ -452,6 +486,13 @@ class BroadcastService:
                         await asyncio.sleep(0.5 * (attempt + 1))
 
             return 'failed'
+
+        async def send_single(telegram_id: int) -> str:
+            if config.message_type == 'main_menu':
+                async with self._menu_slots:
+                    # Check stop and FloodWait after waiting for a rendering slot.
+                    return await send_attempts(telegram_id)
+            return await send_attempts(telegram_id)
 
         for i in range(0, len(recipient_ids), _TG_BATCH_SIZE):
             if cancel_event.is_set():
@@ -472,11 +513,15 @@ class BroadcastService:
                     elif result == 'blocked':
                         blocked_count += 1
                         blocked_telegram_ids.append(batch[idx])
-                    else:
+                    elif result != 'cancelled':
                         failed_count += 1
                 elif isinstance(result, Exception):
                     failed_count += 1
                     logger.error('Необработанное исключение в рассылке', broadcast_id=broadcast_id, result=result)
+
+            if config.message_type == 'main_menu' and cancel_event.is_set():
+                await self._mark_cancelled(broadcast_id, sent_count, failed_count, blocked_count)
+                return sent_count, failed_count, blocked_count, True
 
             # Обновляем прогресс в БД периодически
             processed = sent_count + failed_count + blocked_count
@@ -518,6 +563,12 @@ class BroadcastService:
         """
         if not self._bot:
             raise RuntimeError('Телеграм-бот не инициализирован')
+
+        if config.message_type == 'main_menu':
+            from app.services.main_menu_broadcast_service import send_current_main_menu
+
+            await send_current_main_menu(self._bot, telegram_id)
+            return
 
         if config.media and config.media.type in VALID_MEDIA_TYPES:
             caption = config.media.caption or config.message_text

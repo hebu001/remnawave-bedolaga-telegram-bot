@@ -56,6 +56,7 @@ from ..schemas.broadcasts import (
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix='/admin/broadcasts', tags=['Cabinet Admin Broadcasts'])
+MAIN_MENU_BROADCAST_LABEL = 'Обновить главное меню'
 
 
 # ============ Filter Labels ============
@@ -568,7 +569,7 @@ async def create_broadcast(
         )
 
     message_text = request.message_text.strip()
-    if not message_text:
+    if request.message_type == 'message' and not message_text:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Message text must not be empty',
@@ -582,7 +583,7 @@ async def create_broadcast(
     # Create broadcast record
     broadcast = BroadcastHistory(
         target_type=request.target,
-        message_text=message_text,
+        message_text=MAIN_MENU_BROADCAST_LABEL if request.message_type == 'main_menu' else message_text,
         has_media=media_payload is not None,
         media_type=media_payload.type if media_payload else None,
         media_file_id=media_payload.file_id if media_payload else None,
@@ -611,6 +612,7 @@ async def create_broadcast(
     # Create broadcast config
     config = BroadcastConfig(
         target=request.target,
+        message_type=request.message_type,
         message_text=message_text,
         selected_buttons=request.selected_buttons,
         media=media_config,
@@ -805,7 +807,7 @@ async def create_combined_broadcast(
             )
 
         # Validate telegram message
-        if not request.message_text or not request.message_text.strip():
+        if request.message_type == 'message' and (not request.message_text or not request.message_text.strip()):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='Message text is required for Telegram broadcast',
@@ -851,7 +853,13 @@ async def create_combined_broadcast(
     broadcast = BroadcastHistory(
         target_type=target,
         audience=request.audience.model_dump(mode='json') if request.audience else None,
-        message_text=request.message_text.strip() if request.message_text else None,
+        message_text=(
+            MAIN_MENU_BROADCAST_LABEL
+            if request.message_type == 'main_menu'
+            else request.message_text.strip()
+            if request.message_text
+            else None
+        ),
         has_media=media_payload is not None,
         media_type=media_payload.type if media_payload else None,
         media_file_id=media_payload.file_id if media_payload else None,
@@ -886,7 +894,8 @@ async def create_combined_broadcast(
         telegram_config = BroadcastConfig(
             target=target,
             audience=request.audience,
-            message_text=request.message_text.strip(),
+            message_type=request.message_type,
+            message_text=(request.message_text or '').strip(),
             selected_buttons=request.selected_buttons,
             media=media_config,
             initiator_name=admin_name,
