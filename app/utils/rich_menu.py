@@ -36,6 +36,7 @@ from aiogram.methods import EditMessageText
 from aiogram.types import (
     CallbackQuery,
     InaccessibleMessage,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputRichMessage,
     Message,
@@ -578,6 +579,23 @@ def _build_compact_main_menu_html(user: User, texts) -> str:
         # проходили Pydantic-валидацию в aiogram 3.29–3.30.
         link = f'<a href="{html.escape(sub_url, quote=True)}">{html.escape(sub_url)}</a>'
         subscription_block += f'<blockquote>{link}</blockquote>'
+        subscription_block += (
+            render_keyboard_as_rich_html(
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=texts.t('MAIN_MENU_RICH_ADD_SUBSCRIPTION', 'Добавить подписку'),
+                                url=sub_url,
+                                style='primary',
+                            )
+                        ]
+                    ]
+                ),
+                align='left',
+            )
+            or ''
+        )
 
     blocks.append('<br>'.join(profile) + '<br><br>' + subscription_block)
 
