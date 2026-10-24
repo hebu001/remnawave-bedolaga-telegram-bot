@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -146,12 +146,13 @@ async def list_sender_gifts(
     limit: int = DEFAULT_HISTORY_LIMIT,
     *,
     include_all_statuses: bool = False,
+    only_paid: bool = False,
 ) -> tuple[list[GiftHistoryItem], int]:
     """Query paginated gift history purchased by the given buyer.
 
     Source-neutral: includes gifts bought via bot, cabinet, or landing.
     By default filters to PAID, PENDING_ACTIVATION, DELIVERED.
-    Cabinet history can include unpaid and failed attempts without making them claimable.
+    Cabinet history can include all statuses while limiting results to completed payments.
     Orders by created_at DESC, id DESC.
 
     Args:
@@ -160,6 +161,8 @@ async def list_sender_gifts(
         offset: Number of items to skip (non-negative).
         limit: Number of items per page (bounded between MIN_HISTORY_LIMIT and MAX_HISTORY_LIMIT).
         include_all_statuses: Include all purchase statuses in the buyer's history.
+        only_paid: Additionally require confirmed payment, preserving legacy completed
+            statuses without paid_at and paid purchases whose delivery later failed or expired.
 
     Returns:
         tuple[items, total_count]: List of immutable GiftHistoryItem instances and total count.
@@ -173,6 +176,13 @@ async def list_sender_gifts(
     ]
     if not include_all_statuses:
         base_conditions.append(GuestPurchase.status.in_(ELIGIBLE_GIFT_HISTORY_STATUSES))
+    if only_paid:
+        base_conditions.append(
+            or_(
+                GuestPurchase.paid_at.is_not(None),
+                GuestPurchase.status.in_(ELIGIBLE_GIFT_HISTORY_STATUSES),
+            )
+        )
 
     # Total count query
     count_query = select(func.count()).select_from(GuestPurchase).where(*base_conditions)

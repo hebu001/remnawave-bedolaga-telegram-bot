@@ -646,8 +646,10 @@ async def get_sent_gifts(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Get all gifts the current user has sent."""
-    items, _total_count = await list_sender_gifts(db, buyer_id=user.id, offset=0, limit=100, include_all_statuses=True)
+    """Get gifts the current user has purchased, excluding unpaid checkout attempts."""
+    items, _total_count = await list_sender_gifts(
+        db, buyer_id=user.id, offset=0, limit=100, include_all_statuses=True, only_paid=True
+    )
 
     bot_username = settings.get_bot_username()
     cabinet_url = settings.CABINET_URL

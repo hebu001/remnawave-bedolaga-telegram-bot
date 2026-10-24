@@ -253,6 +253,69 @@ async def test_list_sender_gifts_source_neutral_and_status_filtering(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_list_sender_gifts_only_paid_filters_count_and_page(monkeypatch):
+    """Payment history preserves paid failures/expiry and legacy completed statuses."""
+    async with memory_session(monkeypatch, _TABLES) as db:
+        buyer = await _create_test_user(db, telegram_id=1001)
+        other_buyer = await _create_test_user(db, telegram_id=1002)
+        tariff = await _create_test_tariff(db)
+        now = datetime.now(UTC)
+        states = [
+            ('paid', None),
+            ('pending_activation', None),
+            ('delivered', None),
+            ('failed', now),
+            ('expired', now),
+            ('pending', None),
+            ('failed', None),
+            ('expired', None),
+            ('canceled', None),  # Not a current enum value; unconfirmed imported values stay hidden.
+        ]
+        purchases = [
+            GuestPurchase(
+                token=f'{index:064d}',
+                buyer_user_id=buyer.id if index <= len(states) else other_buyer.id,
+                tariff_id=tariff.id,
+                is_gift=index != len(states) + 2,
+                status=purchase_status,
+                paid_at=paid_at,
+                period_days=30,
+                amount_kopeks=30000,
+                contact_type='telegram',
+                contact_value='@buyer',
+                created_at=now,
+            )
+            for index, (purchase_status, paid_at) in enumerate(states + [('paid', now), ('paid', now)], start=1)
+        ]
+        # The last row is the buyer's own non-gift; neither unrelated row may leak.
+        purchases[-1].buyer_user_id = buyer.id
+        db.add_all(purchases)
+        await db.commit()
+
+        items, total = await list_sender_gifts(db, buyer.id, include_all_statuses=True, only_paid=True)
+        assert total == 5
+        assert [item.token for item in items] == [purchase.token for purchase in reversed(purchases[:5])]
+        page, page_total = await list_sender_gifts(
+            db, buyer.id, offset=1, limit=2, include_all_statuses=True, only_paid=True
+        )
+        assert page_total == 5
+        assert [item.status for item in page] == ['failed', 'delivered']
+        empty_page, final_total = await list_sender_gifts(
+            db, buyer.id, offset=5, limit=2, include_all_statuses=True, only_paid=True
+        )
+        assert empty_page == []
+        assert final_total == 5
+
+        # Other consumers retain their existing status-selection contracts.
+        default_items, default_total = await list_sender_gifts(db, buyer.id)
+        assert default_total == 3
+        assert {item.status for item in default_items} == {'paid', 'pending_activation', 'delivered'}
+        all_items, all_total = await list_sender_gifts(db, buyer.id, include_all_statuses=True)
+        assert all_total == len(states)
+        assert len(all_items) == len(states)
+
+
+@pytest.mark.asyncio
 async def test_list_sender_gifts_stable_ordering_with_equal_timestamps(monkeypatch):
     """Ordering must be strictly `created_at DESC, id DESC` for deterministic pagination."""
     async with memory_session(monkeypatch, _TABLES) as db:

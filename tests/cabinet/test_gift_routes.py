@@ -1213,8 +1213,8 @@ async def test_get_sent_gifts_contract_and_channel_parity(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sent_gifts_preserves_all_owner_statuses_without_unlocking_claims(monkeypatch):
-    """Cabinet history includes unsuccessful attempts, but never another buyer or non-gifts."""
+async def test_sent_gifts_hides_unpaid_attempts_without_unlocking_claims(monkeypatch):
+    """Cabinet history shows purchased gifts, preserving owner and activation guards."""
     from app.cabinet.schemas.gift import ActivateGiftRequest
     from app.config import settings
     from app.services.gift_history_service import list_sender_gifts
@@ -1273,9 +1273,13 @@ async def test_sent_gifts_preserves_all_owner_statuses_without_unlocking_claims(
         await db.commit()
 
         sent = await gift_routes.get_sent_gifts(user=buyer, db=db)
-        assert len(sent) == 6
-        assert {item.status for item in sent} == {status.value for status in GuestPurchaseStatus}
-        assert {item.token for item in sent} == {purchase.claim_code for purchase in purchases}
+        assert len(sent) == 3
+        assert {item.status for item in sent} == {'paid', 'pending_activation', 'delivered'}
+        assert {item.token for item in sent} == {
+            purchase.claim_code
+            for purchase in purchases
+            if purchase.status in {'paid', 'pending_activation', 'delivered'}
+        }
         for item in sent:
             if item.status in {'paid', 'pending_activation'}:
                 assert item.gift_code == item.token
@@ -1305,6 +1309,45 @@ async def test_sent_gifts_preserves_all_owner_statuses_without_unlocking_claims(
             assert rejected.value.detail == 'This gift cannot be activated'
             assert purchase.user_id is None
         activate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sent_gifts_filters_unpaid_before_history_limit_and_keeps_paid_errors(monkeypatch):
+    """Recent unpaid attempts cannot hide older purchases behind the 100-item limit."""
+    from datetime import UTC, datetime, timedelta
+
+    async with memory_session(monkeypatch, _TABLES) as db:
+        buyer = User(id=10, username='buyer')
+        tariff = Tariff(id=1, name='Standard')
+        now = datetime.now(UTC)
+        purchases = [
+            GuestPurchase(
+                id=index,
+                token=f'{index:064d}',
+                claim_code=f'{index:012d}',
+                contact_type='email',
+                contact_value='buyer@example.com',
+                tariff_id=tariff.id,
+                period_days=30,
+                amount_kopeks=20000,
+                is_gift=True,
+                buyer_user_id=buyer.id,
+                status=purchase_status,
+                paid_at=now - timedelta(days=1) if index <= 3 else None,
+                created_at=now - timedelta(days=1) if index <= 3 else now,
+            )
+            for index, purchase_status in enumerate(['paid', 'failed', 'expired'] + ['pending'] * 101, start=1)
+        ]
+        db.add_all([buyer, tariff, *purchases])
+        await db.commit()
+
+        sent = await gift_routes.get_sent_gifts(user=buyer, db=db)
+
+        assert [item.token for item in sent] == ['000000000003', '000000000002', '000000000001']
+        assert [item.status for item in sent] == ['expired', 'failed', 'paid']
+        assert all(item.gift_code is None for item in sent[:2])
+        assert sent[2].gift_code == '000000000001'
+        assert await db.scalar(select(func.count()).select_from(GuestPurchase)) == 104
 
 
 @pytest.mark.asyncio
