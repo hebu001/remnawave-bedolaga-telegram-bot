@@ -519,6 +519,8 @@ class Settings(BaseSettings):
 
     BLACKLIST_CHECK_ENABLED: bool = False
     BLACKLIST_GITHUB_URL: str | None = None
+    # Additional Telegram IDs, separated by commas or whitespace; upstream list stays unchanged.
+    BLACKLIST_ADDITIONAL_IDS: str = ''
     BLACKLIST_UPDATE_INTERVAL_HOURS: int = 24
     BLACKLIST_IGNORE_ADMINS: bool = True
 

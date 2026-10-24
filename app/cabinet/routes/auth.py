@@ -46,6 +46,7 @@ from app.database.crud.user import (
 )
 from app.database.models import CabinetRefreshToken, User, UserStatus
 from app.services import legal_consent_service
+from app.services.blacklist_service import blacklist_service
 from app.services.campaign_service import AdvertisingCampaignService
 from app.services.disposable_email_service import disposable_email_service
 from app.services.panel_sync import (
@@ -147,6 +148,16 @@ async def _password_work[T](operation: Awaitable[T]) -> T:
             detail='Password service is busy; try again shortly',
             headers={'Retry-After': '2'},
         ) from None
+
+
+async def _ensure_telegram_identity_not_blacklisted(telegram_id: int, username: str | None) -> None:
+    """Check a verified Telegram identity before registration or session creation."""
+    is_blacklisted, reason = await blacklist_service.is_user_blacklisted(telegram_id, username)
+    if is_blacklisted:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={'code': 'blacklisted', 'message': reason or 'Доступ запрещен'},
+        )
 
 
 async def _create_or_claim_telegram_user(
@@ -811,6 +822,8 @@ async def auth_telegram(
             detail='Missing Telegram user ID',
         )
 
+    await _ensure_telegram_identity_not_blacklisted(telegram_id, user_data.get('username'))
+
     user = await get_user_by_telegram_id(db, telegram_id)
     access_decision = await _gate_cabinet_identity(
         db,
@@ -989,6 +1002,8 @@ async def auth_telegram_widget(
             detail='Invalid or expired Telegram authentication data',
         )
     # Одноразовость payload гасится ниже, после гейта согласия — см. _consume_widget_payload.
+
+    await _ensure_telegram_identity_not_blacklisted(request.id, request.username)
 
     user = await get_user_by_telegram_id(db, request.id)
     access_decision = await _gate_cabinet_identity(
@@ -1179,6 +1194,8 @@ async def auth_telegram_oidc(
     username = claims.get('preferred_username')
     last_name = claims.get('family_name')
     language = claims.get('locale', 'ru')[:2] if claims.get('locale') else 'ru'
+
+    await _ensure_telegram_identity_not_blacklisted(telegram_id, username)
 
     user = await get_user_by_telegram_id(db, telegram_id)
     access_decision = await _gate_cabinet_identity(
@@ -2742,6 +2759,9 @@ async def poll_deep_link_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='User not found',
         )
+
+    if user.telegram_id is not None:
+        await _ensure_telegram_identity_not_blacklisted(user.telegram_id, user.username)
 
     if user.status != UserStatus.ACTIVE.value:
         raise HTTPException(

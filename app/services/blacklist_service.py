@@ -40,6 +40,19 @@ class BlacklistService:
         """Получает URL к файлу черного списка на GitHub"""
         return getattr(settings, 'BLACKLIST_GITHUB_URL', None)
 
+    def get_additional_blacklist_ids(self) -> set[int]:
+        """Read the live local list without replacing or caching upstream entries."""
+        raw_ids = getattr(settings, 'BLACKLIST_ADDITIONAL_IDS', '') or ''
+        additional_ids: set[int] = set()
+        for item in raw_ids.replace(',', ' ').split():
+            try:
+                telegram_id = int(item)
+            except ValueError:
+                continue
+            if telegram_id > 0:
+                additional_ids.add(telegram_id)
+        return additional_ids
+
     def get_blacklist_update_interval_hours(self) -> int:
         """Получает интервал обновления черного списка в часах"""
         return getattr(settings, 'BLACKLIST_UPDATE_INTERVAL_HOURS', 24)
@@ -152,6 +165,13 @@ class BlacklistService:
         """
         if not self.is_blacklist_check_enabled():
             return False, None
+
+        # Local changes take effect even while a previous upstream miss is cached.
+        # Do not put local results in that cache: removing an ID must apply immediately too.
+        if telegram_id in self.get_additional_blacklist_ids():
+            if self.should_ignore_admins() and self.is_admin(telegram_id):
+                return False, None
+            return True, 'Заблокирован администратором'
 
         # Проверяем кэш
         now = time.monotonic()
