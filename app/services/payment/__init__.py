@@ -5,6 +5,7 @@
 """
 
 from .aurapay import AuraPayPaymentMixin
+from .cardlink import CardlinkPaymentMixin
 from .cloudpayments import CloudPaymentsPaymentMixin
 from .common import PaymentCommonMixin
 from .cryptobot import CryptoBotPaymentMixin
@@ -27,6 +28,7 @@ from .yookassa import YooKassaPaymentMixin
 
 __all__ = [
     'AuraPayPaymentMixin',
+    'CardlinkPaymentMixin',
     'CloudPaymentsPaymentMixin',
     'CryptoBotPaymentMixin',
     'FreekassaPaymentMixin',

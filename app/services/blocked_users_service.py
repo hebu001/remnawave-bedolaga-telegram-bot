@@ -14,7 +14,7 @@ from enum import Enum
 import structlog
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +22,7 @@ from app.database.models import (
     AdvertisingCampaignRegistration,
     ButtonClickLog,
     CabinetRefreshToken,
+    CardlinkPayment,
     CloudPaymentsPayment,
     ContestAttempt,
     CryptoBotPayment,
@@ -348,6 +349,12 @@ class BlockedUsersService:
             await db.execute(delete(HeleketPayment).where(HeleketPayment.user_id == user.id))
             await db.execute(delete(MulenPayPayment).where(MulenPayPayment.user_id == user.id))
             await db.execute(delete(Pal24Payment).where(Pal24Payment.user_id == user.id))
+            # Preserve confirmed receipts used by income reports after account deletion.
+            await db.execute(
+                update(CardlinkPayment)
+                .where(CardlinkPayment.user_id == user.id)
+                .values(user_id=None, transaction_id=None)
+            )
             await db.execute(delete(WataPayment).where(WataPayment.user_id == user.id))
             await db.execute(delete(PlategaPayment).where(PlategaPayment.user_id == user.id))
             await db.execute(delete(CloudPaymentsPayment).where(CloudPaymentsPayment.user_id == user.id))

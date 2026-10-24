@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from contextlib import aclosing
 from decimal import Decimal, InvalidOperation
 
 import structlog
@@ -15,6 +16,12 @@ from app.config import settings
 from app.database.crud.mulenpay import get_mulenpay_payment_by_mulen_id
 from app.database.database import get_db
 from app.external import yookassa_webhook as yookassa_webhook_module
+from app.external.cardlink_webhook import (
+    MAX_CALLBACK_BYTES,
+    CardlinkWebhookHandler,
+    InvalidCardlinkCallback,
+    parse_cardlink_callback,
+)
 from app.external.heleket_webhook import HeleketWebhookHandler
 from app.external.pal24_client import Pal24APIError
 from app.external.tribute import TributeService as TributeAPI
@@ -714,6 +721,50 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                     {'status': 'error', 'reason': 'processing_failed'},
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
+
+        routes_registered = True
+
+    if settings.is_cardlink_configured():
+        cardlink_handler = CardlinkWebhookHandler(payment_service)
+
+        @router.get(settings.CARDLINK_WEBHOOK_PATH)
+        async def cardlink_health() -> JSONResponse:
+            return JSONResponse(
+                {'status': 'ok', 'service': 'cardlink_webhook', 'enabled': settings.is_cardlink_enabled()}
+            )
+
+        @router.post(settings.CARDLINK_WEBHOOK_PATH)
+        async def cardlink_webhook(request: Request) -> Response:
+            # Keep callbacks available when creation is disabled: issued bills must settle.
+            if not settings.is_cardlink_configured():
+                return Response('unavailable', status_code=503)
+            content_length = request.headers.get('content-length')
+            if content_length is not None:
+                try:
+                    if int(content_length) > MAX_CALLBACK_BYTES:
+                        return Response('body_too_large', status_code=413)
+                except ValueError:
+                    return Response('invalid_callback', status_code=400)
+            raw = bytearray()
+            async with aclosing(request.stream()) as chunks:
+                async for chunk in chunks:
+                    raw.extend(chunk)
+                    if len(raw) > MAX_CALLBACK_BYTES:
+                        return Response('body_too_large', status_code=413)
+            try:
+                payload = parse_cardlink_callback(bytes(raw), request.headers.get('content-type', ''))
+            except InvalidCardlinkCallback:
+                return Response('invalid_callback', status_code=400)
+            if not cardlink_handler.verify_callback(payload):
+                return Response('invalid_signature', status_code=401)
+            try:
+                processed = await _process_payment_service_callback(
+                    payment_service, payload, 'process_cardlink_webhook'
+                )
+            except Exception:
+                logger.error('Cardlink callback processing failed')
+                return Response('not_processed', status_code=503)
+            return Response('OK' if processed else 'not_processed', status_code=200 if processed else 503)
 
         routes_registered = True
 
@@ -2238,6 +2289,7 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                     'mulenpay_enabled': settings.is_mulenpay_enabled(),
                     'cryptobot_enabled': settings.is_cryptobot_enabled(),
                     'yookassa_enabled': settings.is_yookassa_enabled(),
+                    'cardlink_enabled': settings.is_cardlink_enabled(),
                     'wata_enabled': settings.is_wata_enabled(),
                     'heleket_enabled': settings.is_heleket_enabled(),
                     'pal24_enabled': settings.is_pal24_enabled(),

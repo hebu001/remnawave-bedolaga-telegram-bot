@@ -20,6 +20,7 @@ from app.database.database import AsyncSessionLocal
 from app.database.models import (
     AntilopayPayment,
     AuraPayPayment,
+    CardlinkPayment,
     CasheraPayment,
     CisPayPayment,
     CloudPaymentsPayment,
@@ -80,6 +81,7 @@ SUPPORTED_MANUAL_CHECK_METHODS: frozenset[PaymentMethod] = frozenset(
         PaymentMethod.MULENPAY,
         PaymentMethod.PAL24,
         PaymentMethod.WATA,
+        PaymentMethod.CARDLINK,
         PaymentMethod.HELEKET,
         PaymentMethod.CRYPTOBOT,
         PaymentMethod.PLATEGA,
@@ -137,6 +139,8 @@ def method_display_name(method: PaymentMethod) -> str:
         return 'PayPalych'
     if method == PaymentMethod.YOOKASSA:
         return 'YooKassa'
+    if method == PaymentMethod.CARDLINK:
+        return settings.get_cardlink_display_name()
     if method == PaymentMethod.WATA:
         return 'WATA'
     if method == PaymentMethod.PLATEGA:
@@ -195,6 +199,8 @@ def _method_is_enabled(method: PaymentMethod) -> bool:
         return settings.is_mulenpay_enabled()
     if method == PaymentMethod.PAL24:
         return settings.is_pal24_enabled()
+    if method == PaymentMethod.CARDLINK:
+        return settings.is_cardlink_configured()
     if method == PaymentMethod.WATA:
         return settings.is_wata_enabled()
     if method == PaymentMethod.PLATEGA:
@@ -411,6 +417,10 @@ def _is_mulenpay_pending(payment: MulenPayPayment) -> bool:
         return False
     status = (payment.status or '').lower()
     return status in {'created', 'processing', 'hold'}
+
+
+def _is_cardlink_pending(payment: CardlinkPayment) -> bool:
+    return not payment.is_paid and (payment.status or '').upper() not in {'FAIL', 'CANCEL', 'CANCELLED', 'EXPIRED'}
 
 
 def _is_wata_pending(payment: WataPayment) -> bool:
@@ -674,6 +684,32 @@ async def _fetch_mulenpay_payments(db: AsyncSession, cutoff: datetime) -> list[P
             amount_kopeks=payment.amount_kopeks,
             status=payment.status or '',
             is_paid=bool(payment.is_paid),
+        )
+        if record:
+            records.append(record)
+    return records
+
+
+async def _fetch_cardlink_payments(db: AsyncSession, cutoff: datetime) -> list[PendingPayment]:
+    stmt = (
+        select(CardlinkPayment)
+        .options(selectinload(CardlinkPayment.user))
+        .where(CardlinkPayment.created_at >= cutoff)
+        .order_by(desc(CardlinkPayment.created_at))
+    )
+    result = await db.execute(stmt)
+    records: list[PendingPayment] = []
+    for payment in result.scalars().all():
+        if not _is_cardlink_pending(payment):
+            continue
+        record = _build_record(
+            PaymentMethod.CARDLINK,
+            payment,
+            identifier=payment.bill_id,
+            amount_kopeks=payment.amount_kopeks,
+            status=payment.status or '',
+            is_paid=bool(payment.is_paid),
+            expires_at=getattr(payment, 'expires_at', None),
         )
         if record:
             records.append(record)
@@ -1334,6 +1370,7 @@ async def list_recent_pending_payments(
         await _fetch_pal24_payments(db, cutoff),
         await _fetch_mulenpay_payments(db, cutoff),
         await _fetch_wata_payments(db, cutoff),
+        await _fetch_cardlink_payments(db, cutoff),
         await _fetch_platega_payments(db, cutoff),
         await _fetch_heleket_payments(db, cutoff),
         await _fetch_cryptobot_payments(db, cutoff),
@@ -1402,6 +1439,21 @@ async def get_payment_record(
             amount_kopeks=payment.amount_kopeks,
             status=payment.status or '',
             is_paid=bool(payment.is_paid),
+        )
+
+    if method == PaymentMethod.CARDLINK:
+        payment = await db.get(CardlinkPayment, local_payment_id)
+        if not payment:
+            return None
+        await db.refresh(payment, attribute_names=['user'])
+        return _build_record(
+            method,
+            payment,
+            identifier=payment.bill_id,
+            amount_kopeks=payment.amount_kopeks,
+            status=payment.status or '',
+            is_paid=bool(payment.is_paid),
+            expires_at=getattr(payment, 'expires_at', None),
         )
 
     if method == PaymentMethod.WATA:
@@ -1788,6 +1840,9 @@ async def run_manual_check(
             payment = result.get('payment') if result else None
         elif method == PaymentMethod.MULENPAY:
             result = await payment_service.get_mulenpay_payment_status(db, local_payment_id)
+            payment = result.get('payment') if result else None
+        elif method == PaymentMethod.CARDLINK:
+            result = await payment_service.get_cardlink_payment_status(db, local_payment_id)
             payment = result.get('payment') if result else None
         elif method == PaymentMethod.WATA:
             result = await payment_service.get_wata_payment_status(db, local_payment_id)

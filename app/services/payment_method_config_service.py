@@ -114,6 +114,13 @@ def _get_method_defaults() -> dict:
             'default_max': settings.WATA_MAX_AMOUNT_KOPEKS,
             'available_sub_options': None,
         },
+        'cardlink': {
+            'default_display_name': settings.get_cardlink_display_name(),
+            'is_configured': settings.is_cardlink_enabled(),
+            'default_min': settings.CARDLINK_MIN_AMOUNT_KOPEKS,
+            'default_max': settings.CARDLINK_MAX_AMOUNT_KOPEKS,
+            'available_sub_options': None,
+        },
         'freekassa': {
             'default_display_name': settings.get_freekassa_display_name(),
             'is_configured': settings.is_freekassa_enabled(),
@@ -356,6 +363,7 @@ DEFAULT_METHOD_ORDER = [
     'pal24',
     'platega',
     'wata',
+    'cardlink',
     'freekassa',
     'freekassa_sbp',
     'freekassa_card',

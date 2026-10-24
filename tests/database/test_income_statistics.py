@@ -27,6 +27,15 @@ def ledger(monkeypatch, reset_local_timezone_cache):
         Column('created_at', DateTime),
         Column('completed_at', DateTime),
     )
+    cardlink = Table(
+        'cardlink_payments',
+        metadata,
+        Column('id', Integer, primary_key=True),
+        Column('amount_kopeks', Integer),
+        Column('is_paid', Boolean),
+        Column('currency', String),
+        Column('paid_at', DateTime),
+    )
     wata = Table(
         'wata_payments',
         metadata,
@@ -89,6 +98,7 @@ def ledger(monkeypatch, reset_local_timezone_cache):
 
         db = Ledger()
         db.cashera = cashera
+        db.cardlink = cardlink
         yield db, transactions, wata, yookassa
     engine.dispose()
 
@@ -347,3 +357,24 @@ async def test_cashera_refund_is_not_a_second_received_payment(ledger):
         completed_at=paid,
     )
     assert await revenue.get_income_total(db, utc('2026-09-01'), utc('2026-09-16')) == 30000
+
+
+@pytest.mark.asyncio
+async def test_cardlink_paid_receipt_is_counted_once_and_unpaid_attempt_is_excluded(ledger):
+    db, transactions, _, _ = ledger
+    paid = utc('2026-10-25 00:00:00')
+    for kind, amount in [('deposit', 19900), ('subscription_payment', -19900)]:
+        db.add(
+            transactions,
+            type=kind,
+            amount_kopeks=amount,
+            payment_method='cardlink',
+            is_completed=True,
+            created_at=paid,
+            completed_at=paid,
+        )
+    db.add(db.cardlink, amount_kopeks=19900, is_paid=True, currency='RUB', paid_at=paid)
+    db.add(db.cardlink, amount_kopeks=50000, is_paid=False, currency='RUB', paid_at=None)
+    stats = await revenue.get_transactions_statistics(db, utc('2026-10-01'), utc('2026-11-01'))
+    assert stats['totals']['income_kopeks'] == 19900
+    assert stats['by_payment_method'] == {'cardlink': {'count': 1, 'amount': 19900}}

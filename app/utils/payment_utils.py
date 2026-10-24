@@ -84,6 +84,17 @@ def get_available_payment_methods() -> list[dict[str, str]]:
             }
         )
 
+    if settings.is_cardlink_enabled():
+        methods.append(
+            {
+                'id': 'cardlink',
+                'name': settings.get_cardlink_display_name(),
+                'icon': '💳',
+                'description': 'через Cardlink',
+                'callback': 'topup_cardlink',
+            }
+        )
+
     if settings.is_pal24_enabled():
         methods.append(
             {'id': 'pal24', 'name': 'СБП', 'icon': '🏦', 'description': 'через PayPalych', 'callback': 'topup_pal24'}
@@ -644,6 +655,8 @@ def is_payment_method_available(method_id: str) -> bool:
         return settings.TRIBUTE_ENABLED
     if method_id == 'mulenpay':
         return settings.is_mulenpay_enabled()
+    if method_id == 'cardlink':
+        return settings.is_cardlink_enabled()
     if method_id == 'wata':
         return settings.is_wata_enabled()
     if method_id == 'pal24':
@@ -742,6 +755,7 @@ def get_payment_method_status() -> dict[str, bool]:
         'yookassa': settings.is_yookassa_enabled(),
         'tribute': settings.TRIBUTE_ENABLED,
         'mulenpay': settings.is_mulenpay_enabled(),
+        'cardlink': settings.is_cardlink_enabled(),
         'wata': settings.is_wata_enabled(),
         'pal24': settings.is_pal24_enabled(),
         'cryptobot': settings.is_cryptobot_enabled(),
@@ -784,6 +798,8 @@ def get_enabled_payment_methods_count() -> int:
     if settings.TRIBUTE_ENABLED:
         count += 1
     if settings.is_mulenpay_enabled():
+        count += 1
+    if settings.is_cardlink_enabled():
         count += 1
     if settings.is_wata_enabled():
         count += 1

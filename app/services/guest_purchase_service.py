@@ -2040,6 +2040,7 @@ async def _find_succeeded_provider_payment(
     from sqlalchemy.types import JSON as SA_JSON
 
     from app.database.models import (
+        CardlinkPayment,
         CloudPaymentsPayment,
         CryptoBotPayment,
         FreekassaPayment,
@@ -2099,6 +2100,10 @@ async def _find_succeeded_provider_payment(
         model = Pal24Payment
         payment_id_attr = 'bill_id'
         extra_conditions = [Pal24Payment.is_paid.is_(True)]
+    elif base_method == 'cardlink':
+        model = CardlinkPayment
+        payment_id_attr = 'bill_id'
+        extra_conditions = [CardlinkPayment.is_paid.is_(True)]
     elif base_method == 'wata':
         model = WataPayment
         payment_id_attr = 'payment_link_id'

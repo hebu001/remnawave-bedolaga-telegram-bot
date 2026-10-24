@@ -19,6 +19,7 @@ from app.database.models import (
     BroadcastHistory,
     ButtonClickLog,
     CabinetRefreshToken,
+    CardlinkPayment,
     CloudPaymentsPayment,
     ContestAttempt,
     CryptoBotPayment,
@@ -89,6 +90,7 @@ _PAYMENT_MODELS: tuple[type, ...] = (
     PlategaPayment,
     RioPayPayment,
     SeverPayPayment,
+    CardlinkPayment,
     WataPayment,
     YooKassaPayment,
 )

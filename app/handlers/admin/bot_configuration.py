@@ -96,6 +96,7 @@ CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
             'LAVA',
             'MULENPAY',
             'PAL24',
+            'CARDLINK',
             'WATA',
             'PLATEGA',
             'TRIBUTE',
@@ -1254,6 +1255,9 @@ def _build_settings_keyboard(
             '💳 Банковская карта ({mulenpay_name})',
         ).format(mulenpay_name=settings.get_mulenpay_display_name())
         test_payment_buttons.append([_test_button(f'{label} · тест', 'mulenpay')])
+    elif category_key == 'CARDLINK':
+        label = settings.get_cardlink_display_name()
+        test_payment_buttons.append([_test_button(f'{label} · тест', 'cardlink')])
     elif category_key == 'WATA':
         label = texts.t('PAYMENT_CARD_WATA', '💳 Банковская карта (WATA)')
         test_payment_buttons.append([_test_button(f'{label} · тест', 'wata')])

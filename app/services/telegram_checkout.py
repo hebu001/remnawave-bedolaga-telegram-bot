@@ -24,7 +24,7 @@ from app.utils.cache import RateLimitCache
 
 
 TTL = 900
-SUPPORTED_METHODS = frozenset({'yookassa', 'yookassa_sbp', 'wata'})
+SUPPORTED_METHODS = frozenset({'yookassa', 'yookassa_sbp', 'wata', 'cardlink'})
 CART_FIELDS = (
     'cart_mode',
     'tariff_id',
@@ -264,7 +264,9 @@ async def complete_checkout(token: str, db) -> str:
     configured = next((item for item, code, _ in _cabinet_choices(methods) if code == method), None)
     if not configured or not configured.min_amount_kopeks <= amount <= configured.max_amount_kopeks:
         raise CheckoutError('Способ или сумма оплаты недоступны. Вернитесь в бот.')
-    if method == 'wata':
+    if method == 'cardlink':
+        enabled = settings.is_cardlink_enabled()
+    elif method == 'wata':
         enabled = settings.is_wata_enabled()
     else:
         enabled = settings.is_yookassa_enabled() and (method != 'yookassa_sbp' or settings.YOOKASSA_SBP_ENABLED)
@@ -283,8 +285,9 @@ async def complete_checkout(token: str, db) -> str:
     description = settings.get_balance_payment_description(amount, telegram_user_id=user.telegram_id)
     try:
         async with asyncio.timeout(35):
-            if method == 'wata':
-                payment = await service.create_wata_payment(
+            if method in {'wata', 'cardlink'}:
+                create = service.create_cardlink_payment if method == 'cardlink' else service.create_wata_payment
+                payment = await create(
                     db=db, user_id=user.id, amount_kopeks=amount, description=description, language=user.language
                 )
                 url = payment.get('payment_url') if payment else None

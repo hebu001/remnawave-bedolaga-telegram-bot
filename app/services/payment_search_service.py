@@ -17,6 +17,7 @@ from sqlalchemy.types import String as SAString
 from app.database.models import (
     AntilopayPayment,
     AuraPayPayment,
+    CardlinkPayment,
     CasheraPayment,
     CisPayPayment,
     CloudPaymentsPayment,
@@ -406,6 +407,41 @@ async def _search_pal24(db: AsyncSession, params: SearchParams) -> list[PendingP
     for payment in result.scalars().all():
         record = _build_record(
             PaymentMethod.PAL24,
+            payment,
+            identifier=payment.bill_id,
+            amount_kopeks=payment.amount_kopeks,
+            status=payment.status or '',
+            is_paid=bool(payment.is_paid),
+            expires_at=getattr(payment, 'expires_at', None),
+        )
+        if record:
+            records.append(record)
+    return records
+
+
+async def _search_cardlink(db: AsyncSession, params: SearchParams) -> list[PendingPayment]:
+    stmt = (
+        select(CardlinkPayment).options(selectinload(CardlinkPayment.user)).order_by(desc(CardlinkPayment.created_at))
+    )
+    stmt = _apply_date_filter(stmt, CardlinkPayment.created_at, params.cutoff, params.upper_bound)
+
+    if params.search:
+        kind = _detect_user_search_kind(params.search)
+        if kind == _UserSearchKind.INVOICE:
+            conditions = [
+                CardlinkPayment.bill_id.ilike(f'%{_escape_like(params.search)}%'),
+                CardlinkPayment.order_id.ilike(f'%{_escape_like(params.search)}%'),
+            ]
+            stmt = stmt.where(or_(*conditions))
+        else:
+            stmt = _apply_user_join_filter(stmt, CardlinkPayment, kind, params.search)
+
+    stmt = stmt.limit(MAX_RECORDS_PER_PROVIDER)
+    result = await db.execute(stmt)
+    records: list[PendingPayment] = []
+    for payment in result.scalars().all():
+        record = _build_record(
+            PaymentMethod.CARDLINK,
             payment,
             identifier=payment.bill_id,
             amount_kopeks=payment.amount_kopeks,
@@ -1193,6 +1229,7 @@ _PROVIDER_SEARCH_MAP: dict[PaymentMethod, Any] = {
     PaymentMethod.HELEKET: _search_heleket,
     PaymentMethod.MULENPAY: _search_mulenpay,
     PaymentMethod.PAL24: _search_pal24,
+    PaymentMethod.CARDLINK: _search_cardlink,
     PaymentMethod.WATA: _search_wata,
     PaymentMethod.PLATEGA: _search_platega,
     PaymentMethod.CLOUDPAYMENTS: _search_cloudpayments,

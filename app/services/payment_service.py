@@ -14,11 +14,13 @@ from app.config import settings
 from app.external.cryptobot import CryptoBotService
 from app.external.heleket import HeleketService
 from app.external.telegram_stars import TelegramStarsService
+from app.services.cardlink_service import CardlinkService
 from app.services.cloudpayments_service import CloudPaymentsService
 from app.services.mulenpay_service import MulenPayService
 from app.services.nalogo_service import NaloGoService
 from app.services.pal24_service import Pal24Service
 from app.services.payment import (
+    CardlinkPaymentMixin,
     CryptoBotPaymentMixin,
     HeleketPaymentMixin,
     MulenPayPaymentMixin,
@@ -847,6 +849,7 @@ class PaymentService(
     Pal24PaymentMixin,
     PlategaPaymentMixin,
     WataPaymentMixin,
+    CardlinkPaymentMixin,
     CloudPaymentsPaymentMixin,
     FreekassaPaymentMixin,
     KassaAiPaymentMixin,
@@ -880,6 +883,9 @@ class PaymentService(
         self.pal24_service = Pal24Service() if settings.is_pal24_enabled() else None
         self.platega_service = PlategaService() if settings.is_platega_enabled() else None
         self.wata_service = WataService() if settings.is_wata_enabled() else None
+        # Keep verification available for outstanding bills after disabling new payments.
+        cardlink_service = CardlinkService()
+        self.cardlink_service = cardlink_service if cardlink_service.is_configured else None
         self.cloudpayments_service = CloudPaymentsService() if settings.is_cloudpayments_enabled() else None
         self.nalogo_service = NaloGoService() if settings.is_nalogo_enabled() else None
 
@@ -1152,6 +1158,19 @@ class PaymentService(
                     'payment_id': result.get('correlation_id'),
                     'provider': 'platega',
                 }
+            return None
+
+        if payment_method == 'cardlink':
+            result = await self.create_cardlink_payment(
+                db=db,
+                user_id=None,
+                amount_kopeks=amount_kopeks,
+                description=description,
+                return_url=return_url,
+                metadata=guest_metadata,
+            )
+            if result:
+                return {'payment_url': result['payment_url'], 'payment_id': result['bill_id'], 'provider': 'cardlink'}
             return None
 
         # --- WATA -------------------------------------------------------------

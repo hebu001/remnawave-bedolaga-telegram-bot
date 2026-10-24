@@ -44,6 +44,7 @@ from app.database.models import (
     ButtonClickLog,
     CabinetRefreshToken,
     CabinetWsTicket,
+    CardlinkPayment,
     CasheraPayment,
     CasheraSubscription,
     CisPayPayment,
@@ -286,6 +287,7 @@ class BackupService:
             WebApiToken,
             # --- Payment providers (FK: users, transactions) ---
             HeleketPayment,
+            CardlinkPayment,
             WataPayment,
             PlategaPayment,
             CloudPaymentsPayment,
@@ -1818,6 +1820,7 @@ class BackupService:
             'button_click_logs',
             # --- Payment providers ---
             'heleket_payments',
+            'cardlink_payments',
             'wata_payments',
             'platega_payments',
             'cloudpayments_payments',

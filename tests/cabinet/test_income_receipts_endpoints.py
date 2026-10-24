@@ -8,7 +8,15 @@ import pytest
 
 from app.cabinet.routes import admin_sales_stats, admin_stats
 from app.database.crud.transaction import get_income_total, get_revenue_by_period, get_transactions_statistics
-from app.database.models import CasheraPayment, GuestPurchase, Transaction, User, WataPayment, YooKassaPayment
+from app.database.models import (
+    CardlinkPayment,
+    CasheraPayment,
+    GuestPurchase,
+    Transaction,
+    User,
+    WataPayment,
+    YooKassaPayment,
+)
 from app.utils.timezone import local_month_start
 from tests.fixtures.local_day import reset_local_timezone_cache, use_timezone  # noqa: F401
 from tests.fixtures.postgres_db import postgres_session
@@ -19,6 +27,7 @@ ADMIN = SimpleNamespace(id=1, username='admin')
 TABLES = [
     User.__table__,
     Transaction.__table__,
+    CardlinkPayment.__table__,
     WataPayment.__table__,
     YooKassaPayment.__table__,
     CasheraPayment.__table__,

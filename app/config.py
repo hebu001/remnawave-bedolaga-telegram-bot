@@ -814,6 +814,23 @@ class Settings(BaseSettings):
     PLATEGA_WEBHOOK_PORT: int = 8086
     PLATEGA_RECURRENT_ENABLED: bool = False  # Рекуррентные СБП-подписки Platega (автопродление)
 
+    # Cardlink hosted payment links. Credentials also authenticate callbacks.
+    CARDLINK_ENABLED: bool = False
+    CARDLINK_DISPLAY_NAME: str = 'Cardlink'
+    CARDLINK_BASE_URL: str = 'https://cardlink.link'
+    CARDLINK_API_TOKEN: str | None = None
+    CARDLINK_SHOP_ID: str | None = None
+    CARDLINK_PAYMENT_DESCRIPTION: str = 'Пополнение баланса'
+    CARDLINK_PAYMENT_METHOD: str | None = None
+    CARDLINK_PAYER_PAYS_COMMISSION: bool = False
+    CARDLINK_SUCCESS_REDIRECT_URL: str | None = None
+    CARDLINK_FAIL_REDIRECT_URL: str | None = None
+    CARDLINK_LINK_TTL_SECONDS: int = 900
+    CARDLINK_MIN_AMOUNT_KOPEKS: int = 10000
+    CARDLINK_MAX_AMOUNT_KOPEKS: int = 100000000
+    CARDLINK_REQUEST_TIMEOUT: int = 30
+    CARDLINK_WEBHOOK_PATH: str = '/cardlink-webhook'
+
     WATA_ENABLED: bool = False
     WATA_DISPLAY_NAME: str = 'Wata'
     WATA_BASE_URL: str = 'https://api.wata.pro/api/h2h'
@@ -2896,6 +2913,15 @@ class Settings(BaseSettings):
         if not info:
             return f'Platega {method_code}'
         return info.get('title') or info.get('name') or f'Platega {method_code}'
+
+    def is_cardlink_configured(self) -> bool:
+        return bool((self.CARDLINK_API_TOKEN or '').strip() and (self.CARDLINK_SHOP_ID or '').strip())
+
+    def is_cardlink_enabled(self) -> bool:
+        return self.CARDLINK_ENABLED and self.is_cardlink_configured()
+
+    def get_cardlink_display_name(self) -> str:
+        return (self.CARDLINK_DISPLAY_NAME or '').strip() or 'Cardlink'
 
     def is_wata_configured(self) -> bool:
         """Есть ли учётные данные провайдера — без учёта флага включения."""

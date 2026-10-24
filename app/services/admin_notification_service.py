@@ -1846,6 +1846,7 @@ class AdminNotificationService:
             'pal24': f'🏦 {settings.get_pal24_display_name()} (СБП)',
             'cryptobot': f'🪙 {settings.get_cryptobot_display_name()} (крипто)',
             'heleket': f'🪙 {settings.get_heleket_display_name()} (крипто)',
+            'cardlink': f'💳 {settings.get_cardlink_display_name()}',
             'wata': f'💳 {settings.get_wata_display_name()}',
             'platega': f'💳 {settings.get_platega_display_name()}',
             'cloudpayments': f'💳 {settings.get_cloudpayments_display_name()}',

@@ -28,6 +28,7 @@ from app.database.models import (
     AdvertisingCampaign,
     AdvertisingCampaignRegistration,
     BroadcastHistory,
+    CardlinkPayment,
     CloudPaymentsPayment,
     CryptoBotPayment,
     FreekassaPayment,
@@ -1164,6 +1165,18 @@ class UserService:
                         await db.flush()
             except Exception as e:
                 logger.error('❌ Ошибка удаления Freekassa платежей', error=e)
+
+            # Сохраняем квитанции Cardlink для статистики дохода, отвязывая удаляемый аккаунт.
+            try:
+                async with db.begin_nested():
+                    await db.execute(
+                        update(CardlinkPayment)
+                        .where(CardlinkPayment.user_id == user_id)
+                        .values(user_id=None, transaction_id=None)
+                    )
+                    await db.flush()
+            except Exception as e:
+                logger.error('❌ Ошибка отвязки Cardlink платежей', error=e)
 
             # Удаляем Wata платежи (до транзакций, т.к. wata_payments.transaction_id -> transactions.id)
             try:

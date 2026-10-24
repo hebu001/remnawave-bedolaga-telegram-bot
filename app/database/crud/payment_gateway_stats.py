@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import (
     AntilopayPayment,
     AuraPayPayment,
+    CardlinkPayment,
     CasheraPayment,
     CisPayPayment,
     CloudPaymentsPayment,
@@ -56,6 +57,7 @@ _GATEWAY_REGISTRY: list[tuple[str, type, object]] = [
     (PaymentMethod.MULENPAY.value, MulenPayPayment, MulenPayPayment.is_paid.is_(True)),
     (PaymentMethod.PAL24.value, Pal24Payment, Pal24Payment.is_paid.is_(True)),
     (PaymentMethod.WATA.value, WataPayment, WataPayment.is_paid.is_(True)),
+    (PaymentMethod.CARDLINK.value, CardlinkPayment, CardlinkPayment.is_paid.is_(True)),
     (PaymentMethod.PLATEGA.value, PlategaPayment, PlategaPayment.is_paid.is_(True)),
     (PaymentMethod.CLOUDPAYMENTS.value, CloudPaymentsPayment, CloudPaymentsPayment.is_paid.is_(True)),
     (PaymentMethod.FREEKASSA.value, FreekassaPayment, FreekassaPayment.is_paid.is_(True)),

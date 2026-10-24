@@ -788,6 +788,20 @@ async def get_payment_methods(
             )
         )
 
+    if settings.is_cardlink_enabled():
+        methods.append(
+            MiniAppPaymentMethod(
+                id='cardlink',
+                icon='💳',
+                name=settings.get_cardlink_display_name(),
+                requires_amount=True,
+                currency='RUB',
+                min_amount_kopeks=settings.CARDLINK_MIN_AMOUNT_KOPEKS,
+                max_amount_kopeks=settings.CARDLINK_MAX_AMOUNT_KOPEKS,
+                integration_type=MiniAppPaymentIntegrationType.REDIRECT,
+            )
+        )
+
     if settings.is_platega_enabled() and settings.get_platega_active_methods():
         platega_methods = settings.get_platega_active_methods()
         definitions = settings.get_platega_method_definitions()
@@ -894,6 +908,7 @@ async def get_payment_methods(
         'pal24': 7,
         'platega': 8,
         'wata': 9,
+        'cardlink': 13,
         'cryptobot': 10,
         'heleket': 11,
         'tribute': 12,
@@ -1169,6 +1184,44 @@ async def create_payment_link(
                 'local_payment_id': result.get('local_payment_id'),
                 'payment_link_id': result.get('payment_link_id'),
                 'payment_id': result.get('payment_link_id'),
+                'status': result.get('status'),
+                'order_id': result.get('order_id'),
+                'requested_at': _current_request_timestamp(),
+            },
+        )
+
+    if method == 'cardlink':
+        if not settings.is_cardlink_enabled():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Payment method is unavailable')
+        if amount_kopeks is None or amount_kopeks <= 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Amount must be positive')
+        if amount_kopeks < settings.CARDLINK_MIN_AMOUNT_KOPEKS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Amount is below minimum')
+        if amount_kopeks > settings.CARDLINK_MAX_AMOUNT_KOPEKS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Amount exceeds maximum')
+
+        payment_service = PaymentService()
+        result = await payment_service.create_cardlink_payment(
+            db=db,
+            user_id=user.id,
+            amount_kopeks=amount_kopeks,
+            description=settings.get_balance_payment_description(
+                amount_kopeks, telegram_user_id=user.telegram_id, user_db_id=user.id
+            ),
+            language=user.language,
+        )
+        payment_url = result.get('payment_url') if result else None
+        if not result or not payment_url:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail='Failed to create payment')
+
+        return MiniAppPaymentCreateResponse(
+            method=method,
+            payment_url=payment_url,
+            amount_kopeks=amount_kopeks,
+            extra={
+                'local_payment_id': result.get('local_payment_id'),
+                'bill_id': result.get('bill_id'),
+                'payment_id': result.get('bill_id'),
                 'status': result.get('status'),
                 'order_id': result.get('order_id'),
                 'requested_at': _current_request_timestamp(),
@@ -1531,6 +1584,8 @@ async def _resolve_payment_status_entry(
         return await _resolve_mulenpay_payment_status(payment_service, db, user, query)
     if method == 'platega':
         return await _resolve_platega_payment_status(payment_service, db, user, query)
+    if method == 'cardlink':
+        return await _resolve_cardlink_payment_status(payment_service, db, user, query)
     if method == 'wata':
         return await _resolve_wata_payment_status(payment_service, db, user, query)
     if method == 'pal24':
@@ -1763,6 +1818,51 @@ async def _resolve_platega_payment_status(
         external_id=refreshed_payment.platega_transaction_id,
         message=None,
         extra=extra,
+    )
+
+
+async def _resolve_cardlink_payment_status(
+    payment_service: PaymentService,
+    db: AsyncSession,
+    user: User,
+    query: MiniAppPaymentStatusQuery,
+) -> MiniAppPaymentStatusResult:
+    from app.database.crud.cardlink import get_cardlink_payment_by_bill_id, get_cardlink_payment_by_local_id
+
+    payment = None
+    if query.local_payment_id:
+        payment = await get_cardlink_payment_by_local_id(db, query.local_payment_id)
+    elif bill_id := query.payment_id or query.invoice_id or query.payment_link_id:
+        payment = await get_cardlink_payment_by_bill_id(db, bill_id)
+    if not payment or payment.user_id != user.id:
+        return MiniAppPaymentStatusResult(
+            method='cardlink',
+            status='pending',
+            is_paid=False,
+            amount_kopeks=query.amount_kopeks,
+            message='Payment not found',
+        )
+    info = await payment_service.get_cardlink_payment_status(db, payment.id)
+    payment = (info or {}).get('payment') or payment
+    paid = bool(payment.is_paid)
+    provider_status = (payment.status or '').upper()
+    status_value = 'paid' if paid else 'failed' if provider_status in {'FAIL', 'CANCEL', 'EXPIRED'} else 'pending'
+    return MiniAppPaymentStatusResult(
+        method='cardlink',
+        status=status_value,
+        is_paid=paid,
+        amount_kopeks=payment.amount_kopeks,
+        currency=payment.currency,
+        completed_at=payment.paid_at,
+        transaction_id=payment.transaction_id,
+        external_id=payment.bill_id,
+        extra={
+            'local_payment_id': payment.id,
+            'bill_id': payment.bill_id,
+            'payment_id': payment.bill_id,
+            'status': provider_status,
+            'order_id': payment.order_id,
+        },
     )
 
 
@@ -4568,6 +4668,7 @@ def _format_payment_method_title(method: str) -> str:
         'mulenpay': 'MulenPay',
         'pal24': 'Pal24',
         'wata': 'WataPay',
+        'cardlink': settings.get_cardlink_display_name(),
         'heleket': 'Heleket',
         'tribute': 'Tribute',
         'stars': 'Telegram Stars',

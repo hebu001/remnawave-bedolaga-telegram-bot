@@ -233,6 +233,7 @@ def create_unified_app(
         'cryptobot': settings.is_cryptobot_enabled(),
         'yookassa': settings.is_yookassa_enabled(),
         'pal24': settings.is_pal24_enabled(),
+        'cardlink': settings.is_cardlink_enabled(),
         'wata': settings.is_wata_enabled(),
         'heleket': settings.is_heleket_enabled(),
         'apple_iap': settings.is_apple_iap_enabled(),

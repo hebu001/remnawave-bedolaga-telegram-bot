@@ -639,6 +639,35 @@ async def create_topup(
                     detail='Failed to create Wata payment',
                 )
 
+        elif request.payment_method == 'cardlink':
+            if not settings.is_cardlink_enabled():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail='Cardlink payment method is unavailable',
+                )
+
+            payment_service = PaymentService()
+            result = await payment_service.create_cardlink_payment(
+                db=db,
+                user_id=user.id,
+                amount_kopeks=request.amount_kopeks,
+                description=settings.get_balance_payment_description(
+                    request.amount_kopeks, telegram_user_id=user.telegram_id, user_db_id=user.id
+                ),
+                language=getattr(user, 'language', None) or settings.DEFAULT_LANGUAGE,
+                return_url=cabinet_success_url,
+                failed_url=cabinet_failed_url,
+            )
+
+            if result and result.get('payment_url'):
+                payment_url = result.get('payment_url')
+                payment_id = str(result.get('local_payment_id') or result.get('bill_id') or 'pending')
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail='Failed to create Cardlink payment',
+                )
+
         elif request.payment_method == 'cloudpayments':
             if not settings.is_cloudpayments_enabled():
                 raise HTTPException(
@@ -1222,6 +1251,18 @@ def _get_status_info(record: PendingPayment) -> tuple[str, str]:
         }
         return mapping.get(status, ('❓', 'Неизвестно'))
 
+    if record.method == PaymentMethod.CARDLINK:
+        mapping = {
+            'new': ('⏳', 'Ожидает оплаты'),
+            'process': ('⌛', 'Обрабатывается'),
+            'underpaid': ('⏳', 'Оплачено частично'),
+            'success': ('✅', 'Оплачено'),
+            'overpaid': ('✅', 'Оплачено'),
+            'fail': ('❌', 'Отклонено'),
+            'expired': ('⌛', 'Истёк'),
+        }
+        return mapping.get(status, ('❓', 'Неизвестно'))
+
     if record.method == PaymentMethod.WATA:
         mapping = {
             'opened': ('⏳', 'Ожидает оплаты'),
@@ -1417,6 +1458,8 @@ def _is_checkable(record: PendingPayment) -> bool:
         return status in {'new', 'process'}
     if record.method == PaymentMethod.MULENPAY:
         return status in {'created', 'processing', 'hold'}
+    if record.method == PaymentMethod.CARDLINK:
+        return not record.is_paid and status in {'new', 'process', 'underpaid', 'pending', 'created'}
     if record.method == PaymentMethod.WATA:
         return status in {'opened', 'pending', 'processing', 'inprogress', 'in_progress'}
     if record.method == PaymentMethod.PLATEGA:
@@ -1454,7 +1497,7 @@ def _get_payment_url(record: PendingPayment) -> str | None:
 
     if record.method == PaymentMethod.PAL24:
         payment_url = getattr(payment, 'link_url', None) or getattr(payment, 'link_page_url', None) or payment_url
-    elif record.method == PaymentMethod.WATA:
+    elif record.method in {PaymentMethod.WATA, PaymentMethod.CARDLINK}:
         payment_url = getattr(payment, 'url', None) or payment_url
     elif record.method == PaymentMethod.YOOKASSA:
         payment_url = getattr(payment, 'confirmation_url', None) or payment_url
@@ -1554,6 +1597,7 @@ async def get_latest_payment_by_method(
 
     from app.database.models import (
         AuraPayPayment,
+        CardlinkPayment,
         CloudPaymentsPayment,
         CryptoBotPayment,
         FreekassaPayment,
@@ -1577,6 +1621,7 @@ async def get_latest_payment_by_method(
         PaymentMethod.HELEKET: HeleketPayment,
         PaymentMethod.MULENPAY: MulenPayPayment,
         PaymentMethod.PAL24: Pal24Payment,
+        PaymentMethod.CARDLINK: CardlinkPayment,
         PaymentMethod.WATA: WataPayment,
         PaymentMethod.PLATEGA: PlategaPayment,
         PaymentMethod.CLOUDPAYMENTS: CloudPaymentsPayment,

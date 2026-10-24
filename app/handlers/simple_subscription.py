@@ -303,6 +303,14 @@ def _get_simple_subscription_payment_keyboard(language: str) -> types.InlineKeyb
     if settings.is_pal24_enabled():
         keyboard.append([types.InlineKeyboardButton(text='💳 PayPalych', callback_data='simple_subscription_pal24')])
 
+    if settings.is_cardlink_enabled():
+        keyboard.append(
+            [
+                types.InlineKeyboardButton(
+                    text=settings.get_cardlink_display_name(), callback_data='simple_subscription_cardlink'
+                )
+            ]
+        )
     if settings.is_wata_enabled():
         keyboard.append([types.InlineKeyboardButton(text='💳 WATA', callback_data='simple_subscription_wata')])
 
@@ -1686,6 +1694,95 @@ async def handle_simple_subscription_payment_method(
             await callback.answer()
             return
 
+        elif payment_method == 'cardlink':
+            # Оплата через Cardlink
+            if not settings.is_cardlink_enabled():
+                await callback.answer('❌ Оплата через Cardlink временно недоступна', show_alert=True)
+                return
+            if price_kopeks < settings.CARDLINK_MIN_AMOUNT_KOPEKS or price_kopeks > settings.CARDLINK_MAX_AMOUNT_KOPEKS:
+                await callback.answer(
+                    f'❌ Сумма для Cardlink должна быть между {settings.format_price(settings.CARDLINK_MIN_AMOUNT_KOPEKS)} и {settings.format_price(settings.CARDLINK_MAX_AMOUNT_KOPEKS)}.',
+                    show_alert=True,
+                )
+                return
+
+            payment_service = PaymentService(callback.bot)
+            try:
+                cardlink_result = await payment_service.create_cardlink_payment(
+                    db=db,
+                    user_id=db_user.id,
+                    amount_kopeks=price_kopeks,
+                    description=settings.get_subscription_payment_description(
+                        subscription_params['period_days'],
+                        price_kopeks,
+                    ),
+                    language=db_user.language,
+                )
+            except Exception as error:
+                logger.error('Ошибка создания Cardlink платежа', error=error)
+                cardlink_result = None
+
+            if not cardlink_result or not cardlink_result.get('payment_url'):
+                await callback.answer(
+                    texts.t(
+                        'CARDLINK_PAYMENT_ERROR',
+                        '❌ Ошибка создания платежа Cardlink. Попробуйте позже или обратитесь в поддержку.',
+                    ),
+                    show_alert=True,
+                )
+                return
+
+            payment_url = cardlink_result['payment_url']
+            bill_id = cardlink_result.get('bill_id')
+            local_payment_id = cardlink_result.get('local_payment_id')
+
+            keyboard = types.InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        types.InlineKeyboardButton(
+                            text=texts.t('CARDLINK_PAY_BUTTON', '💳 Оплатить через Cardlink'),
+                            url=payment_url,
+                        )
+                    ],
+                    [
+                        types.InlineKeyboardButton(
+                            text=texts.t('CHECK_STATUS_BUTTON', '📊 Проверить статус'),
+                            callback_data=f'check_simple_cardlink_{local_payment_id}',
+                        )
+                    ],
+                    [types.InlineKeyboardButton(text=texts.BACK, callback_data='subscription_purchase')],
+                ]
+            )
+
+            message_template = texts.t(
+                'CARDLINK_PAYMENT_INSTRUCTIONS',
+                (
+                    '💳 <b>Оплата через Cardlink</b>\n\n'
+                    '💰 Сумма: {amount}\n'
+                    '🆔 ID платежа: {payment_id}\n\n'
+                    '📱 <b>Инструкция:</b>\n'
+                    "1. Нажмите кнопку 'Оплатить через Cardlink'\n"
+                    '2. Следуйте подсказкам платежной системы\n'
+                    '3. Подтвердите перевод\n'
+                    '4. Средства зачислятся автоматически\n\n'
+                    '❓ Если возникнут проблемы, обратитесь в {support}'
+                ),
+            )
+
+            await callback.message.edit_text(
+                message_template.format(
+                    amount=settings.format_price(price_kopeks),
+                    payment_id=bill_id,
+                    support=settings.get_support_contact_display_html(),
+                ),
+                reply_markup=keyboard,
+                parse_mode='HTML',
+            )
+
+            await state.clear()
+            await callback.answer()
+            return
+
         else:
             await callback.answer('❌ Неизвестный способ оплаты', show_alert=True)
 
@@ -2475,6 +2572,9 @@ def register_simple_subscription_handlers(dp):
 
     dp.callback_query.register(check_simple_heleket_payment_status, F.data.startswith('check_simple_heleket_'))
 
+    from app.handlers.balance.cardlink import check_cardlink_payment_status
+
+    dp.callback_query.register(check_cardlink_payment_status, F.data.startswith('check_simple_cardlink_'))
     dp.callback_query.register(check_simple_wata_payment_status, F.data.startswith('check_simple_wata_'))
 
     dp.callback_query.register(check_simple_pal24_payment_status, F.data.startswith('check_simple_pal24_'))

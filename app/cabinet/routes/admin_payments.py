@@ -135,6 +135,17 @@ def _get_status_info(record: PendingPayment) -> tuple[str, str]:
         }
         return mapping.get(status_str, ('❓', 'Неизвестно'))
 
+    if record.method == PaymentMethod.CARDLINK:
+        mapping = {
+            'new': ('⏳', 'Ожидает оплаты'),
+            'process': ('⌛', 'Обрабатывается'),
+            'underpaid': ('⏳', 'Оплачено частично'),
+            'success': ('✅', 'Оплачено'),
+            'overpaid': ('✅', 'Оплачено'),
+            'fail': ('❌', 'Ошибка'),
+        }
+        return mapping.get(status_str, ('❓', 'Неизвестно'))
+
     if record.method == PaymentMethod.WATA:
         mapping = {
             'opened': ('⏳', 'Ожидает оплаты'),
@@ -218,6 +229,8 @@ def _is_checkable(record: PendingPayment) -> bool:
         return status_str in {'new', 'process'}
     if record.method == PaymentMethod.MULENPAY:
         return status_str in {'created', 'processing', 'hold'}
+    if record.method == PaymentMethod.CARDLINK:
+        return not record.is_paid
     if record.method == PaymentMethod.WATA:
         return status_str in {'opened', 'pending', 'processing', 'inprogress', 'in_progress'}
     if record.method == PaymentMethod.PLATEGA:
@@ -242,7 +255,7 @@ def _get_payment_url(record: PendingPayment) -> str | None:
 
     if record.method == PaymentMethod.PAL24:
         payment_url = getattr(payment, 'link_url', None) or getattr(payment, 'link_page_url', None) or payment_url
-    elif record.method == PaymentMethod.WATA:
+    elif record.method in {PaymentMethod.WATA, PaymentMethod.CARDLINK}:
         payment_url = getattr(payment, 'url', None) or payment_url
     elif record.method == PaymentMethod.YOOKASSA:
         payment_url = getattr(payment, 'confirmation_url', None) or payment_url

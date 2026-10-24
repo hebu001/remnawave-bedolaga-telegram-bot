@@ -362,7 +362,7 @@ async def try_fulfill_subpage_renewal(
     token = _extract_subpage_invoice_token(metadata)
     if token is None:
         return None
-    if provider_name not in ('wata', 'yookassa') or not provider_payment_id or payment_amount_kopeks <= 0:
+    if provider_name not in ('wata', 'yookassa', 'cardlink') or not provider_payment_id or payment_amount_kopeks <= 0:
         raise ValueError('subpage_payment_invalid')
     try:
         invoice = await db.scalar(select(SubpageInvoice).where(SubpageInvoice.token == token).with_for_update())

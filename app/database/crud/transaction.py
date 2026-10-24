@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database.local_date import as_date, local_date_expr
 from app.database.models import (
+    CardlinkPayment,
     CasheraPayment,
     PaymentMethod,
     Transaction,
@@ -43,11 +44,16 @@ REAL_PAYMENT_METHODS = [m.value for m in PaymentMethod if m.value not in _NON_GA
 def income_payments_query():
     """One row per received payment, never both its deposit and subscription debit.
 
-    WATA/YooKassa/Cashera records also cover gifts and direct purchases without a
+    WATA/YooKassa/Cashera/Cardlink receipts cover gifts and direct purchases without a
     linked transaction. Cashera recurring charges use the ledger: their charge
     UUIDs have no CasheraPayment row. Other gateways retain their existing source.
     Old YooKassa records without captured_at use the completed ledger entry.
     """
+    cardlink = select(
+        CardlinkPayment.amount_kopeks.label('amount_kopeks'),
+        CardlinkPayment.paid_at.label('paid_at'),
+        literal(PaymentMethod.CARDLINK.value).label('payment_method'),
+    ).where(CardlinkPayment.is_paid.is_(True), CardlinkPayment.currency == 'RUB')
     wata = select(
         WataPayment.amount_kopeks.label('amount_kopeks'),
         WataPayment.paid_at.label('paid_at'),
@@ -103,11 +109,15 @@ def income_payments_query():
         Transaction.is_completed.is_(True),
         Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
         Transaction.payment_method.in_(
-            [m for m in REAL_PAYMENT_METHODS if m not in (PaymentMethod.WATA.value, PaymentMethod.YOOKASSA.value)]
+            [
+                m
+                for m in REAL_PAYMENT_METHODS
+                if m not in (PaymentMethod.WATA.value, PaymentMethod.YOOKASSA.value, PaymentMethod.CARDLINK.value)
+            ]
         ),
         or_(Transaction.payment_method != PaymentMethod.CASHERA.value, ~cashera_receipt_exists),
     )
-    return union_all(wata, yookassa, cashera, other_gateways).subquery('income_payments')
+    return union_all(wata, yookassa, cashera, cardlink, other_gateways).subquery('income_payments')
 
 
 async def get_income_total(db: AsyncSession, start_date: datetime, end_date: datetime) -> int:

@@ -160,6 +160,7 @@ class PaymentMethod(Enum):
     MULENPAY = 'mulenpay'
     PAL24 = 'pal24'
     WATA = 'wata'
+    CARDLINK = 'cardlink'
     PLATEGA = 'platega'
     # СБП-автопродление Platega. В базу НЕ пишется: сами списания хранятся
     # обычными транзакциями с методом `platega`, а это значение служит ключом
@@ -609,6 +610,41 @@ class Pal24Payment(Base):
         return (
             f'<Pal24Payment(id={self.id}, bill_id={self.bill_id}, amount={self.amount_rubles}₽, status={self.status})>'
         )
+
+
+class CardlinkPayment(Base):
+    """A verified provider receipt; survives deletion of its optional buyer."""
+
+    __tablename__ = 'cardlink_payments'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    bill_id = Column(String(64), unique=True, nullable=False, index=True)
+    order_id = Column(String(64), unique=True, nullable=False, index=True)
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default='RUB', server_default='RUB')
+    description = Column(Text, nullable=True)
+    status = Column(String(32), nullable=False, default='NEW', server_default='NEW')
+    is_paid = Column(Boolean, nullable=False, default=False, server_default=text('false'))
+    paid_at = Column(AwareDateTime(), nullable=True)
+    url = Column(Text, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+    callback_payload = Column(JSON, nullable=True)
+    expires_at = Column(AwareDateTime(), nullable=True)
+    transaction_id = Column(Integer, ForeignKey('transactions.id'), nullable=True)
+    created_at = Column(AwareDateTime(), default=func.now(), server_default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), server_default=func.now(), onupdate=func.now())
+
+    user = relationship('User', backref='cardlink_payments')
+    transaction = relationship('Transaction', backref='cardlink_payment')
+
+    @property
+    def amount_rubles(self) -> float:
+        return self.amount_kopeks / 100
+
+    @property
+    def payment_url(self) -> str | None:
+        return self.url
 
 
 class WataPayment(Base):

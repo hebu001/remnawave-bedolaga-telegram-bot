@@ -30,7 +30,7 @@ pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(not os.getenv('TEST_POSTGRES_URL'), reason='needs dedicated local PostgreSQL'),
 ]
-HEAD = 'evo_0110'
+HEAD = 'evo_0111'
 
 
 async def upgrade_runtime(connection, schema):

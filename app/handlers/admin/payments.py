@@ -34,6 +34,8 @@ def _method_display(method: PaymentMethod) -> str:
         return settings.get_mulenpay_display_name()
     if method == PaymentMethod.PAL24:
         return 'PayPalych'
+    if method == PaymentMethod.CARDLINK:
+        return settings.get_cardlink_display_name()
     if method == PaymentMethod.WATA:
         return 'WATA'
     if method == PaymentMethod.HELEKET:
@@ -95,6 +97,17 @@ def _status_info(
             'canceled': ('❌', texts.t('ADMIN_PAYMENT_STATUS_CANCELED', '❌ Cancelled')),
             'cancel': ('❌', texts.t('ADMIN_PAYMENT_STATUS_CANCELED', '❌ Cancelled')),
             'error': ('⚠️', texts.t('ADMIN_PAYMENT_STATUS_FAILED', '❌ Failed')),
+        }
+        return mapping.get(status, ('❓', texts.t('ADMIN_PAYMENT_STATUS_UNKNOWN', '❓ Unknown')))
+
+    if record.method == PaymentMethod.CARDLINK:
+        mapping = {
+            'new': ('⏳', texts.t('ADMIN_PAYMENT_STATUS_PENDING', '⏳ Pending')),
+            'process': ('⌛', texts.t('ADMIN_PAYMENT_STATUS_PROCESSING', '⌛ Processing')),
+            'underpaid': ('⏳', texts.t('ADMIN_PAYMENT_STATUS_UNDERPAID', 'Оплачено частично')),
+            'success': ('✅', texts.t('ADMIN_PAYMENT_STATUS_PAID', '✅ Paid')),
+            'overpaid': ('✅', texts.t('ADMIN_PAYMENT_STATUS_PAID', '✅ Paid')),
+            'fail': ('❌', texts.t('ADMIN_PAYMENT_STATUS_FAILED', '❌ Failed')),
         }
         return mapping.get(status, ('❓', texts.t('ADMIN_PAYMENT_STATUS_UNKNOWN', '❓ Unknown')))
 
@@ -189,6 +202,8 @@ def _is_checkable(record: PendingPayment) -> bool:
         return status in {'new', 'process'}
     if record.method == PaymentMethod.MULENPAY:
         return status in {'created', 'processing', 'hold'}
+    if record.method == PaymentMethod.CARDLINK:
+        return not record.is_paid
     if record.method == PaymentMethod.WATA:
         return status in {'opened', 'pending', 'processing', 'inprogress', 'in_progress'}
     if record.method == PaymentMethod.PLATEGA:
@@ -305,7 +320,7 @@ def _build_detail_keyboard(
     payment_url = getattr(payment, 'payment_url', None)
     if record.method == PaymentMethod.PAL24:
         payment_url = payment.link_url or payment.link_page_url or payment_url
-    elif record.method == PaymentMethod.WATA:
+    elif record.method in {PaymentMethod.WATA, PaymentMethod.CARDLINK}:
         payment_url = payment.url or payment_url
     elif record.method == PaymentMethod.YOOKASSA:
         payment_url = getattr(payment, 'confirmation_url', None) or payment_url
@@ -437,7 +452,7 @@ def _build_payment_details_text(record: PendingPayment, *, texts, language: str)
                 f'🧾 {texts.t("ADMIN_PAYMENT_GATEWAY_ID", "Gateway ID")}: {html.escape(str(payment.mulen_payment_id))}'
             )
 
-    if record.method == PaymentMethod.WATA:
+    if record.method in {PaymentMethod.WATA, PaymentMethod.CARDLINK}:
         if getattr(payment, 'order_id', None):
             lines.append(
                 f'🧾 {texts.t("ADMIN_PAYMENT_GATEWAY_ID", "Gateway ID")}: {html.escape(str(payment.order_id))}'

@@ -101,7 +101,7 @@ async def _rate_limit(request: Request, action: str, limit: int, window: int) ->
 
 
 # Providers wired into the subpage flow (invoice creation + webhook hook)
-SUBPAGE_SUPPORTED_METHODS = ('yookassa', 'wata')
+SUBPAGE_SUPPORTED_METHODS = ('yookassa', 'wata', 'cardlink')
 
 
 async def _available_methods(db: AsyncSession, user) -> list[SubpageMethod]:
@@ -236,6 +236,8 @@ async def create_subpage_invoice(
 
     if body.method == 'yookassa':
         min_amount, max_amount = settings.YOOKASSA_MIN_AMOUNT_KOPEKS, settings.YOOKASSA_MAX_AMOUNT_KOPEKS
+    elif body.method == 'cardlink':
+        min_amount, max_amount = settings.CARDLINK_MIN_AMOUNT_KOPEKS, settings.CARDLINK_MAX_AMOUNT_KOPEKS
     else:
         min_amount, max_amount = settings.WATA_MIN_AMOUNT_KOPEKS, settings.WATA_MAX_AMOUNT_KOPEKS
     if amount_kopeks < min_amount or amount_kopeks > max_amount:
@@ -281,7 +283,12 @@ async def create_subpage_invoice(
         payment_url = result.get('confirmation_url') if result else None
         provider_payment_id = str(result.get('yookassa_payment_id') or '') if result else ''
     else:
-        result = await payment_service.create_wata_payment(
+        create = (
+            payment_service.create_cardlink_payment
+            if body.method == 'cardlink'
+            else payment_service.create_wata_payment
+        )
+        result = await create(
             db=db,
             user_id=user.id,
             amount_kopeks=amount_kopeks,
@@ -292,7 +299,9 @@ async def create_subpage_invoice(
             metadata=metadata,
         )
         payment_url = result.get('payment_url') if result else None
-        provider_payment_id = str(result.get('payment_link_id') or '') if result else ''
+        provider_payment_id = (
+            str(result.get('bill_id' if body.method == 'cardlink' else 'payment_link_id') or '') if result else ''
+        )
     if not result or not payment_url or not provider_payment_id:
         logger.error('Subpage: payment creation failed', short_uuid=short_uuid, method=body.method)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Payment provider error')

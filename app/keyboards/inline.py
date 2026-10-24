@@ -1842,6 +1842,16 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
             ]
         )
         has_direct_payment_methods = True
+    if settings.is_cardlink_enabled():
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=settings.get_cardlink_display_name(),
+                    callback_data=_build_callback('cardlink'),
+                )
+            ]
+        )
+        has_direct_payment_methods = True
 
     if settings.is_pal24_enabled():
         keyboard.append(

@@ -755,6 +755,14 @@ def _get_trial_payment_keyboard(language: str, can_pay_from_balance: bool = Fals
     if settings.is_pal24_enabled():
         keyboard.append([types.InlineKeyboardButton(text='💳 PayPalych', callback_data='trial_payment_pal24')])
 
+    if settings.is_cardlink_enabled():
+        keyboard.append(
+            [
+                types.InlineKeyboardButton(
+                    text=settings.get_cardlink_display_name(), callback_data='trial_payment_cardlink'
+                )
+            ]
+        )
     if settings.is_wata_enabled():
         keyboard.append([types.InlineKeyboardButton(text='💳 WATA', callback_data='trial_payment_wata')])
 
@@ -3699,6 +3707,12 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
 
     # Определяем метод оплаты
     payment_method = callback.data.replace('trial_payment_', '')
+    if payment_method == 'cardlink' and (
+        not settings.is_cardlink_enabled()
+        or not settings.CARDLINK_MIN_AMOUNT_KOPEKS <= trial_price_kopeks <= settings.CARDLINK_MAX_AMOUNT_KOPEKS
+    ):
+        await callback.answer('❌ Этот способ оплаты недоступен для выбранной суммы', show_alert=True)
+        return
 
     try:
         payment_service = PaymentService(callback.bot)
@@ -4071,6 +4085,42 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
                             InlineKeyboardButton(
                                 text=texts.t('CHECK_PAYMENT', '🔄 Проверить оплату'),
                                 callback_data=f'check_trial_wata_{pending_subscription.id}',
+                            )
+                        ],
+                        [InlineKeyboardButton(text=texts.BACK, callback_data='trial_activate')],
+                    ]
+                ),
+                parse_mode='HTML',
+            )
+
+        elif payment_method == 'cardlink':
+            # Оплата через Cardlink
+            payment_result = await payment_service.create_cardlink_payment(
+                db=db,
+                user_id=db_user.id,
+                amount_kopeks=trial_price_kopeks,
+                description=texts.t('PAID_TRIAL_PAYMENT_DESC', 'Пробная подписка на {days} дней').format(
+                    days=trial_duration
+                ),
+                language=db_user.language,
+            )
+
+            if not payment_result or not payment_result.get('payment_url'):
+                await callback.answer('❌ Не удалось создать платеж. Попробуйте позже.', show_alert=True)
+                return
+
+            await callback.message.edit_text(
+                texts.t(
+                    'PAID_TRIAL_CARDLINK',
+                    '💳 <b>Оплата через Cardlink</b>\n\nНажмите кнопку ниже для перехода к оплате.\n\n💰 Сумма: {amount}',
+                ).format(amount=settings.format_price(trial_price_kopeks)),
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text='💳 Оплатить', url=payment_result['payment_url'])],
+                        [
+                            InlineKeyboardButton(
+                                text=texts.t('CHECK_PAYMENT', '🔄 Проверить оплату'),
+                                callback_data=f'check_cardlink_{payment_result["local_payment_id"]}',
                             )
                         ],
                         [InlineKeyboardButton(text=texts.BACK, callback_data='trial_activate')],

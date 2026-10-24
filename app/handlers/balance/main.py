@@ -90,6 +90,13 @@ async def route_payment_by_method(
             await process_platega_payment_amount(message, db_user, db, amount_kopeks, state)
         return True
 
+    if payment_method == 'cardlink':
+        from .cardlink import process_cardlink_payment_amount
+
+        async with AsyncSessionLocal() as db:
+            await process_cardlink_payment_amount(message, db_user, db, amount_kopeks, state)
+        return True
+
     if payment_method == 'wata':
         from .wata import process_wata_payment_amount
 
@@ -768,6 +775,10 @@ def register_balance_handlers(dp: Dispatcher):
 
     dp.callback_query.register(start_mulenpay_payment, F.data == 'topup_mulenpay')
 
+    from .cardlink import start_cardlink_payment
+
+    dp.callback_query.register(start_cardlink_payment, F.data == 'topup_cardlink')
+
     from .wata import start_wata_payment
 
     dp.callback_query.register(start_wata_payment, F.data == 'topup_wata')
@@ -951,6 +962,10 @@ def register_balance_handlers(dp: Dispatcher):
     from .mulenpay import check_mulenpay_payment_status
 
     dp.callback_query.register(check_mulenpay_payment_status, F.data.startswith('check_mulenpay_'))
+
+    from .cardlink import check_cardlink_payment_status
+
+    dp.callback_query.register(check_cardlink_payment_status, F.data.startswith('check_cardlink_'))
 
     from .wata import check_wata_payment_status
 
