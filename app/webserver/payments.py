@@ -808,7 +808,9 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                 )
 
             try:
-                payload = json.loads(raw_body)
+                # Preserve signed decimal amounts until exact kopek validation;
+                # binary float decoding can round a mismatching amount to match.
+                payload = json.loads(raw_body, parse_float=str)
             except json.JSONDecodeError, UnicodeDecodeError:
                 return JSONResponse(
                     {'status': 'error', 'reason': 'invalid_json'},

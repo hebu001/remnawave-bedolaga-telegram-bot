@@ -85,6 +85,8 @@ class CardlinkPaymentMixin:
         Only a complete authenticated API bill that matches this immutable local
         order may authorize money movement. Never infer status from a callback.
         """
+        if not isinstance(bill, dict):
+            return False
         try:
             return (
                 bill.get('id') == payment.bill_id
@@ -92,7 +94,7 @@ class CardlinkPaymentMixin:
                 and bill.get('currency_in') == payment.currency == 'RUB'
                 and bill.get('type') == 'NORMAL'
                 and money_to_kopeks(bill.get('amount')) == payment.amount_kopeks
-                and isinstance(bill.get('status'), str)
+                and bill.get('status') in ('NEW', 'PROCESS', 'UNDERPAID', 'SUCCESS', 'OVERPAID', 'FAIL')
             )
         except ValueError, TypeError, CardlinkAPIError:
             return False
@@ -171,6 +173,11 @@ class CardlinkPaymentMixin:
         bill: dict[str, Any],
     ) -> CardlinkPayment:
         """Caller holds the receipt row lock through ledger and balance commit."""
+        # _sync already authenticates and validates the API bill. Repeat the
+        # settlement invariant here so another internal caller cannot persist a
+        # paid receipt or dispatch guest/subpage fulfillment with weaker proof.
+        if not self._validate_cardlink_bill(payment, bill) or bill['status'] not in ('SUCCESS', 'OVERPAID'):
+            raise ValueError('cardlink_payment_evidence_mismatch')
         payment_module = import_module('app.services.payment_service')
         metadata = dict(payment.metadata_json or {})
         purpose = metadata.get('purpose')

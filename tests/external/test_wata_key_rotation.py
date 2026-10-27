@@ -452,3 +452,26 @@ async def test_aiohttp_rotated_key_processes_payment_exactly_once(monkeypatch, k
     db.commit.assert_awaited_once()
     db.rollback.assert_not_awaited()
     assert provider.calls == 2
+
+
+async def test_aiohttp_signature_verification_preserves_exact_decimal_amount(monkeypatch, keys):
+    monkeypatch.setattr(type(wata_module.settings), 'is_wata_enabled', lambda self: True)
+    body = b'{"amount":150.000000000000001,"currency":"RUB","transactionStatus":"Paid"}'
+    db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+
+    class Session:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(wata_module, 'AsyncSessionLocal', Session)
+    service = SimpleNamespace(process_wata_webhook=AsyncMock(return_value=True))
+    provider = QueueProvider([pem(keys[0])], clock=Clock())
+    request = SimpleNamespace(read=AsyncMock(return_value=body), headers={'X-Signature': sign(keys[0], body)})
+    response = await WataWebhookHandler(service, public_key_provider=provider).handle_webhook(request)
+    assert response.status == 200
+    service.process_wata_webhook.assert_awaited_once_with(
+        db, {'amount': '150.000000000000001', 'currency': 'RUB', 'transactionStatus': 'Paid'}
+    )

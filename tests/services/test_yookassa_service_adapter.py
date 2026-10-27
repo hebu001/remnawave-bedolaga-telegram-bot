@@ -19,6 +19,7 @@ from yookassa import Configuration, Payment as YooKassaPayment  # type: ignore
 
 from app.config import settings
 from app.services.yookassa_service import YooKassaService
+from app.utils.yookassa_payment_validation import YooKassaResponseValidationError
 
 
 @pytest.fixture
@@ -74,11 +75,9 @@ async def test_create_payment_success(monkeypatch: pytest.MonkeyPatch) -> None:
         test=False,
     )
 
+    response_obj._evo_raw_amount = {'value': response_obj.amount.value, 'currency': response_obj.amount.currency}
     monkeypatch.setattr(
-        YooKassaPayment,
-        'create',
-        staticmethod(lambda payload, key: response_obj),
-        raising=False,
+        'app.services.yookassa_service._request_verified_yookassa_payment', lambda **kwargs: response_obj
     )
 
     service = YooKassaService()
@@ -97,7 +96,7 @@ async def test_create_payment_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result is not None
     assert result['id'] == 'yk_1'
     assert result['confirmation_url'] == 'https://yk/confirm'
-    assert result['amount_value'] == 140.0
+    assert result['amount_value'] == '140.00'
     assert result['status'] == 'pending'
 
 
@@ -159,11 +158,9 @@ async def test_create_sbp_payment_success(monkeypatch: pytest.MonkeyPatch) -> No
         test=True,
     )
 
+    response_obj._evo_raw_amount = {'value': response_obj.amount.value, 'currency': response_obj.amount.currency}
     monkeypatch.setattr(
-        YooKassaPayment,
-        'create',
-        staticmethod(lambda payload, key: response_obj),
-        raising=False,
+        'app.services.yookassa_service._request_verified_yookassa_payment', lambda **kwargs: response_obj
     )
 
     service = YooKassaService()
@@ -179,3 +176,68 @@ async def test_create_sbp_payment_success(monkeypatch: pytest.MonkeyPatch) -> No
     assert result['id'] == 'sbp_001'
     assert result['confirmation_url'] == 'https://sbp/confirm'
     assert result['status'] == 'pending'
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('method', ['create_payment', 'create_sbp_payment', 'create_autopayment'])
+@pytest.mark.parametrize(
+    'value,currency',
+    [
+        ('0.01', 'RUB'),
+        ('100.02', 'RUB'),
+        ('100.01', 'USD'),
+        ('100.0101', 'RUB'),
+        ('NaN', 'RUB'),
+        (None, 'RUB'),
+        (True, 'RUB'),
+    ],
+)
+async def test_creation_rejects_provider_amount_or_currency_mismatch(monkeypatch, method, value, currency):
+    _prepare_config(monkeypatch)
+    monkeypatch.setattr(asyncio, 'get_running_loop', DummyLoop)
+    monkeypatch.setattr(Configuration, 'configure', lambda *args, **kwargs: None)
+    response = SimpleNamespace(
+        id='yk-bad', status='succeeded', paid=True, amount=SimpleNamespace(value=value, currency=currency)
+    )
+    response._evo_raw_amount = {'value': value, 'currency': currency}
+    monkeypatch.setattr('app.services.yookassa_service._request_verified_yookassa_payment', lambda **kwargs: response)
+    service = YooKassaService()
+    args = dict(amount=100.01, currency='RUB', description='Order', metadata={}, receipt_email='test@example.com')
+    if method == 'create_autopayment':
+        args['payment_method_id'] = 'saved-card'
+        monkeypatch.setattr(
+            'app.services.yookassa_service.PaymentRequestBuilder.set_payment_method_id',
+            lambda self, value: None,
+            raising=False,
+        )
+    if method == 'create_autopayment':
+        with pytest.raises(YooKassaResponseValidationError):
+            await getattr(service, method)(**args)
+    else:
+        assert await getattr(service, method)(**args) is None
+
+
+@pytest.mark.anyio
+async def test_get_payment_info_preserves_exact_decimal_amount_and_authenticated_method(monkeypatch):
+    _prepare_config(monkeypatch)
+    monkeypatch.setattr(asyncio, 'get_running_loop', DummyLoop)
+    monkeypatch.setattr(Configuration, 'configure', lambda *args, **kwargs: None)
+    response = SimpleNamespace(
+        id='yk-precise',
+        status='succeeded',
+        paid=True,
+        amount=SimpleNamespace(value='100.01', currency='RUB'),
+        metadata={'user_id': '21'},
+        description='Order',
+        refundable=True,
+        created_at=datetime(2026, 10, 27, tzinfo=UTC),
+        captured_at=None,
+        test=False,
+        payment_method=SimpleNamespace(type='bank_card', id='api-saved-card', saved=True, card=None),
+    )
+    response._evo_raw_amount = {'value': '100.01', 'currency': 'RUB'}
+    monkeypatch.setattr('app.services.yookassa_service._request_verified_yookassa_payment', lambda **kwargs: response)
+    result = await YooKassaService().get_payment_info('yk-precise')
+    assert result['amount_value'] == '100.01'
+    assert result['payment_method_id'] == 'api-saved-card'
+    assert result['payment_method_saved'] is True

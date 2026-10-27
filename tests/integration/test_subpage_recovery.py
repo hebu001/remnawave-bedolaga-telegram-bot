@@ -418,16 +418,35 @@ async def test_provider_routes_linked_payment_to_unfinished_subpage_order(sessio
         db.add(payment)
         await db.commit()
         if method == 'wata':
-            result = await WataPaymentMixin().process_wata_webhook(
-                db,
-                {
-                    'orderId': invoice['token'],
-                    'paymentLinkId': invoice['external_id'],
-                    'transactionStatus': 'Paid',
-                },
+            payload = {
+                'orderId': invoice['token'],
+                'paymentLinkId': invoice['external_id'],
+                'transactionStatus': 'Paid',
+                'transactionId': f'{invoice["token"]}-transaction',
+                'kind': 'Payment',
+                'amount': f'{invoice["amount"] // 100}.{invoice["amount"] % 100:02d}',
+                'currency': 'RUB',
+            }
+            service = WataPaymentMixin()
+            service.wata_service = SimpleNamespace(
+                get_transaction=AsyncMock(return_value={**payload, 'id': payload['transactionId'], 'status': 'Paid'})
             )
+            result = await service.process_wata_webhook(db, payload)
         else:
-            result = await YooKassaPaymentMixin()._process_successful_yookassa_payment(db, payment)
+            service = YooKassaPaymentMixin()
+            service.yookassa_service = SimpleNamespace(
+                get_payment_info=AsyncMock(
+                    return_value={
+                        'id': payment.yookassa_payment_id,
+                        'status': 'succeeded',
+                        'paid': True,
+                        'amount_value': f'{invoice["amount"] // 100}.{invoice["amount"] % 100:02d}',
+                        'amount_currency': 'RUB',
+                        'test_mode': False,
+                    }
+                )
+            )
+            result = await service._process_successful_yookassa_payment(db, payment)
         assert result is True
     state = await snapshot(sessions)
     assert state['users'][0][1] == 50000
@@ -461,17 +480,36 @@ async def test_provider_does_not_acknowledge_database_error(sessions, order_cont
         db.add(payment)
         await db.commit()
         if method == 'wata':
+            payload = {
+                'orderId': invoice['token'],
+                'paymentLinkId': invoice['external_id'],
+                'transactionStatus': 'Paid',
+                'transactionId': f'{invoice["token"]}-transaction',
+                'kind': 'Payment',
+                'amount': f'{invoice["amount"] // 100}.{invoice["amount"] % 100:02d}',
+                'currency': 'RUB',
+            }
+            service = WataPaymentMixin()
+            service.wata_service = SimpleNamespace(
+                get_transaction=AsyncMock(return_value={**payload, 'id': payload['transactionId'], 'status': 'Paid'})
+            )
             with pytest.raises(DBAPIError):
-                await WataPaymentMixin().process_wata_webhook(
-                    db,
-                    {
-                        'orderId': invoice['token'],
-                        'paymentLinkId': invoice['external_id'],
-                        'transactionStatus': 'Paid',
-                    },
-                )
+                await service.process_wata_webhook(db, payload)
         else:
-            assert await YooKassaPaymentMixin()._process_successful_yookassa_payment(db, payment) is False
+            service = YooKassaPaymentMixin()
+            service.yookassa_service = SimpleNamespace(
+                get_payment_info=AsyncMock(
+                    return_value={
+                        'id': payment.yookassa_payment_id,
+                        'status': 'succeeded',
+                        'paid': True,
+                        'amount_value': f'{invoice["amount"] // 100}.{invoice["amount"] % 100:02d}',
+                        'amount_currency': 'RUB',
+                        'test_mode': False,
+                    }
+                )
+            )
+            assert await service._process_successful_yookassa_payment(db, payment) is False
     assert (await order_state(sessions, invoice['token']))[0] == 'paid'
     assert (await snapshot(sessions))['ledger'] == []
 

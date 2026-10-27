@@ -5,7 +5,9 @@ from __future__ import annotations
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -251,6 +253,11 @@ async def test_process_wata_webhook_updates_status(monkeypatch: pytest.MonkeyPat
         'orderId': payment.order_id,
         'transactionStatus': 'Declined',
         'terminalPublicId': 'terminal-001',
+        'paymentLinkId': payment.payment_link_id,
+        'transactionId': 'tx-declined',
+        'amount': '150.00',
+        'currency': 'RUB',
+        'kind': 'Payment',
     }
 
     processed = await service.process_wata_webhook(db, payload)
@@ -261,7 +268,8 @@ async def test_process_wata_webhook_updates_status(monkeypatch: pytest.MonkeyPat
     assert payment.is_paid is False
     assert payment.metadata_json.get('last_webhook') == payload
     assert payment.callback_payload == payload
-    assert payment.terminal_public_id == 'terminal-001'
+    # Nonfinal callbacks never overwrite the immutable expected terminal.
+    assert payment.terminal_public_id is None
     assert update_kwargs['status'] == 'Declined'
     assert update_kwargs['is_paid'] is False
 
@@ -334,9 +342,16 @@ async def test_process_wata_webhook_finalizes_paid(monkeypatch: pytest.MonkeyPat
 
     payload = {
         'orderId': payment.order_id,
+        'paymentLinkId': payment.payment_link_id,
         'transactionStatus': 'Paid',
         'transactionId': 'tx-001',
+        'amount': '150.00',
+        'currency': 'RUB',
+        'kind': 'Payment',
     }
+    transaction = {**payload, 'id': 'tx-001', 'status': 'Paid'}
+    transaction.pop('transactionStatus')
+    service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=transaction))
 
     processed = await service.process_wata_webhook(db, payload)
 

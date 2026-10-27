@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json as json_module
 import re
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any
 
 import aiohttp
@@ -131,7 +133,7 @@ class WataService:
                         return {}
 
                     try:
-                        data = await response.json()
+                        data = await response.json(loads=partial(json_module.loads, parse_float=str))
                     except aiohttp.ContentTypeError as error:
                         logger.error('WATA API returned non-JSON response', error=error)
                         raise WataAPIError('WATA API returned invalid JSON') from error

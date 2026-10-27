@@ -594,6 +594,7 @@ async def test_process_yookassa_webhook_success(monkeypatch: pytest.MonkeyPatch)
         yookassa_payment_id='yk_123',
         user_id=21,
         amount_kopeks=10000,
+        currency='RUB',
         transaction_id=None,
         status='pending',
         is_paid=False,
@@ -678,7 +679,17 @@ async def test_process_yookassa_webhook_success(monkeypatch: pytest.MonkeyPatch)
     service.build_topup_success_keyboard = AsyncMock(return_value=None)
     # Подтверждение API обязательно: без него тело вебхука не используется.
     service.yookassa_service = SimpleNamespace(
-        get_payment_info=AsyncMock(return_value={'id': 'yk_123', 'status': 'succeeded', 'paid': True})
+        get_payment_info=AsyncMock(
+            return_value={
+                'id': 'yk_123',
+                'status': 'succeeded',
+                'paid': True,
+                'amount_value': '100.00',
+                'amount_currency': 'RUB',
+                'test_mode': False,
+                'payment_method_type': 'bank_card',
+            }
+        )
     )
 
     payload = {
@@ -711,6 +722,7 @@ async def test_process_yookassa_webhook_uses_remote_status(monkeypatch: pytest.M
         yookassa_payment_id='yk_789',
         user_id=42,
         amount_kopeks=20000,
+        currency='RUB',
         transaction_id=None,
         status='pending',
         is_paid=False,
@@ -796,8 +808,9 @@ async def test_process_yookassa_webhook_uses_remote_status(monkeypatch: pytest.M
         'id': 'yk_789',
         'status': 'succeeded',
         'paid': True,
-        'amount_value': 200.0,
-        'amount_currency': 'rub',
+        'amount_value': '200.00',
+        'amount_currency': 'RUB',
+        'test_mode': False,
         'payment_method_type': 'bank_card',
         'refundable': True,
     }
@@ -833,6 +846,7 @@ async def test_process_yookassa_webhook_handles_cancellation(monkeypatch: pytest
         yookassa_payment_id='yk_cancel',
         user_id=77,
         amount_kopeks=5000,
+        currency='RUB',
         transaction_id=None,
         status='pending',
         is_paid=False,
@@ -853,8 +867,9 @@ async def test_process_yookassa_webhook_handles_cancellation(monkeypatch: pytest
             'id': 'yk_cancel',
             'status': 'canceled',
             'paid': False,
-            'amount_value': 50.0,
+            'amount_value': '50.00',
             'amount_currency': 'RUB',
+            'test_mode': False,
         }
     )
     service.yookassa_service = SimpleNamespace(get_payment_info=get_info_mock)
@@ -891,6 +906,7 @@ async def test_process_yookassa_webhook_restores_missing_payment(
         yookassa_payment_id='yk_456',
         user_id=21,
         amount_kopeks=0,
+        currency='RUB',
         status='pending',
         is_paid=False,
         transaction_id=None,
@@ -1017,8 +1033,9 @@ async def test_process_yookassa_webhook_restores_missing_payment(
                 'id': 'yk_456',
                 'status': 'succeeded',
                 'paid': True,
-                'amount_value': 150.0,
+                'amount_value': '150.00',
                 'amount_currency': 'RUB',
+                'test_mode': False,
                 'metadata': {'user_id': '21', 'payment_purpose': 'balance_topup'},
             }
         )
@@ -1164,6 +1181,7 @@ async def test_process_yookassa_webhook_skip_ip_credits_when_confirmed(monkeypat
         yookassa_payment_id='yk_ok',
         user_id=21,
         amount_kopeks=10000,
+        currency='RUB',
         transaction_id=None,
         status='pending',
         is_paid=False,
@@ -1247,8 +1265,9 @@ async def test_process_yookassa_webhook_skip_ip_credits_when_confirmed(monkeypat
             'id': 'yk_ok',
             'status': 'succeeded',
             'paid': True,
-            'amount_value': 100.0,
+            'amount_value': '100.00',
             'amount_currency': 'RUB',
+            'test_mode': False,
             'payment_method_type': 'bank_card',
             'refundable': True,
         }

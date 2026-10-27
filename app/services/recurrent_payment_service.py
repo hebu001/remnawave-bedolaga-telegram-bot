@@ -25,6 +25,7 @@ from app.database.models import (
     UserPromoGroup,
 )
 from app.utils.miniapp_buttons import build_subscription_extend_button
+from app.utils.yookassa_payment_validation import YooKassaResponseValidationError
 
 
 logger = structlog.get_logger(__name__)
@@ -143,6 +144,9 @@ async def process_recurrent_payments(db: AsyncSession, bot: Bot | None = None) -
                 elif result == 'all_cards_failed':
                     stats['all_cards_failed'] += 1
                     _daily_guard.mark_processed(guard_key)
+                elif result == 'error':
+                    stats['errors'] += 1
+                    _daily_guard.mark_processed(guard_key)
                 elif result == 'skipped':
                     stats['already_processed'] += 1
             except Exception as e:
@@ -239,6 +243,7 @@ async def _process_single_subscription(
         'no_card' — нет сохранённой карты
         'all_cards_failed' — все карты не сработали
         'skipped' — баланс достаточен или другая причина пропуска
+        'error' — противоречивый ответ API, попытки списания остановлены
     """
     from app.database.crud.saved_payment_method import get_active_payment_methods_by_user
 
@@ -319,14 +324,25 @@ async def _process_single_subscription(
     for saved_method in saved_methods:
         # Детерминированный ключ: при рестарте/повторе YooKassa вернёт тот же платёж
         idem_key = f'recurrent_{subscription.id}_{saved_method.id}_{today}'
-        result = await yookassa_service.create_autopayment(
-            amount=topup_amount_rubles,
-            currency='RUB',
-            description=description,
-            payment_method_id=saved_method.yookassa_payment_method_id,
-            metadata=metadata,
-            idempotence_key=idem_key,
-        )
+        try:
+            result = await yookassa_service.create_autopayment(
+                amount=topup_amount_rubles,
+                currency='RUB',
+                description=description,
+                payment_method_id=saved_method.yookassa_payment_method_id,
+                metadata=metadata,
+                idempotence_key=idem_key,
+            )
+        except YooKassaResponseValidationError:
+            # The provider may have charged a card (including an older payment
+            # returned for the daily idempotency key). Never try another card
+            # after a contradictory response; leave resolution to a later check.
+            logger.error(
+                'YooKassa recurrent payment response mismatch; stopping card attempts',
+                user_id=user.id,
+                subscription_id=subscription.id,
+            )
+            return 'error'
 
         if not result:
             card_display = f'*{saved_method.card_last4}' if saved_method.card_last4 else ''

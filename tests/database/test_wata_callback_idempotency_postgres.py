@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -57,7 +58,9 @@ async def _create_payment(db: Any, order_id: str) -> tuple[int, int, dict[str, A
         url='https://pay.example.test/wata',
     )
     payload = {
-        'id': f'{order_id}-transaction',
+        'id': payment.payment_link_id,
+        'transactionId': f'{order_id}-transaction',
+        'kind': 'Payment',
         'orderId': order_id,
         'paymentLinkId': payment.payment_link_id,
         'transactionStatus': 'Paid',
@@ -66,6 +69,12 @@ async def _create_payment(db: Any, order_id: str) -> tuple[int, int, dict[str, A
         'paymentTime': datetime.now(UTC).isoformat(),
     }
     return user.id, payment.id, payload
+
+
+def _api_transaction(payload: dict[str, Any]) -> dict[str, Any]:
+    transaction = {**payload, 'id': payload['transactionId'], 'status': payload['transactionStatus']}
+    transaction.pop('transactionStatus')
+    return transaction
 
 
 async def _deliver(service: PaymentService, db: Any, payload: dict[str, Any]) -> bool:
@@ -100,7 +109,7 @@ async def _assert_one_credit_and_receipt(db: Any, user_id: int, payment_id: int,
     assert deposit.type == TransactionType.DEPOSIT.value
     assert deposit.amount_kopeks == AMOUNT_KOPEKS
     assert deposit.is_completed is True
-    assert deposit.external_id == payload['id']
+    assert deposit.external_id == payload['transactionId']
 
     paid_receipts = (
         (await db.execute(select(WataPayment).where(WataPayment.user_id == user_id, WataPayment.is_paid.is_(True))))
@@ -113,7 +122,7 @@ async def _assert_one_credit_and_receipt(db: Any, user_id: int, payment_id: int,
     assert receipt.transaction_id == deposit.id
     assert receipt.status == 'Paid'
     assert receipt.amount_kopeks == AMOUNT_KOPEKS
-    assert receipt.callback_payload == payload
+    assert receipt.callback_payload == _api_transaction(payload)
     assert receipt.paid_at is not None
 
     # Fork income contracts count the confirmed WATA receipt once; adding its
@@ -131,6 +140,7 @@ async def test_repeated_paid_wata_callback_credits_and_counts_income_once(postgr
 
     async with postgres_sessions(postgres_database, TABLES, count=2) as (db, watcher):
         user_id, payment_id, payload = await _create_payment(db, 'wata-replay')
+        service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=_api_transaction(payload)))
         for _ in range(4):
             assert await _deliver(service, db, payload) is True
 
@@ -145,6 +155,7 @@ async def test_competing_paid_wata_callbacks_credit_and_count_income_once(postgr
 
     async with postgres_sessions(postgres_database, TABLES, count=3) as (first, second, watcher):
         user_id, payment_id, payload = await _create_payment(first, 'wata-concurrent')
+        service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=_api_transaction(payload)))
         original_lock = wata_crud.get_wata_payment_by_id_for_update
         holder_has_the_row = asyncio.Event()
         entries = 0
@@ -172,3 +183,82 @@ async def test_competing_paid_wata_callbacks_credit_and_count_income_once(postgr
         assert entries == 2
         assert race_observed, 'The second actual callback never queued behind the payment row lock'
         notification.assert_awaited_once()
+
+
+@pytest.mark.parametrize('source', ['callback', 'api'])
+@pytest.mark.parametrize(('field', 'value'), [('amount', '1.00'), ('currency', 'USD')])
+async def test_mismatched_wata_evidence_does_not_persist_receipt_or_credit(
+    postgres_database, monkeypatch, source, field, value
+) -> None:
+    notification = AsyncMock()
+    monkeypatch.setattr(event_emitter, 'emit', notification)
+    service = PaymentService(bot=None)
+
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, watcher):
+        user_id, payment_id, payload = await _create_payment(db, f'wata-reject-{source}-{field}')
+        api_payload = _api_transaction(payload)
+        service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=api_payload))
+        incoming = dict(payload)
+        if source == 'callback':
+            incoming[field] = value
+        else:
+            service.wata_service.get_transaction.return_value = {**api_payload, field: value}
+        assert await service.process_wata_webhook(db, incoming) is False
+        # Real webhook wrappers commit even a False return; rejection must leave
+        # no dirty receipt, balance, ledger, or recovery marker to persist.
+        await db.commit()
+        watcher.expunge_all()
+        rejected = await watcher.get(WataPayment, payment_id)
+        user = await watcher.get(User, user_id)
+        assert user.balance_kopeks == INITIAL_BALANCE_KOPEKS
+        assert rejected.is_paid is False
+        assert rejected.status == 'Opened'
+        assert rejected.transaction_id is None
+        assert rejected.callback_payload is None
+        assert rejected.paid_at is None
+        assert not rejected.metadata_json
+        assert await watcher.scalar(select(func.count()).select_from(Transaction)) == 0
+        notification.assert_not_awaited()
+        await watcher.rollback()
+
+        service.wata_service.get_transaction.return_value = api_payload
+        assert await _deliver(service, db, payload) is True
+        await _assert_one_credit_and_receipt(watcher, user_id, payment_id, payload)
+        notification.assert_awaited_once()
+
+
+async def test_documented_wata_callback_with_null_link_credits_using_api_binding(
+    postgres_database, monkeypatch
+) -> None:
+    monkeypatch.setattr(event_emitter, 'emit', AsyncMock())
+    service = PaymentService(bot=None)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, watcher):
+        user_id, payment_id, payload = await _create_payment(db, 'wata-documented-id')
+        service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=_api_transaction(payload)))
+        incoming = {**payload, 'id': 'independent-notification-id', 'paymentLinkId': None}
+        assert await _deliver(service, db, incoming) is True
+        await _assert_one_credit_and_receipt(watcher, user_id, payment_id, payload)
+
+
+async def test_declined_callback_cannot_poison_terminal_before_valid_payment(postgres_database, monkeypatch) -> None:
+    monkeypatch.setattr(event_emitter, 'emit', AsyncMock())
+    service = PaymentService(bot=None)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, watcher):
+        user_id, payment_id, payload = await _create_payment(db, 'wata-immutable-terminal')
+        payment = await db.get(WataPayment, payment_id)
+        payment.terminal_public_id = 'correct-terminal'
+        await db.commit()
+        payload['terminalPublicId'] = 'correct-terminal'
+        service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=_api_transaction(payload)))
+        incoming = {**payload, 'transactionStatus': 'Declined', 'terminalPublicId': 'foreign-terminal'}
+        assert await service.process_wata_webhook(db, incoming) is False
+        await db.commit()
+        watcher.expunge_all()
+        rejected = await watcher.get(WataPayment, payment_id)
+        assert rejected.terminal_public_id == 'correct-terminal'
+        assert rejected.status == 'Opened'
+        assert rejected.is_paid is False
+        assert rejected.callback_payload is None
+        await watcher.rollback()
+        assert await _deliver(service, db, payload) is True
+        await _assert_one_credit_and_receipt(watcher, user_id, payment_id, payload)

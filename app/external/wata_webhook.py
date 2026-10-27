@@ -200,7 +200,7 @@ class WataWebhookHandler:
             return web.json_response({'status': 'error', 'reason': 'invalid_signature'}, status=401)
 
         try:
-            payload: dict[str, Any] = json.loads(raw_body)
+            payload: dict[str, Any] = json.loads(raw_body, parse_float=str)
         except json.JSONDecodeError, UnicodeDecodeError:
             logger.error('Некорректный JSON WATA webhook')
             return web.json_response({'status': 'error', 'reason': 'invalid_json'}, status=400)

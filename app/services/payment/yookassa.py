@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +17,7 @@ from app.config import settings
 from app.database.models import PaymentMethod, TransactionType
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
+from app.utils.yookassa_payment_validation import yookassa_amount_kopeks, yookassa_money_matches
 
 
 if TYPE_CHECKING:
@@ -30,64 +30,67 @@ class YooKassaPaymentMixin:
     """Mixin с операциями по созданию и подтверждению платежей YooKassa."""
 
     @staticmethod
-    def _format_amount_value(value: Any) -> str:
-        """Форматирует сумму для хранения в webhook-объекте."""
-
-        try:
-            quantized = Decimal(str(value)).quantize(Decimal('0.00'))
-            return format(quantized, 'f')
-        except InvalidOperation, ValueError, TypeError:
-            return str(value)
-
-    @classmethod
     def _merge_remote_yookassa_payload(
-        cls,
         event_object: dict[str, Any],
         remote_data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Объединяет локальные данные вебхука с ответом API YooKassa."""
+        """Build an API-only snapshot; a webhook is just a lookup trigger.
 
-        merged: dict[str, Any] = dict(event_object)
+        Never inherit metadata, saved-card details, test flags or money from
+        the unauthenticated notification, even when the API omits a field.
+        """
+        return {
+            'id': remote_data.get('id'),
+            'status': remote_data.get('status'),
+            'paid': remote_data.get('paid'),
+            'refundable': remote_data.get('refundable', False),
+            'amount': {'value': remote_data.get('amount_value'), 'currency': remote_data.get('amount_currency')},
+            'metadata': remote_data.get('metadata') or {},
+            'description': remote_data.get('description'),
+            'created_at': remote_data.get('created_at'),
+            'captured_at': remote_data.get('captured_at'),
+            'confirmation': {'confirmation_url': remote_data.get('confirmation_url')},
+            'test': remote_data.get('test_mode'),
+            'payment_method': {
+                'type': remote_data.get('payment_method_type'),
+                'id': remote_data.get('payment_method_id'),
+                'saved': remote_data.get('payment_method_saved') is True,
+                'card': remote_data.get('payment_method_card') or {},
+            },
+        }
 
-        status = remote_data.get('status')
-        if status:
-            merged['status'] = status
-
-        if 'paid' in remote_data:
-            merged['paid'] = bool(remote_data.get('paid'))
-
-        if 'refundable' in remote_data:
-            merged['refundable'] = bool(remote_data.get('refundable'))
-
-        payment_method_type = remote_data.get('payment_method_type')
-        if payment_method_type:
-            payment_method = dict(merged.get('payment_method') or {})
-            payment_method['type'] = payment_method_type
-            merged['payment_method'] = payment_method
-
-        amount_value = remote_data.get('amount_value')
-        amount_currency = remote_data.get('amount_currency')
-        if amount_value is not None or amount_currency:
-            merged_amount = dict(merged.get('amount') or {})
-            if amount_value is not None:
-                merged_amount['value'] = cls._format_amount_value(amount_value)
-            if amount_currency:
-                merged_amount['currency'] = str(amount_currency).upper()
-            merged['amount'] = merged_amount
-
-        for datetime_field in ('captured_at', 'created_at'):
-            value = remote_data.get(datetime_field)
-            if value:
-                merged[datetime_field] = value
-
-        metadata = remote_data.get('metadata')
-        if metadata:
-            try:
-                merged['metadata'] = dict(metadata)  # type: ignore[arg-type]
-            except TypeError:
-                merged['metadata'] = metadata
-
-        return merged
+    @staticmethod
+    def _validate_yookassa_api_payment(
+        remote_data: Any, payment_id: str, payment: YooKassaPayment | None = None, *, succeeded: bool = False
+    ) -> bool:
+        """Bind authenticated API money and identity to the durable local order."""
+        if not isinstance(remote_data, dict) or remote_data.get('id') != payment_id:
+            return False
+        if remote_data.get('status') not in {'pending', 'waiting_for_capture', 'succeeded', 'canceled'}:
+            return False
+        if type(remote_data.get('paid')) is not bool:
+            return False
+        if remote_data.get('status') == 'succeeded' and remote_data.get('paid') is not True:
+            return False
+        if succeeded and (remote_data.get('status') != 'succeeded' or remote_data.get('paid') is not True):
+            return False
+        if type(remote_data.get('test_mode')) is not bool:
+            return False
+        if remote_data.get('test_mode') is True and not settings.YOOKASSA_TEST_MODE:
+            return False
+        if payment is not None:
+            if getattr(payment, 'test_mode', False) and not settings.YOOKASSA_TEST_MODE:
+                return False
+            return yookassa_money_matches(
+                remote_data.get('amount_value'),
+                remote_data.get('amount_currency'),
+                payment.amount_kopeks,
+                payment.currency,
+            )
+        return (
+            remote_data.get('amount_currency') == 'RUB'
+            and yookassa_amount_kopeks(remote_data.get('amount_value')) is not None
+        )
 
     async def create_yookassa_payment(
         self,
@@ -317,6 +320,13 @@ class YooKassaPaymentMixin:
                     'Ошибка получения статуса YooKassa', yookassa_payment_id=payment.yookassa_payment_id, error=error
                 )
 
+        if not self._validate_yookassa_api_payment(remote_data, payment.yookassa_payment_id, payment):
+            logger.warning(
+                'YooKassa status rejected: API payment identity or money mismatch',
+                yookassa_payment_id=payment.yookassa_payment_id,
+            )
+            return None
+
         if remote_data:
             status = remote_data.get('status') or payment.status
             paid = bool(remote_data.get('paid', getattr(payment, 'is_paid', False)))
@@ -369,7 +379,7 @@ class YooKassaPaymentMixin:
                 )
             else:
                 try:
-                    await self._process_successful_yookassa_payment(db, payment)
+                    await self._process_successful_yookassa_payment(db, payment, verified_remote_data=remote_data)
                 except Exception as process_error:  # pragma: no cover - defensive logging
                     logger.error(
                         'Ошибка обработки успешного платежа YooKassa',
@@ -390,6 +400,8 @@ class YooKassaPaymentMixin:
         db: AsyncSession,
         payment: YooKassaPayment,
         event_object: dict[str, Any] | None = None,
+        *,
+        verified_remote_data: dict[str, Any] | None = None,
     ) -> bool:
         """Переносит успешный платёж YooKassa в транзакции и начисляет баланс пользователю."""
         payment_external_id = payment.yookassa_payment_id
@@ -401,6 +413,22 @@ class YooKassaPaymentMixin:
             # Lock the payment row to prevent concurrent double-processing
             locked_result = await db.execute(select(YKPayment).where(YKPayment.id == payment.id).with_for_update())
             payment = locked_result.scalar_one()
+
+            # All fulfillment paths (balance, guest, gift, subpage and saved
+            # methods) require the same authenticated snapshot under the row lock.
+            if verified_remote_data is None and getattr(self, 'yookassa_service', None):
+                verified_remote_data = await asyncio.wait_for(
+                    self.yookassa_service.get_payment_info(payment.yookassa_payment_id), timeout=8
+                )
+            if not self._validate_yookassa_api_payment(
+                verified_remote_data, payment.yookassa_payment_id, payment, succeeded=True
+            ):
+                logger.warning(
+                    'YooKassa fulfillment rejected: API payment identity or money mismatch',
+                    yookassa_payment_id=payment.yookassa_payment_id,
+                )
+                return False
+            event_object = self._merge_remote_yookassa_payload({}, verified_remote_data)
 
             # Reject test-mode payments in production
             if getattr(payment, 'test_mode', False) and not getattr(settings, 'YOOKASSA_TEST_MODE', False):
@@ -1484,6 +1512,26 @@ class YooKassaPaymentMixin:
             )
             return False
 
+        if not self._validate_yookassa_api_payment(remote_data, yookassa_payment_id):
+            logger.warning(
+                'YooKassa webhook rejected: invalid API payment identity or money',
+                yookassa_payment_id=yookassa_payment_id,
+            )
+            return False
+        if 'amount' in event_object:
+            callback_amount = event_object['amount']
+            if not isinstance(callback_amount, dict) or not yookassa_money_matches(
+                callback_amount.get('value'),
+                callback_amount.get('currency'),
+                yookassa_amount_kopeks(remote_data.get('amount_value')),
+                remote_data.get('amount_currency'),
+            ):
+                logger.warning(
+                    'YooKassa webhook rejected: notification money differs from API',
+                    yookassa_payment_id=yookassa_payment_id,
+                )
+                return False
+
         if remote_data:
             previous_status = event_object.get('status')
             event_object = self._merge_remote_yookassa_payload(event_object, remote_data)
@@ -1509,6 +1557,13 @@ class YooKassaPaymentMixin:
                 )
                 return False
 
+        if not self._validate_yookassa_api_payment(remote_data, yookassa_payment_id, payment):
+            logger.warning(
+                'YooKassa webhook rejected: API amount or currency differs from local order',
+                yookassa_payment_id=yookassa_payment_id,
+            )
+            return False
+
         payment.status = event_object.get('status', payment.status)
         payment.confirmation_url = self._extract_confirmation_url(event_object)
 
@@ -1531,7 +1586,9 @@ class YooKassaPaymentMixin:
         await db.refresh(payment)
 
         if payment.status == 'succeeded' and payment.is_paid:
-            return await self._process_successful_yookassa_payment(db, payment, event_object=event_object)
+            return await self._process_successful_yookassa_payment(
+                db, payment, event_object=event_object, verified_remote_data=remote_data
+            )
 
         logger.info(
             'Webhook YooKassa обновил платеж до статуса',
@@ -1653,21 +1710,21 @@ class YooKassaPaymentMixin:
             return None
 
         amount_info = event_object.get('amount') or {}
-        amount_value = amount_info.get('value')
-        currency = (amount_info.get('currency') or 'RUB').upper()
-
-        if amount_value is None:
-            logger.error('Webhook YooKassa не содержит сумму платежа', yookassa_payment_id=yookassa_payment_id)
+        amount_kopeks = yookassa_amount_kopeks(amount_info.get('value'))
+        currency = amount_info.get('currency')
+        if amount_kopeks is None or currency != 'RUB':
+            logger.warning(
+                'YooKassa restoration rejected: invalid API amount or currency', yookassa_payment_id=yookassa_payment_id
+            )
             return None
-
-        try:
-            amount_kopeks = int((Decimal(str(amount_value)) * 100).quantize(Decimal(1)))
-        except (InvalidOperation, ValueError) as error:
-            logger.error(
-                'Некорректная сумма в webhook YooKassa',
+        # Current orders record their expected amount in provider metadata.
+        # Legacy/recurrent orders may omit it; their restored credit is limited
+        # to the exact authenticated API amount, never the notification amount.
+        expected_amount = metadata.get('amount_kopeks')
+        if expected_amount is not None and str(expected_amount) != str(amount_kopeks):
+            logger.warning(
+                'YooKassa restoration rejected: API amount differs from order metadata',
                 yookassa_payment_id=yookassa_payment_id,
-                amount_value=amount_value,
-                error=error,
             )
             return None
 
@@ -1705,6 +1762,16 @@ class YooKassaPaymentMixin:
         )
 
         if not local_payment:
+            return None
+        # create_yookassa_payment is idempotent: a concurrent creator can return
+        # a pre-existing row, so bind money again before setting paid flags.
+        if (
+            local_payment.yookassa_payment_id != yookassa_payment_id
+            or not yookassa_money_matches(
+                amount_info.get('value'), currency, local_payment.amount_kopeks, local_payment.currency
+            )
+            or (getattr(local_payment, 'test_mode', False) and not settings.YOOKASSA_TEST_MODE)
+        ):
             return None
 
         await payment_module.update_yookassa_payment_status(

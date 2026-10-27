@@ -438,3 +438,13 @@ def test_missing_credentials_is_not_configured(config):
     service = CardlinkService(api_token='')
     assert not service.is_configured
     assert not service.verify_callback(callback(config))
+
+
+@pytest.mark.anyio
+async def test_raw_json_fractional_kopeck_is_not_rounded_into_valid_bill(config, http):
+    http.raw = (
+        '{"success":true,"id":"bill123","order_id":"order123","status":"SUCCESS",'
+        '"type":"NORMAL","currency_in":"RUB","amount":150.010000000000001}'
+    )
+    with pytest.raises(CardlinkAPIError, match='invalid bill amount'):
+        await CardlinkService().get_bill('bill123')

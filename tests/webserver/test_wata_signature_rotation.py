@@ -120,6 +120,26 @@ async def test_mounted_route_accepts_rotation_before_cache_expiry(monkeypatch, s
     assert events == ['opened', 'closed']
 
 
+async def test_mounted_route_preserves_exact_signed_amount(monkeypatch, signing_keys) -> None:
+    key, _, _ = signing_keys
+    # Binary float decoding rounds this amount to 150.0 before the payment
+    # validator can reject its extra fraction of a kopek.
+    body = b'{"orderId":"route-exact-money","amount":150.000000000000001,"currency":"RUB"}'
+    provider = WataPublicKeyProvider(cache_seconds=3600)
+    monkeypatch.setattr(provider, '_fetch_public_key', AsyncMock(return_value=_pem(key)))
+    app, callback, database, events = _mounted_app(monkeypatch, provider)
+
+    async with _client(app) as client:
+        response = await _post(client, key, body)
+
+    assert response.status_code == 200
+    callback.assert_awaited_once_with(
+        database,
+        {'orderId': 'route-exact-money', 'amount': '150.000000000000001', 'currency': 'RUB'},
+    )
+    assert events == ['opened', 'closed']
+
+
 async def test_mounted_route_rejects_signature_invalid_after_refresh(monkeypatch, signing_keys) -> None:
     old, new, unrelated = signing_keys
     provider = WataPublicKeyProvider(cache_seconds=3600)

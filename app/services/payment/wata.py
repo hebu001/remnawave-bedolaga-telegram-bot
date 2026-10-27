@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from importlib import import_module
 from typing import Any
 
@@ -16,50 +17,79 @@ from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
 
 
+def _identifier(value: Any) -> str | None:
+    return value if isinstance(value, str) and value and value == value.strip() else None
+
+
+def _amount_matches(value: Any, amount_kopeks: Any) -> bool:
+    """Compare exact minor units without rounding untrusted provider amounts."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        return False
+    if type(amount_kopeks) is not int or amount_kopeks <= 0:
+        return False
+    try:
+        amount = Decimal(str(value))
+        # Compare directly, without multiplication/quantize subject to context rounding.
+        expected = Decimal(f'{amount_kopeks // 100}.{amount_kopeks % 100:02d}')
+        return amount.is_finite() and amount > 0 and amount == expected
+    except InvalidOperation, ValueError, TypeError:
+        return False
+
+
+def _matches_payment(
+    payment: Any, payload: Any, *, webhook: bool = False, link: bool = False, require_paid: bool = True
+) -> bool:
+    """Bind provider evidence to the immutable local order before any mutation."""
+    if not isinstance(payload, dict):
+        return False
+    if not _amount_matches(payload.get('amount'), payment.amount_kopeks):
+        return False
+    if payload.get('currency') != payment.currency or payment.currency != 'RUB':
+        return False
+    if not _identifier(payment.order_id) or payload.get('orderId') != payment.order_id:
+        return False
+    if not _identifier(payment.payment_link_id):
+        return False
+    if webhook:
+        # WATA's current webhook example has paymentLinkId=null and a distinct
+        # id/transactionId. Only transactionId identifies the API lookup; id is
+        # ambiguous across API versions and must never stand in for a link ID.
+        # The fetched transaction must still have the exact local paymentLinkId.
+        callback_link = payload.get('paymentLinkId')
+        if callback_link is not None and callback_link != payment.payment_link_id:
+            return False
+    elif payload.get('id' if link else 'paymentLinkId') != payment.payment_link_id:
+        return False
+    terminal = getattr(payment, 'terminal_public_id', None)
+    if terminal and payload.get('terminalPublicId') != terminal:
+        return False
+    if link:
+        return payload.get('status') in ('Opened', 'Closed', 'Paid')
+    status_keys = ('transactionStatus',) if webhook else ('status', 'statusName')
+    statuses = [payload[key] for key in status_keys if key in payload]
+    allowed_statuses = ('Paid',) if require_paid else ('Created', 'Pending', 'Declined')
+    if not statuses or any(value not in allowed_statuses for value in statuses):
+        return False
+    if payload.get('kind') != 'Payment' or payload.get('originalTransactionId'):
+        return False
+    return _identifier(payload.get('transactionId' if webhook else 'id')) is not None
+
+
 def _extract_transaction_id(payment: Any, remote_link: dict[str, Any] | None = None) -> str | None:
-    """Try to find the remote WATA transaction identifier from stored payloads."""
-
-    def _from_mapping(mapping: Any) -> str | None:
-        if isinstance(mapping, str):
-            try:
-                import json
-
-                mapping = json.loads(mapping)
-            except Exception:  # pragma: no cover - defensive parsing
-                return None
-        if not isinstance(mapping, dict):
-            return None
-        for key in ('id', 'transaction_id', 'transactionId'):
-            value = mapping.get(key)
-            if not value:
-                continue
-            value_str = str(value)
-            if '-' in value_str:
-                return value_str
-        return None
-
-    candidate = None
-
-    if hasattr(payment, 'callback_payload'):
-        candidate = _from_mapping(payment.callback_payload)
+    """Webhook id and link id are NOT transaction IDs; never interchange them."""
+    callback = getattr(payment, 'callback_payload', None)
+    if isinstance(callback, dict):
+        key = 'transactionId' if 'transactionStatus' in callback else 'id'
+        candidate = _identifier(callback.get(key))
         if candidate:
             return candidate
-
     metadata = getattr(payment, 'metadata_json', None)
-    if isinstance(metadata, dict):
-        if 'transaction' in metadata:
-            candidate = _from_mapping(metadata.get('transaction'))
-            if candidate:
-                return candidate
-        candidate = _from_mapping(metadata)
+    transaction = metadata.get('transaction') if isinstance(metadata, dict) else None
+    if isinstance(transaction, dict):
+        candidate = _identifier(transaction.get('id'))
         if candidate:
             return candidate
-
-    candidate = _from_mapping(remote_link)
-    if candidate:
-        return candidate
-
-    return None
+    return _identifier(remote_link.get('transactionId')) if isinstance(remote_link, dict) else None
 
 
 class WataPaymentMixin:
@@ -198,12 +228,12 @@ class WataPaymentMixin:
             return False
 
         order_id_raw = payload.get('orderId')
-        payment_link_raw = payload.get('paymentLinkId') or payload.get('id') or payload.get('transactionId')
+        payment_link_raw = payload.get('paymentLinkId')
         transaction_status_raw = payload.get('transactionStatus')
 
         order_id = str(order_id_raw) if order_id_raw else None
         payment_link_id = str(payment_link_raw) if payment_link_raw else None
-        transaction_status = (transaction_status_raw or '').strip()
+        transaction_status = transaction_status_raw if isinstance(transaction_status_raw, str) else ''
 
         if not order_id and not payment_link_id:
             logger.error('WATA webhook без orderId и paymentLinkId', payload=payload)
@@ -223,13 +253,39 @@ class WataPaymentMixin:
             logger.error('WATA платеж не найден', order_id=order_id, payment_link_id=payment_link_id)
             return False
 
-        # Lock payment row immediately to prevent concurrent webhook processing (TOCTOU race)
+        verified_transaction = None
+        is_paid_callback = transaction_status == 'Paid'
+        if not _matches_payment(payment, payload, webhook=True, require_paid=is_paid_callback):
+            logger.warning('WATA callback rejected: payment evidence mismatch', payment_id=payment.id)
+            return False
+        if is_paid_callback:
+            if not getattr(self, 'wata_service', None):
+                return False
+            try:
+                verified_transaction = await self.wata_service.get_transaction(payload['transactionId'])
+            except Exception as error:
+                logger.warning('WATA callback verification unavailable', error_type=type(error).__name__)
+                return False
+            if (
+                not _matches_payment(payment, verified_transaction)
+                or verified_transaction['id'] != payload['transactionId']
+                or verified_transaction.get('terminalPublicId') != payload.get('terminalPublicId')
+            ):
+                logger.warning('WATA callback rejected: API evidence mismatch', payment_id=payment.id)
+                return False
+
+        # Lock after the network request, then recheck evidence against the locked order.
         wata_crud = import_module('app.database.crud.wata')
         locked = await wata_crud.get_wata_payment_by_id_for_update(db, payment.id)
         if not locked:
             logger.error('WATA: не удалось заблокировать платёж', payment_id=payment.id)
             return False
         payment = locked
+        if not _matches_payment(payment, payload, webhook=True, require_paid=is_paid_callback):
+            return False
+        if payment.is_paid and not is_paid_callback:
+            # A delayed failed attempt must not downgrade a settled payment.
+            return True
 
         status_lower = transaction_status.lower()
         metadata = dict(getattr(payment, 'metadata_json', {}) or {})
@@ -239,10 +295,14 @@ class WataPaymentMixin:
         )
 
         if status_lower == 'paid':
+            if not _matches_payment(payment, payload, webhook=True) or not _matches_payment(
+                payment, verified_transaction
+            ):
+                return False
             if payment.is_paid and metadata.get('purpose') != 'subpage_renewal':
                 logger.info('WATA платеж уже помечен как оплачен', payment_link_id=payment.payment_link_id)
                 # Update callback payload without releasing the lock prematurely
-                payment.callback_payload = payload
+                payment.callback_payload = verified_transaction
                 payment.metadata_json = metadata
                 if terminal_public_id:
                     payment.terminal_public_id = terminal_public_id
@@ -258,14 +318,13 @@ class WataPaymentMixin:
                 payment.terminal_public_id = terminal_public_id
             await db.flush()
 
-            await self._finalize_wata_payment(db, payment, payload)
+            await self._finalize_wata_payment(db, payment, verified_transaction)
             return True
 
         # Non-success statuses: safe to use update_wata_payment_status (commits)
         update_kwargs: dict[str, Any] = {
             'metadata': metadata,
             'callback_payload': payload,
-            'terminal_public_id': terminal_public_id,
             'status': transaction_status,
             'last_status': transaction_status,
         }
@@ -294,115 +353,52 @@ class WataPaymentMixin:
         if not payment:
             return None
 
-        remote_link: dict[str, Any] | None = None
-        transaction_payload: dict[str, Any] | None = None
-        transaction_id: str | None = None
-
-        if getattr(self, 'wata_service', None) and payment.payment_link_id:
+        remote_link = None
+        transaction_payload = None
+        service = getattr(self, 'wata_service', None)
+        if service and not payment.is_paid:
             try:
-                remote_link = await self.wata_service.get_payment_link(payment.payment_link_id)  # type: ignore[union-attr]
-            except WataAPIError as error:
-                logger.error('Ошибка получения WATA ссылки', payment_link_id=payment.payment_link_id, error=error)
-            except Exception as error:  # pragma: no cover - safety net
-                logger.exception('Непредвиденная ошибка при запросе WATA ссылки', error=error)
+                remote_link = await service.get_payment_link(payment.payment_link_id)
+            except Exception as error:
+                logger.warning('WATA link verification unavailable', error_type=type(error).__name__)
 
-        if remote_link:
-            remote_status = remote_link.get('status') or payment.status
-            if remote_status != payment.status:
-                existing_metadata = dict(getattr(payment, 'metadata_json', {}) or {})
-                existing_metadata['link'] = remote_link
-                await payment_module.update_wata_payment_status(
-                    db,
-                    payment=payment,
-                    status=remote_status,
-                    last_status=remote_status,
-                    url=remote_link.get('url') or remote_link.get('paymentUrl'),
-                    metadata=existing_metadata,
-                    terminal_public_id=remote_link.get('terminalPublicId'),
-                )
-                payment = await payment_module.get_wata_payment_by_id(db, local_payment_id)
-
-            remote_status_normalized = (remote_status or '').lower()
-            if remote_status_normalized in {'closed', 'paid'} and not payment.is_paid:
+            # A contradictory link must not be persisted or used to finalize an order.
+            link_valid = remote_link is None or _matches_payment(payment, remote_link, link=True)
+            if not link_valid:
+                logger.warning('WATA status rejected: link evidence mismatch', payment_id=payment.id)
+            else:
                 transaction_id = _extract_transaction_id(payment, remote_link)
                 if transaction_id:
                     try:
-                        transaction_payload = await self.wata_service.get_transaction(  # type: ignore[union-attr]
-                            transaction_id
-                        )
-                    except WataAPIError as error:
-                        logger.error('Ошибка получения WATA транзакции', transaction_id=transaction_id, error=error)
-                    except Exception as error:  # pragma: no cover - safety net
-                        logger.exception(
-                            'Непредвиденная ошибка при запросе WATA транзакции',
-                            transaction_id=transaction_id,
-                            error=error,
-                        )
-                if not transaction_payload:
+                        candidate = await service.get_transaction(transaction_id)
+                        if _matches_payment(payment, candidate) and candidate['id'] == transaction_id:
+                            transaction_payload = candidate
+                    except Exception as error:
+                        logger.warning('WATA transaction verification unavailable', error_type=type(error).__name__)
+                if transaction_payload is None:
                     try:
-                        tx_response = await self.wata_service.search_transactions(  # type: ignore[union-attr]
+                        response = await service.search_transactions(
                             order_id=payment.order_id,
                             payment_link_id=payment.payment_link_id,
                             status='Paid',
                             limit=5,
                         )
-                        items = tx_response.get('items') or []
-                        for item in items:
-                            if (item or {}).get('status') == 'Paid':
-                                transaction_payload = item
-                                break
-                    except WataAPIError as error:
-                        logger.error(
-                            'Ошибка поиска WATA транзакций', payment_link_id=payment.payment_link_id, error=error
-                        )
-                    except Exception as error:  # pragma: no cover - safety net
-                        logger.exception('Непредвиденная ошибка при поиске WATA транзакции', error=error)
+                        items = response.get('items') if isinstance(response, dict) else None
+                        if isinstance(items, list):
+                            # Search filters are hints, not proof of identity or amount.
+                            transaction_payload = next(
+                                (item for item in items if _matches_payment(payment, item)), None
+                            )
+                    except Exception as error:
+                        logger.warning('WATA search verification unavailable', error_type=type(error).__name__)
 
-        if not transaction_payload and not payment.is_paid and getattr(self, 'wata_service', None):
-            fallback_transaction_id = transaction_id or _extract_transaction_id(payment)
-            if fallback_transaction_id:
-                try:
-                    transaction_payload = await self.wata_service.get_transaction(  # type: ignore[union-attr]
-                        fallback_transaction_id
-                    )
-                except WataAPIError as error:
-                    logger.error(
-                        'Ошибка повторного запроса WATA транзакции',
-                        fallback_transaction_id=fallback_transaction_id,
-                        error=error,
-                    )
-                except Exception as error:  # pragma: no cover - safety net
-                    logger.exception(
-                        'Непредвиденная ошибка при повторном запросе WATA транзакции',
-                        fallback_transaction_id=fallback_transaction_id,
-                        error=error,
-                    )
-
-        if transaction_payload and not payment.is_paid:
-            normalized_status = None
-            if isinstance(transaction_payload, dict):
-                raw_status = transaction_payload.get('status') or transaction_payload.get('statusName')
-                if raw_status:
-                    normalized_status = str(raw_status).lower()
-            if normalized_status == 'paid':
-                # Lock payment row before finalization to prevent concurrent double-processing
-                wata_crud = import_module('app.database.crud.wata')
-                locked = await wata_crud.get_wata_payment_by_id_for_update(db, payment.id)
-                if not locked:
-                    logger.error('WATA status check: не удалось заблокировать платёж', payment_id=payment.id)
-                elif locked.is_paid:
-                    # Another concurrent handler already processed — skip
-                    logger.info('WATA платеж уже оплачен после блокировки', payment_link_id=locked.payment_link_id)
-                    payment = locked
-                else:
-                    payment = locked
-                    payment = await self._finalize_wata_payment(db, payment, transaction_payload)
-            else:
-                logger.debug(
-                    'WATA транзакция в этом статусе повторной обработки не требует',
-                    transaction_id=transaction_id or getattr(payment, 'payment_link_id', ''),
-                    normalized_status=normalized_status or 'unknown',
-                )
+                if transaction_payload is not None:
+                    wata_crud = import_module('app.database.crud.wata')
+                    locked = await wata_crud.get_wata_payment_by_id_for_update(db, payment.id)
+                    if locked:
+                        payment = locked
+                        if not payment.is_paid and _matches_payment(payment, transaction_payload):
+                            payment = await self._finalize_wata_payment(db, payment, transaction_payload)
 
         return {
             'payment': payment,
@@ -420,16 +416,11 @@ class WataPaymentMixin:
     ) -> Any:
         payment_module = import_module('app.services.payment_service')
 
-        if isinstance(transaction_payload, dict):
-            paid_status = transaction_payload.get('status') or transaction_payload.get('statusName')
-        else:
-            paid_status = None
-        if paid_status and str(paid_status).lower() not in {'paid', 'declined', 'pending'}:
-            logger.debug(
-                'Неизвестный статус WATA транзакции',
-                getattr=getattr(payment, 'payment_link_id', ''),
-                paid_status=paid_status,
-            )
+        # Defense in depth: every caller, including future recovery paths, must
+        # supply verified Paid/Payment evidence before receipts, gifts or balance.
+        if not _matches_payment(payment, transaction_payload):
+            logger.warning('WATA finalization rejected: payment evidence mismatch', payment_id=payment.id)
+            return payment
 
         # FOR UPDATE lock already acquired by caller — just check idempotency
         if payment.transaction_id and (payment.metadata_json or {}).get('purpose') != 'subpage_renewal':

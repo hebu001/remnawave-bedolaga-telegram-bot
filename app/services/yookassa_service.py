@@ -11,9 +11,56 @@ from yookassa.domain.exceptions.not_found_error import NotFoundError as YooKassa
 from yookassa.domain.request.payment_request_builder import PaymentRequestBuilder
 
 from app.config import settings
+from app.utils.yookassa_payment_validation import (
+    YooKassaResponseValidationError,
+    yookassa_amount_kopeks,
+    yookassa_money_matches,
+)
 
 
 logger = structlog.get_logger(__name__)
+
+
+def _request_verified_yookassa_payment(*, payment_id=None, payment_request=None, idempotence_key=None):
+    """Validate raw authenticated JSON before the SDK rounds money or coerces booleans.
+
+    Payment.find_one/create constructs PaymentResponse immediately. Its Amount
+    setter converts through float and rounds 149.999 to 150.00, which must never
+    satisfy a 150.00 order. Keep exact money separately; SDK parses only the
+    remaining optional fields for our existing adapter contract.
+    """
+    from yookassa.domain.response import PaymentResponse
+
+    instance = YooKassaPayment()
+    if payment_request is None:
+        if not isinstance(payment_id, str) or not payment_id or '/' in payment_id:
+            raise YooKassaResponseValidationError('Invalid requested payment identity')
+        raw = instance.client.request('GET', instance.base_path + '/' + payment_id)
+    else:
+        payment_request = instance.add_default_cms_name(payment_request)
+        raw = instance.client.request(
+            'POST', instance.base_path, None, {'Idempotence-Key': str(idempotence_key)}, payment_request
+        )
+    if not isinstance(raw, dict):
+        raise YooKassaResponseValidationError('Invalid payment response')
+    money = raw.get('amount')
+    if (
+        not isinstance(money, dict)
+        or not isinstance(money.get('value'), str)
+        or yookassa_amount_kopeks(money.get('value')) is None
+        or money.get('currency') != 'RUB'
+        or not isinstance(raw.get('id'), str)
+        or not raw['id']
+        or (payment_id is not None and raw['id'] != payment_id)
+        or raw.get('status') not in {'pending', 'waiting_for_capture', 'succeeded', 'canceled'}
+        or type(raw.get('paid')) is not bool
+        or type(raw.get('test')) is not bool
+        or (raw.get('status') == 'succeeded' and raw.get('paid') is not True)
+    ):
+        raise YooKassaResponseValidationError('Invalid payment money, identity or state')
+    response = PaymentResponse(raw)
+    response._evo_raw_amount = dict(money)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +260,12 @@ class YooKassaService:
             }
 
         try:
+            expected_kopeks = yookassa_amount_kopeks(str(amount))
+            if expected_kopeks is None or currency.upper() != 'RUB':
+                return None
+            amount_value = f'{expected_kopeks // 100}.{expected_kopeks % 100:02d}'
             builder = PaymentRequestBuilder()
-            builder.set_amount({'value': str(round(amount, 2)), 'currency': currency.upper()})
+            builder.set_amount({'value': amount_value, 'currency': currency.upper()})
             builder.set_capture(True)
             builder.set_confirmation({'type': ConfirmationType.REDIRECT, 'return_url': return_url or self.return_url})
             builder.set_description(description)
@@ -224,7 +275,7 @@ class YooKassaService:
                 {
                     'description': description[:128],
                     'quantity': '1.00',
-                    'amount': {'value': str(round(amount, 2)), 'currency': currency.upper()},
+                    'amount': {'value': amount_value, 'currency': currency.upper()},
                     'vat_code': int(getattr(settings, 'YOOKASSA_VAT_CODE', 1)),
                     'payment_mode': getattr(settings, 'YOOKASSA_PAYMENT_MODE', 'full_payment'),
                     'payment_subject': getattr(settings, 'YOOKASSA_PAYMENT_SUBJECT', 'service'),
@@ -256,8 +307,19 @@ class YooKassaService:
             loop = asyncio.get_running_loop()
             async with asyncio.timeout(30):
                 response = await loop.run_in_executor(
-                    _yookassa_executor, lambda: YooKassaPayment.create(payment_request, idempotence_key)
+                    _yookassa_executor,
+                    lambda: _request_verified_yookassa_payment(
+                        payment_request=payment_request, idempotence_key=idempotence_key
+                    ),
                 )
+
+            if not yookassa_money_matches(
+                response._evo_raw_amount['value'], response._evo_raw_amount['currency'], expected_kopeks, 'RUB'
+            ):
+                logger.error(
+                    'YooKassa creation rejected: API amount or currency differs from request', payment_id=response.id
+                )
+                return None
 
             logger.info(
                 'Ответ YooKassa Payment.create',
@@ -271,8 +333,8 @@ class YooKassaService:
                 'confirmation_url': response.confirmation.confirmation_url if response.confirmation else None,
                 'status': response.status,
                 'metadata': response.metadata,
-                'amount_value': float(response.amount.value),
-                'amount_currency': response.amount.currency,
+                'amount_value': str(response._evo_raw_amount['value']),
+                'amount_currency': response._evo_raw_amount['currency'],
                 'idempotence_key_used': idempotence_key,
                 'paid': response.paid,
                 'refundable': response.refundable,
@@ -317,11 +379,15 @@ class YooKassaService:
             }
 
         try:
+            expected_kopeks = yookassa_amount_kopeks(str(amount))
+            if expected_kopeks is None or currency.upper() != 'RUB':
+                return None
+            amount_value = f'{expected_kopeks // 100}.{expected_kopeks % 100:02d}'
             # Создаем один платеж с подтверждением через QR
             # Это позволит получить QR-код для пользователя
             builder = PaymentRequestBuilder()
 
-            builder.set_amount({'value': str(round(amount, 2)), 'currency': currency.upper()})
+            builder.set_amount({'value': amount_value, 'currency': currency.upper()})
 
             builder.set_capture(True)
 
@@ -338,7 +404,7 @@ class YooKassaService:
                 {
                     'description': description[:128],
                     'quantity': '1.00',
-                    'amount': {'value': str(round(amount, 2)), 'currency': currency.upper()},
+                    'amount': {'value': amount_value, 'currency': currency.upper()},
                     'vat_code': int(getattr(settings, 'YOOKASSA_VAT_CODE', 1)),
                     'payment_mode': getattr(settings, 'YOOKASSA_PAYMENT_MODE', 'full_payment'),
                     'payment_subject': getattr(settings, 'YOOKASSA_PAYMENT_SUBJECT', 'service'),
@@ -365,8 +431,19 @@ class YooKassaService:
             loop = asyncio.get_running_loop()
             async with asyncio.timeout(30):
                 response = await loop.run_in_executor(
-                    _yookassa_executor, lambda: YooKassaPayment.create(payment_request, idempotence_key)
+                    _yookassa_executor,
+                    lambda: _request_verified_yookassa_payment(
+                        payment_request=payment_request, idempotence_key=idempotence_key
+                    ),
                 )
+
+            if not yookassa_money_matches(
+                response._evo_raw_amount['value'], response._evo_raw_amount['currency'], expected_kopeks, 'RUB'
+            ):
+                logger.error(
+                    'YooKassa creation rejected: API amount or currency differs from request', payment_id=response.id
+                )
+                return None
 
             logger.info(
                 'Ответ YooKassa Payment.create (СБП, redirect)',
@@ -387,8 +464,8 @@ class YooKassaService:
                 else None,
                 'status': response.status,
                 'metadata': response.metadata,
-                'amount_value': float(response.amount.value),
-                'amount_currency': response.amount.currency,
+                'amount_value': str(response._evo_raw_amount['value']),
+                'amount_currency': response._evo_raw_amount['currency'],
                 'idempotence_key_used': idempotence_key,
                 'paid': response.paid,
                 'refundable': response.refundable,
@@ -413,7 +490,7 @@ class YooKassaService:
             loop = asyncio.get_running_loop()
             async with asyncio.timeout(30):
                 payment_info_yk = await loop.run_in_executor(
-                    _yookassa_executor, lambda: YooKassaPayment.find_one(payment_id_in_yookassa)
+                    _yookassa_executor, lambda: _request_verified_yookassa_payment(payment_id=payment_id_in_yookassa)
                 )
 
             if payment_info_yk:
@@ -427,8 +504,8 @@ class YooKassaService:
                     'id': payment_info_yk.id,
                     'status': payment_info_yk.status,
                     'paid': payment_info_yk.paid,
-                    'amount_value': float(payment_info_yk.amount.value),
-                    'amount_currency': payment_info_yk.amount.currency,
+                    'amount_value': str(payment_info_yk._evo_raw_amount['value']),
+                    'amount_currency': payment_info_yk._evo_raw_amount['currency'],
                     'metadata': payment_info_yk.metadata,
                     'description': payment_info_yk.description,
                     'refundable': payment_info_yk.refundable,
@@ -506,8 +583,12 @@ class YooKassaService:
             return None
 
         try:
+            expected_kopeks = yookassa_amount_kopeks(str(amount))
+            if expected_kopeks is None or currency.upper() != 'RUB':
+                return None
+            amount_value = f'{expected_kopeks // 100}.{expected_kopeks % 100:02d}'
             builder = PaymentRequestBuilder()
-            builder.set_amount({'value': str(round(amount, 2)), 'currency': currency.upper()})
+            builder.set_amount({'value': amount_value, 'currency': currency.upper()})
             builder.set_capture(True)
             builder.set_payment_method_id(payment_method_id)
             builder.set_description(description)
@@ -517,7 +598,7 @@ class YooKassaService:
                 {
                     'description': description[:128],
                     'quantity': '1.00',
-                    'amount': {'value': str(round(amount, 2)), 'currency': currency.upper()},
+                    'amount': {'value': amount_value, 'currency': currency.upper()},
                     'vat_code': str(getattr(settings, 'YOOKASSA_VAT_CODE', 1)),
                     'payment_mode': getattr(settings, 'YOOKASSA_PAYMENT_MODE', 'full_payment'),
                     'payment_subject': getattr(settings, 'YOOKASSA_PAYMENT_SUBJECT', 'service'),
@@ -543,8 +624,19 @@ class YooKassaService:
             loop = asyncio.get_running_loop()
             async with asyncio.timeout(30):
                 response = await loop.run_in_executor(
-                    _yookassa_executor, lambda: YooKassaPayment.create(payment_request, idempotence_key)
+                    _yookassa_executor,
+                    lambda: _request_verified_yookassa_payment(
+                        payment_request=payment_request, idempotence_key=idempotence_key
+                    ),
                 )
+
+            if not yookassa_money_matches(
+                response._evo_raw_amount['value'], response._evo_raw_amount['currency'], expected_kopeks, 'RUB'
+            ):
+                logger.error(
+                    'YooKassa creation rejected: API amount or currency differs from request', payment_id=response.id
+                )
+                raise YooKassaResponseValidationError('Autopayment amount or currency mismatch')
 
             logger.info(
                 'Ответ YooKassa автоплатёж',
@@ -558,8 +650,8 @@ class YooKassaService:
                 'status': response.status,
                 'paid': response.paid,
                 'metadata': response.metadata,
-                'amount_value': float(response.amount.value),
-                'amount_currency': response.amount.currency,
+                'amount_value': str(response._evo_raw_amount['value']),
+                'amount_currency': response._evo_raw_amount['currency'],
                 'idempotence_key_used': idempotence_key,
                 'refundable': response.refundable,
                 'created_at': response.created_at.isoformat()
@@ -568,6 +660,8 @@ class YooKassaService:
                 'description_from_yk': response.description,
                 'test_mode': response.test if hasattr(response, 'test') else None,
             }
+        except YooKassaResponseValidationError:
+            raise
         except Exception as e:
             logger.error(
                 'Ошибка создания автоплатежа YooKassa',

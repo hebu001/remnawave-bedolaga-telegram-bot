@@ -295,9 +295,10 @@ def test_webhook_timeout_is_caught_and_refuses_without_confirmation() -> None:
         'Webhook handler must catch TimeoutError from wait_for instead of propagating it as a 500'
     )
 
-    wait_for_idx = source.find('asyncio.wait_for(')
+    webhook_source = source[source.index('    async def process_yookassa_webhook(') :]
+    wait_for_idx = webhook_source.find('asyncio.wait_for(')
     assert wait_for_idx >= 0
-    snippet = source[wait_for_idx : wait_for_idx + 2500]
+    snippet = webhook_source[wait_for_idx : wait_for_idx + 2500]
     timeout_block_start = snippet.find('TimeoutError')
     assert timeout_block_start >= 0
     timeout_block = snippet[timeout_block_start : timeout_block_start + 500]

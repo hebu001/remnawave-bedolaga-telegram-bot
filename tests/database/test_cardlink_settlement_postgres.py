@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
@@ -14,7 +15,7 @@ from app.config import settings
 from app.database.crud import cardlink as crud
 from app.database.crud.transaction import get_income_total, income_payments_query
 from app.database.models import CardlinkPayment, GuestPurchase, SubpageInvoice, Transaction, User
-from app.services.cardlink_service import CardlinkAPIError
+from app.services.cardlink_service import CardlinkAPIError, CardlinkService
 from app.services.event_emitter import event_emitter
 from app.services.payment_service import PaymentService
 from tests.fixtures.postgres_db import lock_waiter_appeared, postgres_sessions
@@ -176,12 +177,73 @@ async def test_competing_callback_and_poll_credit_once(postgres_database, servic
         ('status', None),
     ],
 )
-async def test_mismatched_api_proof_never_credits(postgres_database, service, field, bad):
+@pytest.mark.parametrize('entrypoint', ['webhook', 'poll'])
+async def test_mismatched_api_proof_never_credits(postgres_database, service, field, bad, entrypoint):
     async with postgres_sessions(postgres_database, TABLES) as (db, watcher):
         user_id, payment_id, callback = await seed(db, service)
         service.cardlink_service.get_bill.return_value[field] = bad
-        assert await deliver(service, db, callback) is False
+        if entrypoint == 'webhook':
+            assert await service.process_cardlink_webhook(db, callback) is False
+        else:
+            assert await service.get_cardlink_payment_status(db, payment_id) is None
+        # A normal False/None response does not imply that the request's DB
+        # dependency rolls back. Rejected evidence must survive an explicit commit.
+        await db.commit()
         await assert_credit(watcher, user_id, payment_id, credited=False)
+        receipt = await watcher.get(CardlinkPayment, payment_id)
+        assert receipt.status == 'NEW'
+        assert receipt.paid_at is None
+        assert receipt.transaction_id is None
+        assert receipt.callback_payload is None
+        assert 'verified_bill' not in (receipt.metadata_json or {})
+
+
+@pytest.mark.parametrize('scenario', ['underpaid', 'smaller-api-amount', 'foreign-api-currency', 'api-unavailable'])
+async def test_valid_signature_cannot_override_api_money_or_status(postgres_database, service, monkeypatch, scenario):
+    from app.services.guest_purchase_service import _find_succeeded_provider_payment
+
+    async with postgres_sessions(postgres_database, TABLES) as (db, watcher):
+        user_id, payment_id, callback = await seed(db, service, metadata={'purchase_token': 'money-proof'})
+        original_bill = deepcopy(service.cardlink_service.get_bill.return_value)
+        bill = deepcopy(original_bill)
+        if scenario == 'underpaid':
+            bill['status'] = 'UNDERPAID'
+        elif scenario == 'smaller-api-amount':
+            bill['amount'] = '1.00'
+        elif scenario == 'foreign-api-currency':
+            bill['currency_in'] = 'USD'
+        api = AsyncMock(return_value=bill)
+        if scenario == 'api-unavailable':
+            api.side_effect = CardlinkAPIError('unavailable')
+        real_client = CardlinkService(
+            base_url='https://cardlink.link', api_token='fixture-money-secret', shop_id='fixture-shop'
+        )
+        monkeypatch.setattr(real_client, 'get_bill', api)
+        service.cardlink_service = real_client
+
+        # A provider-signed partial payment is replayed with unsigned Status
+        # replaced by SUCCESS. The signature is valid; only API proof may settle.
+        callback['OutSum'] = '1.00'
+        callback['Status'] = 'SUCCESS'
+        signed = f'{callback["OutSum"]}:{callback["InvId"]}:fixture-money-secret'
+        callback['SignatureValue'] = hashlib.md5(signed.encode(), usedforsecurity=False).hexdigest().upper()
+        assert real_client.verify_callback(callback)
+        result = await service.process_cardlink_webhook(db, callback)
+        assert result is (scenario == 'underpaid')
+        await db.commit()
+        await assert_credit(watcher, user_id, payment_id, credited=False)
+        assert await _find_succeeded_provider_payment(watcher, 'cardlink', 'money-proof') is None
+        await watcher.rollback()
+
+        # A later fully verified payment still succeeds exactly once.
+        api.side_effect = None
+        api.return_value = original_bill
+        callback['OutSum'] = '150.01'
+        signed = f'{callback["OutSum"]}:{callback["InvId"]}:fixture-money-secret'
+        callback['SignatureValue'] = hashlib.md5(signed.encode(), usedforsecurity=False).hexdigest().upper()
+        for _ in range(2):
+            assert await service.process_cardlink_webhook(db, callback)
+        await assert_credit(watcher, user_id, payment_id)
 
 
 @pytest.mark.parametrize('status', ['NEW', 'PROCESS', 'UNDERPAID', 'FAIL', 'CANCEL', 'unknown'])
@@ -189,8 +251,31 @@ async def test_unsigned_success_never_overrides_api_nonpaid(postgres_database, s
     async with postgres_sessions(postgres_database, TABLES) as (db, watcher):
         user_id, payment_id, callback = await seed(db, service)
         service.cardlink_service.get_bill.return_value['status'] = status
-        assert await deliver(service, db, callback)
+        result = await deliver(service, db, callback)
+        assert result is (status in {'NEW', 'PROCESS', 'UNDERPAID', 'FAIL'})
         await assert_credit(watcher, user_id, payment_id, credited=False)
+
+
+@pytest.mark.parametrize('purpose', ['balance', 'guest_purchase', 'subpage_renewal'])
+@pytest.mark.parametrize('field,bad', [('amount', '1.00'), ('currency_in', 'USD'), ('status', 'UNDERPAID')])
+async def test_finalizer_rejects_invalid_evidence_before_durable_capture(
+    postgres_database, service, purpose, field, bad
+):
+    from app.services.guest_purchase_service import _find_succeeded_provider_payment
+
+    async with postgres_sessions(postgres_database, TABLES) as (db, watcher):
+        user_id, payment_id, _ = await seed(
+            db, service, metadata={'purpose': purpose, 'purchase_token': 'finalizer-proof'}
+        )
+        payment = await crud.get_cardlink_payment_by_id_for_update(db, payment_id)
+        bill = {**service.cardlink_service.get_bill.return_value, field: bad}
+        with pytest.raises(ValueError, match='cardlink_payment_evidence_mismatch'):
+            await service._finalize_cardlink_payment(db, payment, bill)
+        await db.commit()
+        await assert_credit(watcher, user_id, payment_id, credited=False)
+        receipt = await watcher.get(CardlinkPayment, payment_id)
+        assert receipt.status == 'NEW' and receipt.paid_at is None
+        assert await _find_succeeded_provider_payment(watcher, 'cardlink', 'finalizer-proof') is None
 
 
 @pytest.mark.parametrize('invalid', ['signature', 'order', 'bill', 'currency', 'unavailable'])
