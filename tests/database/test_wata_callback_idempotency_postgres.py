@@ -133,14 +133,30 @@ async def _assert_one_credit_and_receipt(db: Any, user_id: int, payment_id: int,
     assert await get_income_total(db, now - timedelta(days=1), now + timedelta(days=1)) == AMOUNT_KOPEKS
 
 
-async def test_repeated_paid_wata_callback_credits_and_counts_income_once(postgres_database, monkeypatch) -> None:
+@pytest.mark.parametrize('customer_fee', [False, True])
+async def test_repeated_paid_wata_callback_credits_and_counts_income_once(
+    postgres_database, monkeypatch, customer_fee
+) -> None:
     notification = AsyncMock()
     monkeypatch.setattr(event_emitter, 'emit', notification)
     service = PaymentService(bot=None)
 
     async with postgres_sessions(postgres_database, TABLES, count=2) as (db, watcher):
         user_id, payment_id, payload = await _create_payment(db, 'wata-replay')
-        service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=_api_transaction(payload)))
+        remote_link = {
+            'id': payload['paymentLinkId'],
+            'orderId': payload['orderId'],
+            'amount': payload['amount'],
+            'currency': 'RUB',
+            'status': 'Closed',
+        }
+        if customer_fee:
+            payload['amount'] = '1315.79'
+            payload['commission'] = '65.7895'
+        service.wata_service = SimpleNamespace(
+            get_transaction=AsyncMock(return_value=_api_transaction(payload)),
+            get_payment_link=AsyncMock(return_value=remote_link),
+        )
         for _ in range(4):
             assert await _deliver(service, db, payload) is True
 
@@ -148,14 +164,30 @@ async def test_repeated_paid_wata_callback_credits_and_counts_income_once(postgr
         notification.assert_awaited_once()
 
 
-async def test_competing_paid_wata_callbacks_credit_and_count_income_once(postgres_database, monkeypatch) -> None:
+@pytest.mark.parametrize('customer_fee', [False, True])
+async def test_competing_paid_wata_callbacks_credit_and_count_income_once(
+    postgres_database, monkeypatch, customer_fee
+) -> None:
     notification = AsyncMock()
     monkeypatch.setattr(event_emitter, 'emit', notification)
     service = PaymentService(bot=None)
 
     async with postgres_sessions(postgres_database, TABLES, count=3) as (first, second, watcher):
         user_id, payment_id, payload = await _create_payment(first, 'wata-concurrent')
-        service.wata_service = SimpleNamespace(get_transaction=AsyncMock(return_value=_api_transaction(payload)))
+        remote_link = {
+            'id': payload['paymentLinkId'],
+            'orderId': payload['orderId'],
+            'amount': payload['amount'],
+            'currency': 'RUB',
+            'status': 'Closed',
+        }
+        if customer_fee:
+            payload['amount'] = '1315.79'
+            payload['commission'] = '65.7895'
+        service.wata_service = SimpleNamespace(
+            get_transaction=AsyncMock(return_value=_api_transaction(payload)),
+            get_payment_link=AsyncMock(return_value=remote_link),
+        )
         original_lock = wata_crud.get_wata_payment_by_id_for_update
         holder_has_the_row = asyncio.Event()
         entries = 0

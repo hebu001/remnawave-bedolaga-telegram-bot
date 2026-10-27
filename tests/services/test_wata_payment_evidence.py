@@ -122,7 +122,12 @@ async def test_invalid_callback_has_no_mutation_even_if_api_would_confirm(monkey
     assert await service.process_wata_webhook(db, change(callback(), key, value)) is False
     assert vars(payment) == before
     service._finalize_wata_payment.assert_not_awaited()
-    service.wata_service.get_transaction.assert_not_awaited()
+    if (key, value) == ('amount', '150.02'):
+        # A positive customer fee can only be rejected after comparing gross
+        # against the authenticated transaction, not against principal alone.
+        service.wata_service.get_transaction.assert_awaited_once()
+    else:
+        service.wata_service.get_transaction.assert_not_awaited()
     lock.assert_not_awaited()
     db.flush.assert_not_awaited()
     db.commit.assert_not_awaited()
@@ -156,7 +161,10 @@ async def test_unavailable_or_malformed_api_does_not_settle(monkeypatch, remote)
     db.flush.assert_not_awaited()
 
 
-@pytest.mark.parametrize(('key', 'value'), BAD_EVIDENCE + [('status', 'Pending'), ('id', MISSING)])
+@pytest.mark.parametrize(
+    ('key', 'value'),
+    [case for case in BAD_EVIDENCE if case != ('amount', '150.02')] + [('status', 'Pending'), ('id', MISSING)],
+)
 async def test_polling_rejects_mismatched_api_transaction(monkeypatch, key, value):
     service, db, payment, _ = setup(monkeypatch)
     before = deepcopy(vars(payment))

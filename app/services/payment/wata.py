@@ -36,14 +36,57 @@ def _amount_matches(value: Any, amount_kopeks: Any) -> bool:
         return False
 
 
+def _kopeck_amount(value: Any) -> Decimal | None:
+    """Read positive, finite money without rounding away fractional kopecks."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        return None
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount <= 0:
+            return None
+        parts = amount.as_tuple()
+        # Inspect digits instead of quantizing/multiplying under Decimal's
+        # context: even very long trailing fractions must never round to cents.
+        if parts.exponent < -2 and any(parts.digits[parts.exponent + 2 :]):
+            return None
+        return amount
+    except InvalidOperation, ValueError, TypeError:
+        return None
+
+
+def _has_customer_fee(payment: Any, payload: Any) -> bool:
+    if not isinstance(payload, dict) or type(payment.amount_kopeks) is not int or payment.amount_kopeks <= 0:
+        return False
+    amount = _kopeck_amount(payload.get('amount'))
+    principal = Decimal(f'{payment.amount_kopeks // 100}.{payment.amount_kopeks % 100:02d}')
+    return amount is not None and amount > principal
+
+
 def _matches_payment(
-    payment: Any, payload: Any, *, webhook: bool = False, link: bool = False, require_paid: bool = True
+    payment: Any,
+    payload: Any,
+    *,
+    webhook: bool = False,
+    link: bool = False,
+    require_paid: bool = True,
+    verified_link: dict[str, Any] | None = None,
 ) -> bool:
     """Bind provider evidence to the immutable local order before any mutation."""
     if not isinstance(payload, dict):
         return False
     if not _amount_matches(payload.get('amount'), payment.amount_kopeks):
-        return False
+        # WATA can charge a customer fee on top of the requested principal.
+        # A larger Paid transaction is valid only when a separately fetched
+        # authenticated link still proves the exact immutable local order.
+        # Never infer principal by subtracting commission (it may have 3+ digits
+        # or contain a merchant-paid portion), or credit the larger gross amount.
+        if (
+            link
+            or not require_paid
+            or not _has_customer_fee(payment, payload)
+            or not _matches_payment(payment, verified_link, link=True)
+        ):
+            return False
     if payload.get('currency') != payment.currency or payment.currency != 'RUB':
         return False
     if not _identifier(payment.order_id) or payload.get('orderId') != payment.order_id:
@@ -254,8 +297,19 @@ class WataPaymentMixin:
             return False
 
         verified_transaction = None
+        verified_link = None
         is_paid_callback = transaction_status == 'Paid'
-        if not _matches_payment(payment, payload, webhook=True, require_paid=is_paid_callback):
+        if is_paid_callback and _has_customer_fee(payment, payload):
+            if not getattr(self, 'wata_service', None):
+                return False
+            try:
+                verified_link = await self.wata_service.get_payment_link(payment.payment_link_id)
+            except Exception as error:
+                logger.warning('WATA fee link verification unavailable', error_type=type(error).__name__)
+                return False
+        if not _matches_payment(
+            payment, payload, webhook=True, require_paid=is_paid_callback, verified_link=verified_link
+        ):
             logger.warning('WATA callback rejected: payment evidence mismatch', payment_id=payment.id)
             return False
         if is_paid_callback:
@@ -267,9 +321,10 @@ class WataPaymentMixin:
                 logger.warning('WATA callback verification unavailable', error_type=type(error).__name__)
                 return False
             if (
-                not _matches_payment(payment, verified_transaction)
+                not _matches_payment(payment, verified_transaction, verified_link=verified_link)
                 or verified_transaction['id'] != payload['transactionId']
                 or verified_transaction.get('terminalPublicId') != payload.get('terminalPublicId')
+                or _kopeck_amount(verified_transaction.get('amount')) != _kopeck_amount(payload.get('amount'))
             ):
                 logger.warning('WATA callback rejected: API evidence mismatch', payment_id=payment.id)
                 return False
@@ -281,7 +336,9 @@ class WataPaymentMixin:
             logger.error('WATA: не удалось заблокировать платёж', payment_id=payment.id)
             return False
         payment = locked
-        if not _matches_payment(payment, payload, webhook=True, require_paid=is_paid_callback):
+        if not _matches_payment(
+            payment, payload, webhook=True, require_paid=is_paid_callback, verified_link=verified_link
+        ):
             return False
         if payment.is_paid and not is_paid_callback:
             # A delayed failed attempt must not downgrade a settled payment.
@@ -295,9 +352,9 @@ class WataPaymentMixin:
         )
 
         if status_lower == 'paid':
-            if not _matches_payment(payment, payload, webhook=True) or not _matches_payment(
-                payment, verified_transaction
-            ):
+            if not _matches_payment(
+                payment, payload, webhook=True, verified_link=verified_link
+            ) or not _matches_payment(payment, verified_transaction, verified_link=verified_link):
                 return False
             if payment.is_paid and metadata.get('purpose') != 'subpage_renewal':
                 logger.info('WATA платеж уже помечен как оплачен', payment_link_id=payment.payment_link_id)
@@ -318,7 +375,10 @@ class WataPaymentMixin:
                 payment.terminal_public_id = terminal_public_id
             await db.flush()
 
-            await self._finalize_wata_payment(db, payment, verified_transaction)
+            if verified_link is not None:
+                await self._finalize_wata_payment(db, payment, verified_transaction, verified_link=verified_link)
+            else:
+                await self._finalize_wata_payment(db, payment, verified_transaction)
             return True
 
         # Non-success statuses: safe to use update_wata_payment_status (commits)
@@ -371,7 +431,10 @@ class WataPaymentMixin:
                 if transaction_id:
                     try:
                         candidate = await service.get_transaction(transaction_id)
-                        if _matches_payment(payment, candidate) and candidate['id'] == transaction_id:
+                        if (
+                            _matches_payment(payment, candidate, verified_link=remote_link)
+                            and candidate['id'] == transaction_id
+                        ):
                             transaction_payload = candidate
                     except Exception as error:
                         logger.warning('WATA transaction verification unavailable', error_type=type(error).__name__)
@@ -387,7 +450,8 @@ class WataPaymentMixin:
                         if isinstance(items, list):
                             # Search filters are hints, not proof of identity or amount.
                             transaction_payload = next(
-                                (item for item in items if _matches_payment(payment, item)), None
+                                (item for item in items if _matches_payment(payment, item, verified_link=remote_link)),
+                                None,
                             )
                     except Exception as error:
                         logger.warning('WATA search verification unavailable', error_type=type(error).__name__)
@@ -397,8 +461,15 @@ class WataPaymentMixin:
                     locked = await wata_crud.get_wata_payment_by_id_for_update(db, payment.id)
                     if locked:
                         payment = locked
-                        if not payment.is_paid and _matches_payment(payment, transaction_payload):
-                            payment = await self._finalize_wata_payment(db, payment, transaction_payload)
+                        if not payment.is_paid and _matches_payment(
+                            payment, transaction_payload, verified_link=remote_link
+                        ):
+                            if _has_customer_fee(payment, transaction_payload):
+                                payment = await self._finalize_wata_payment(
+                                    db, payment, transaction_payload, verified_link=remote_link
+                                )
+                            else:
+                                payment = await self._finalize_wata_payment(db, payment, transaction_payload)
 
         return {
             'payment': payment,
@@ -413,12 +484,14 @@ class WataPaymentMixin:
         db: AsyncSession,
         payment: Any,
         transaction_payload: dict[str, Any],
+        *,
+        verified_link: dict[str, Any] | None = None,
     ) -> Any:
         payment_module = import_module('app.services.payment_service')
 
         # Defense in depth: every caller, including future recovery paths, must
         # supply verified Paid/Payment evidence before receipts, gifts or balance.
-        if not _matches_payment(payment, transaction_payload):
+        if not _matches_payment(payment, transaction_payload, verified_link=verified_link):
             logger.warning('WATA finalization rejected: payment evidence mismatch', payment_id=payment.id)
             return payment
 
