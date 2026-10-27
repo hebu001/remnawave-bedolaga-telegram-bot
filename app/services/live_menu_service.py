@@ -38,9 +38,8 @@ from app.utils.rich_menu import (
     _looks_like_unsupported,
     _mark_logo_unavailable_once,
     _mark_rich_unavailable,
-    _resolve_rich_logo_url,
     _strip_tg_time,
-    build_main_menu_rich_html,
+    build_main_menu_rich_payload,
     forget_live_menu_state,
     is_rich_menu_enabled,
     live_menu_fingerprint,
@@ -211,12 +210,12 @@ async def _refresh_one(bot, key: str) -> str | None:
         # Compare the actual visible buttons too: balance may be hidden in the
         # compact body but visible in a configured button. No guessed field list.
         keyboard = await build_main_menu_keyboard(user, db)
-        fp = live_menu_fingerprint(user, texts, keyboard)
+        payload = await build_main_menu_rich_payload(user, texts, db)
+        fp = live_menu_fingerprint(user, texts, keyboard, payload=payload)
         if fp == state.get('fp'):
             return None
-        rich_html = await build_main_menu_rich_html(user, texts, db)
         language = user.language
-    rich_html, keyboard = _apply_inline_buttons(rich_html, keyboard, for_edit=True)
+    rich_html, keyboard = _apply_inline_buttons(payload.html, keyboard, for_edit=True)
     if await cache.redis_client.get(key) != raw:
         return None  # пока собирали, нажали кнопку на меню или пришло новое меню
 
@@ -226,7 +225,7 @@ async def _refresh_one(bot, key: str) -> str | None:
                 chat_id=chat_id,
                 message_id=state['m'],
                 parse_mode=None,
-                rich_message=_input_rich_message(html_, language),
+                rich_message=_input_rich_message(payload.with_html(html_), language),
                 reply_markup=keyboard,
             )
         )
@@ -243,7 +242,7 @@ async def _refresh_one(bot, key: str) -> str | None:
             if _looks_like_unsupported(error):
                 _mark_rich_unavailable(error)
                 return 'unsupported'
-            if _resolve_rich_logo_url() and _is_media_fetch_error(error):
+            if payload.without_logo() != payload and _is_media_fetch_error(error):
                 _mark_logo_unavailable_once(error)  # следующий проход уже без логотипа, ключ живёт
                 return None
             await forget_live_menu_state(key, raw)  # удалено, заблокирован, нельзя править

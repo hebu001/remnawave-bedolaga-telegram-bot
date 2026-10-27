@@ -37,6 +37,7 @@ def _rich_menu_env(monkeypatch):
     monkeypatch.setattr(settings, 'CABINET_URL', 'https://cabinet.example.test')
     monkeypatch.setattr(settings, 'HIDE_SUBSCRIPTION_LINK', False)
     monkeypatch.setattr(settings, 'CONNECT_BUTTON_MODE', 'webapp')
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value=None))
     yield
     rich_menu._reset_rich_menu_availability()
 
@@ -261,11 +262,11 @@ async def test_profile_layout_omits_action_footer_and_balance_text(monkeypatch):
 
 
 def test_input_rich_message_flags():
-    rich = rich_menu._input_rich_message('<p>x</p>', 'fa')
+    rich = rich_menu._input_rich_message(rich_menu.RichMenuPayload('<p>x</p>'), 'fa')
     assert rich.is_rtl is True
     assert rich.skip_entity_detection is True
 
-    assert rich_menu._input_rich_message('<p>x</p>', 'ru').is_rtl is None
+    assert rich_menu._input_rich_message(rich_menu.RichMenuPayload('<p>x</p>'), 'ru').is_rtl is None
 
 
 async def test_try_send_disabled_by_setting(monkeypatch):
@@ -793,6 +794,161 @@ async def test_logo_fetch_failure_degrades_and_resends(monkeypatch):
     assert rich_menu.is_rich_menu_enabled() is True
 
 
+def _assert_video_media(rich_message, file_id='telegram-video-1'):
+    assert rich_message.html.startswith('<video src="tg://video?id=start_video"></video>')
+    assert '<img ' not in rich_message.html
+    assert len(rich_message.media) == 1
+    binding = rich_message.media[0]
+    assert binding.id == 'start_video'
+    assert binding.media.type == 'video'
+    assert binding.media.media == file_id
+    assert file_id not in rich_message.html
+
+
+async def test_start_rich_answer_uses_video_with_profile_buttons_and_effect(monkeypatch):
+    """The /start rich-first path must use the uploaded file, not the logo."""
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', 'https://example.test/logo.png')
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', True)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_EFFECT_ID', '5104841245755180586')
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value='telegram-video-1'))
+    bot = AsyncMock()
+    message = SimpleNamespace(bot=bot, chat=SimpleNamespace(id=100))
+
+    assert await rich_menu.try_answer_rich_main_menu(
+        message, _make_user(_make_subscription(datetime.now(UTC))), DummyTexts(), AsyncMock(), _make_keyboard()
+    )
+
+    bot.send_rich_message.assert_awaited_once()
+    request = bot.send_rich_message.await_args.kwargs
+    _assert_video_media(request['rich_message'])
+    assert 'Ваш профиль' in request['rich_message'].html
+    assert 'Добавить подписку' in request['rich_message'].html
+    assert 'data="y"' in request['rich_message'].html
+    assert request['reply_markup'] is None
+    assert request['message_effect_id'] == '5104841245755180586'
+    bot.send_photo.assert_not_awaited()
+    bot.send_video.assert_not_awaited()
+    bot.send_message.assert_not_awaited()
+
+
+async def test_payload_without_video_keeps_logo_and_has_no_media_binding(monkeypatch):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', 'https://example.test/logo.png')
+    payload = await rich_menu.build_main_menu_rich_payload(_make_user(None), DummyTexts(), AsyncMock())
+
+    request = rich_menu._input_rich_message(payload, 'ru')
+    assert request.html.startswith('<img src="https://example.test/logo.png"/>')
+    assert '<video' not in request.html
+    assert request.media is None
+
+
+@pytest.mark.parametrize('error_kind', ['date', 'effect'])
+async def test_video_binding_survives_send_retries(monkeypatch, error_kind):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', True)
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_EFFECT_ID', '123')
+    video = AsyncMock(return_value='telegram-video-1')
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', video)
+    monkeypatch.setattr(
+        rich_menu,
+        'build_main_menu_rich_html',
+        AsyncMock(return_value='<p><tg-time unix="99999999999" format="d">01.01.2099</tg-time></p>'),
+    )
+    message = 'RICH_MESSAGE_DATE_INVALID' if error_kind == 'date' else 'wrong message effect identifier'
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = [TelegramBadRequest(method=None, message=message), None]
+
+    assert await rich_menu.try_send_rich_main_menu(
+        bot, 100, _make_user(None), DummyTexts(), AsyncMock(), _make_keyboard()
+    )
+
+    first, second = bot.send_rich_message.await_args_list
+    for call in (first, second):
+        _assert_video_media(call.kwargs['rich_message'])
+        assert 'data="y"' in call.kwargs['rich_message'].html
+    if error_kind == 'date':
+        assert '<tg-time' not in second.kwargs['rich_message'].html
+    else:
+        assert 'message_effect_id' not in second.kwargs
+    video.assert_awaited_once()
+
+
+@pytest.mark.parametrize('recreate', [False, True])
+async def test_video_binding_survives_callback_edit_or_recreation(monkeypatch, recreate):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', True)
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value='telegram-video-1'))
+    callback = _make_callback(text=None if recreate else 'menu', photo=[MagicMock()] if recreate else None)
+    if not recreate:
+        callback.bot.side_effect = [TelegramBadRequest(method=None, message='RICH_MESSAGE_DATE_INVALID'), None]
+
+    assert await rich_menu.try_edit_rich_main_menu(
+        callback, _make_user(None), DummyTexts(), AsyncMock(), _make_keyboard()
+    )
+
+    requests = (
+        [call.kwargs['rich_message'] for call in callback.bot.send_rich_message.await_args_list]
+        if recreate
+        else [call.args[0].rich_message for call in callback.bot.await_args_list]
+    )
+    assert len(requests) == (1 if recreate else 2)
+    for request in requests:
+        _assert_video_media(request)
+        assert request.html.count('data="y"') == 1
+
+
+@pytest.mark.parametrize('delivery', ['send', 'edit'])
+async def test_rejected_video_does_not_disable_logo_or_retry_it_as_logo(monkeypatch, delivery):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', 'https://example.test/logo.png')
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value='telegram-video-1'))
+    # MEDIA_EMPTY is also in the existing URL/logo error matcher.
+    error = TelegramBadRequest(method=None, message='Bad Request: MEDIA_EMPTY')
+    bot = AsyncMock()
+    if delivery == 'send':
+        bot.send_rich_message.side_effect = error
+        success = await rich_menu.try_send_rich_main_menu(
+            bot, 100, _make_user(None), DummyTexts(), AsyncMock(), _make_keyboard()
+        )
+        bot.send_rich_message.assert_awaited_once()
+    else:
+        callback = _make_callback()
+        callback.bot = bot
+        bot.side_effect = error
+        success = await rich_menu.try_edit_rich_main_menu(
+            callback, _make_user(None), DummyTexts(), AsyncMock(), _make_keyboard()
+        )
+        bot.assert_awaited_once()
+        bot.send_rich_message.assert_not_awaited()
+
+    assert success is False, 'the existing caller should deliver its classical fallback'
+    assert rich_menu._resolve_rich_logo_url() == 'https://example.test/logo.png'
+    assert rich_menu.is_rich_menu_enabled() is True
+
+
+async def test_live_tracking_uses_video_snapshot_sent_before_setting_changes(monkeypatch):
+    video = AsyncMock(return_value='telegram-video-1')
+    remember = AsyncMock()
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', video)
+    monkeypatch.setattr(rich_menu, 'remember_live_menu', remember)
+
+    async def send_and_replace_video(**kwargs):
+        video.return_value = 'telegram-video-2'
+        return SimpleNamespace(message_id=42)
+
+    bot = SimpleNamespace(send_rich_message=AsyncMock(side_effect=send_and_replace_video))
+    user = _make_user(None)
+    texts = DummyTexts()
+    keyboard = _make_keyboard()
+    assert await rich_menu.try_send_rich_main_menu(bot, 100, user, texts, AsyncMock(), keyboard)
+
+    snapshot = remember.await_args.kwargs['payload']
+    assert snapshot.video_file_id == 'telegram-video-1'
+    _assert_video_media(bot.send_rich_message.await_args.kwargs['rich_message'])
+    video.assert_awaited_once()
+    new_payload = await rich_menu.build_main_menu_rich_payload(user, texts, AsyncMock())
+    assert snapshot.html == new_payload.html, 'only the file_id changed'
+    assert rich_menu.live_menu_fingerprint(user, texts, keyboard, payload=snapshot) != rich_menu.live_menu_fingerprint(
+        user, texts, keyboard, payload=new_payload
+    )
+
+
 async def test_profile_subscription_link_is_explicit_and_clickable(monkeypatch):
     user = _make_user(_make_subscription(datetime.now(UTC)))
     html_out = await rich_menu.build_main_menu_rich_html(user, DummyTexts(), AsyncMock())
@@ -952,7 +1108,7 @@ async def test_send_retries_without_tg_time_on_date_error():
     bot = SimpleNamespace(send_rich_message=fake_send)
     rich_html = '<p><tg-time unix="99999999999" format="d">01.01.2099</tg-time></p>'
 
-    await rich_menu._send_rich_menu(bot, 1, rich_html, None, 'ru')
+    await rich_menu._send_rich_menu(bot, 1, rich_menu.RichMenuPayload(rich_html), None, 'ru')
 
     assert len(calls) == 2, 'должен быть ровно один повтор'
     assert '<tg-time' in calls[0]

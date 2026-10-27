@@ -11,15 +11,16 @@ telegram-bot-api) модуль запоминает недоступность �
 пытается. Ошибки конкретного рендера (например, неотредактированное сообщение)
 на флаг не влияют — просто отдаём False и меню рисуется классикой.
 
-Ограничение: у rich-сообщения нет фото, поэтому при ENABLE_LOGO_MODE главное
-меню в rich-режиме показывается без логотипа, а переходы меню <-> разделы с
-логотипом идут через delete+send (существующие fallback-и photo_message).
+Медиа-шапка содержит настроенное видео по Telegram file_id, иначе логотип
+по публичному URL. HTML и media mapping передаются вместе при отправке,
+редактировании и фоновых обновлениях.
 """
 
 import hashlib
 import html
 import json
 import re
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -38,7 +39,9 @@ from aiogram.types import (
     InaccessibleMessage,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaVideo,
     InputRichMessage,
+    InputRichMessageMedia,
     Message,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import User
+from app.services.start_media_service import get_start_video_file_id
 from app.utils.cache import cache
 from app.utils.formatters import format_username_link
 from app.utils.logo_fingerprint import logo_version
@@ -92,6 +96,25 @@ _SPOILER_SPAN_RE = re.compile(
 )
 _SPAN_TAG_RE = re.compile(r'</?span[^>]*>', re.IGNORECASE)
 _IMG_TAG_RE = re.compile(r'<img[^>]*/?>', re.IGNORECASE)
+_LEADING_LOGO_RE = re.compile(r'\A<img\s+[^>]*>')
+_START_VIDEO_MEDIA_ID = 'start_video'
+
+
+@dataclass(frozen=True, slots=True)
+class RichMenuPayload:
+    """One immutable snapshot of the visible menu and its Telegram media."""
+
+    html: str
+    video_file_id: str | None = None
+
+    def with_html(self, rich_html: str) -> RichMenuPayload:
+        return replace(self, html=rich_html)
+
+    def without_logo(self) -> RichMenuPayload:
+        # A rejected video must never be retried as though it were a logo URL.
+        if self.video_file_id:
+            return self
+        return self.with_html(_LEADING_LOGO_RE.sub('', self.html, count=1))
 
 
 def is_rich_menu_enabled() -> bool:
@@ -274,7 +297,13 @@ def _traffic_usage_text(subscription, texts) -> str:
 LIVE_MENU_TTL = 30 * 24 * 3600  # ponytail: меню, которое не открывали месяц, не оживляем; открыл меню — отсчёт заново
 
 
-def live_menu_fingerprint(user: User, texts, keyboard: InlineKeyboardMarkup | None = None) -> str:
+def live_menu_fingerprint(
+    user: User,
+    texts,
+    keyboard: InlineKeyboardMarkup | None = None,
+    *,
+    payload: RichMenuPayload | None = None,
+) -> str:
     """Fingerprint the exact compact display, using its renderer and calendar rules.
 
     This layout has no random content or moving timer entities. Sharing its pure
@@ -284,10 +313,15 @@ def live_menu_fingerprint(user: User, texts, keyboard: InlineKeyboardMarkup | No
     keyboard includes visible balance labels, cart/admin buttons and custom links;
     a hidden field matters only when it changes that rendered markup.
     """
-    rendered = _build_compact_main_menu_html(user, texts)
+    rendered = payload.html if payload is not None else _build_compact_main_menu_html(user, texts)
     markup = keyboard.model_dump(mode='json', exclude_none=True) if keyboard is not None else {'inline_keyboard': []}
+    visible = [user.language, rendered, markup, bool(settings.MAIN_MENU_RICH_INLINE_BUTTONS)]
+    if payload is not None and payload.video_file_id:
+        # The HTML uses a stable local media ID; replacing a video changes only
+        # the mapping. Keep the old fingerprint format for menus without video.
+        visible.append(payload.video_file_id)
     projection = json.dumps(
-        (user.language, rendered, markup, bool(settings.MAIN_MENU_RICH_INLINE_BUTTONS)),
+        visible,
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -304,13 +338,19 @@ async def forget_live_menu_state(key: str, raw: bytes | str) -> None:
 
 
 async def remember_live_menu(
-    chat_id: int, message_id: int | None, user: User, texts, keyboard: InlineKeyboardMarkup | None = None
+    chat_id: int,
+    message_id: int | None,
+    user: User,
+    texts,
+    keyboard: InlineKeyboardMarkup | None = None,
+    *,
+    payload: RichMenuPayload,
 ) -> None:
     """Запоминает последнее rich-меню чата для фоновой перерисовки. Никогда не бросает."""
     if not settings.MAIN_MENU_LIVE_ENABLED or not message_id:
         return
     try:
-        state = {'m': message_id, 'fp': live_menu_fingerprint(user, texts, keyboard)}
+        state = {'m': message_id, 'fp': live_menu_fingerprint(user, texts, keyboard, payload=payload)}
         await cache.set(f'live_menu:{chat_id}', state, expire=LIVE_MENU_TTL)
     except Exception as error:  # меню уже показано — живость не повод уводить его в классику
         logger.warning('Живое меню: не удалось запомнить меню', chat_id=chat_id, error=str(error))
@@ -622,6 +662,17 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
     return _build_compact_main_menu_html(user, texts)
 
 
+async def build_main_menu_rich_payload(user: User, texts, db: AsyncSession) -> RichMenuPayload:
+    """Read the selected video once and keep it with the HTML for all retries."""
+    rich_html = await build_main_menu_rich_html(user, texts, db)
+    video_file_id = await get_start_video_file_id(db)
+    if video_file_id:
+        rich_html = f'<video src="tg://video?id={_START_VIDEO_MEDIA_ID}"></video>' + _LEADING_LOGO_RE.sub(
+            '', rich_html, count=1
+        )
+    return RichMenuPayload(html=rich_html, video_file_id=video_file_id)
+
+
 _TG_TIME_TAG_RE = re.compile(r'<tg-time\b[^>]*>(.*?)</tg-time>', re.DOTALL | re.IGNORECASE)
 
 
@@ -640,11 +691,14 @@ def _strip_tg_time(rich_html: str) -> str:
     return _TG_TIME_TAG_RE.sub(r'\1', rich_html)
 
 
-def _input_rich_message(rich_html: str, language: str | None) -> InputRichMessage:
+def _input_rich_message(payload: RichMenuPayload, language: str | None) -> InputRichMessage:
     return InputRichMessage(
-        html=rich_html,
+        html=payload.html,
         is_rtl=True if (language or '').lower() in _RTL_LANGUAGES else None,
         skip_entity_detection=True,
+        media=[InputRichMessageMedia(id=_START_VIDEO_MEDIA_ID, media=InputMediaVideo(media=payload.video_file_id))]
+        if payload.video_file_id
+        else None,
     )
 
 
@@ -679,13 +733,14 @@ def _apply_inline_buttons(
 async def _send_rich_menu(
     bot: Bot,
     chat_id: int,
-    rich_html: str,
+    payload: RichMenuPayload,
     keyboard: InlineKeyboardMarkup,
     language: str | None,
 ) -> Message | None:
     global _effect_unavailable
 
-    rich_html, keyboard = _apply_inline_buttons(rich_html, keyboard)
+    rich_html, keyboard = _apply_inline_buttons(payload.html, keyboard)
+    payload = payload.with_html(rich_html)
     effect_id = (settings.MAIN_MENU_RICH_EFFECT_ID or '').strip() or None
     if _effect_unavailable:
         effect_id = None
@@ -693,7 +748,7 @@ async def _send_rich_menu(
     try:
         return await bot.send_rich_message(
             chat_id=chat_id,
-            rich_message=_input_rich_message(rich_html, language),
+            rich_message=_input_rich_message(payload, language),
             reply_markup=keyboard,
             message_effect_id=effect_id,
         )
@@ -706,7 +761,7 @@ async def _send_rich_menu(
             )
             return await bot.send_rich_message(
                 chat_id=chat_id,
-                rich_message=_input_rich_message(_strip_tg_time(rich_html), language),
+                rich_message=_input_rich_message(payload.with_html(_strip_tg_time(rich_html)), language),
                 reply_markup=keyboard,
                 message_effect_id=effect_id,
             )
@@ -721,7 +776,7 @@ async def _send_rich_menu(
             )
             return await bot.send_rich_message(
                 chat_id=chat_id,
-                rich_message=_input_rich_message(rich_html, language),
+                rich_message=_input_rich_message(payload, language),
                 reply_markup=keyboard,
             )
         raise
@@ -740,14 +795,14 @@ async def try_send_rich_main_menu(
         return False
 
     try:
-        rich_html = await build_main_menu_rich_html(db_user, texts, db)
+        payload = await build_main_menu_rich_payload(db_user, texts, db)
     except Exception as error:
         logger.error('Ошибка сборки rich-меню', error=error, user_id=getattr(db_user, 'id', None))
         return False
 
     try:
-        sent = await _send_rich_menu(bot, chat_id, rich_html, keyboard, db_user.language)
-        await remember_live_menu(chat_id, getattr(sent, 'message_id', None), db_user, texts, keyboard)
+        sent = await _send_rich_menu(bot, chat_id, payload, keyboard, db_user.language)
+        await remember_live_menu(chat_id, getattr(sent, 'message_id', None), db_user, texts, keyboard, payload=payload)
         return True
     except TelegramForbiddenError:
         # Пользователь заблокировал бота — классический рендер упадёт так же, не ретраим.
@@ -756,7 +811,7 @@ async def try_send_rich_main_menu(
     except (TelegramNotFound, TelegramBadRequest) as error:
         if _looks_like_unsupported(error):
             _mark_rich_unavailable(error)
-        elif _is_media_fetch_error(error) and _mark_logo_unavailable_once(error):
+        elif not payload.video_file_id and _is_media_fetch_error(error) and _mark_logo_unavailable_once(error):
             # Логотип не скачался — единственный повтор уже без него (флаг взведён).
             return await try_send_rich_main_menu(bot, chat_id, db_user, texts, db, keyboard)
         else:
@@ -807,7 +862,7 @@ async def try_edit_rich_main_menu(
         return False
 
     try:
-        rich_html = await build_main_menu_rich_html(db_user, texts, db)
+        payload = await build_main_menu_rich_payload(db_user, texts, db)
     except Exception as error:
         logger.error('Ошибка сборки rich-меню', error=error, user_id=getattr(db_user, 'id', None))
         return False
@@ -815,7 +870,8 @@ async def try_edit_rich_main_menu(
     chat_id = message.chat.id
     language = db_user.language
     live_keyboard = keyboard
-    rich_html, keyboard = _apply_inline_buttons(rich_html, keyboard, for_edit=True)
+    rich_html, keyboard = _apply_inline_buttons(payload.html, keyboard, for_edit=True)
+    edit_payload = payload.with_html(rich_html)
 
     is_editable_as_rich = (
         not isinstance(message, InaccessibleMessage)
@@ -838,7 +894,7 @@ async def try_edit_rich_main_menu(
                 EditMessageText(
                     chat_id=chat_id,
                     message_id=message.message_id,
-                    rich_message=_input_rich_message(rich_html, language),
+                    rich_message=_input_rich_message(edit_payload, language),
                     reply_markup=keyboard,
                     parse_mode=None,
                 )
@@ -857,16 +913,16 @@ async def try_edit_rich_main_menu(
                     # отредактирует уцелевшее сообщение на месте и не наплодит дублей.
                     logger.debug('Не удалось удалить сообщение перед rich-меню', error=str(delete_error))
                     return False
-            sent = await _send_rich_menu(bot, chat_id, rich_html, keyboard, language)
+            sent = await _send_rich_menu(bot, chat_id, edit_payload, keyboard, language)
             menu_message_id = getattr(sent, 'message_id', None)
-        await remember_live_menu(chat_id, menu_message_id, db_user, texts, live_keyboard)
+        await remember_live_menu(chat_id, menu_message_id, db_user, texts, live_keyboard, payload=payload)
         return True
     except TelegramForbiddenError:
         logger.warning('Не удалось показать rich-меню: бот заблокирован пользователем', chat_id=chat_id)
         return True
     except (TelegramNotFound, TelegramBadRequest) as error:
         if 'message is not modified' in str(error).lower():
-            await remember_live_menu(chat_id, message.message_id, db_user, texts, live_keyboard)
+            await remember_live_menu(chat_id, message.message_id, db_user, texts, live_keyboard, payload=payload)
             return True
         if _is_rich_date_error(error) and is_editable_as_rich:
             # Та же страховка, что и в _send_rich_menu: дата вне диапазона роняет
@@ -877,19 +933,19 @@ async def try_edit_rich_main_menu(
                     EditMessageText(
                         chat_id=chat_id,
                         message_id=message.message_id,
-                        rich_message=_input_rich_message(_strip_tg_time(rich_html), language),
+                        rich_message=_input_rich_message(edit_payload.with_html(_strip_tg_time(rich_html)), language),
                         reply_markup=keyboard,
                         parse_mode=None,
                     )
                 )
-                await remember_live_menu(chat_id, message.message_id, db_user, texts, live_keyboard)
+                await remember_live_menu(chat_id, message.message_id, db_user, texts, live_keyboard, payload=payload)
                 return True
             except TelegramBadRequest as retry_error:
                 logger.warning('Повтор rich-меню без tg-time не удался', error=str(retry_error))
                 return False
         if _looks_like_unsupported(error):
             _mark_rich_unavailable(error)
-        elif _is_media_fetch_error(error) and _mark_logo_unavailable_once(error):
+        elif not payload.video_file_id and _is_media_fetch_error(error) and _mark_logo_unavailable_once(error):
             # Логотип не скачался — единственный повтор уже без него (флаг взведён).
             return await try_edit_rich_main_menu(callback, db_user, texts, db, live_keyboard)
         else:

@@ -93,6 +93,7 @@ def env(monkeypatch):
     monkeypatch.setattr(menu, 'get_main_menu_text', AsyncMock(side_effect=fallback_text))
     monkeypatch.setattr(start, 'cmd_start', AsyncMock(side_effect=AssertionError('Must not run /start')))
     monkeypatch.setattr(rich_menu, 'remember_live_menu', AsyncMock())
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value=None))
     state.bot = SimpleNamespace(send_rich_message=AsyncMock(side_effect=send), send_message=AsyncMock(side_effect=send))
     yield state
     rich_menu._reset_rich_menu_availability()
@@ -202,6 +203,42 @@ async def test_logo_is_removed_for_one_retry_only(env, monkeypatch, second_fails
     assert env.bot.send_message.await_count == int(second_fails)
     assert rich_menu.remember_live_menu.await_count == int(not second_fails)
     assert len(env.sessions) == 1
+
+
+async def test_broadcast_video_snapshot_is_loaded_before_session_closes(env, monkeypatch):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', 'https://example.test/logo.png')
+
+    async def load_video(db):
+        assert env.open_sessions == 1
+        assert db is env.sessions[-1]
+        return 'saved-video'
+
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(side_effect=load_video))
+    await sender.send_current_main_menu(env.bot, 100)
+
+    request = env.bot.send_rich_message.await_args.kwargs['rich_message']
+    assert request.html.startswith('<video src="tg://video?id=start_video"></video>')
+    assert '<img ' not in request.html
+    assert 'User 100' in request.html
+    assert request.media[0].media.media == 'saved-video'
+    assert rich_menu.remember_live_menu.await_args.kwargs['payload'].video_file_id == 'saved-video'
+    assert env.open_sessions == 0
+    env.bot.send_rich_message.assert_awaited_once()
+    env.bot.send_message.assert_not_awaited()
+
+
+async def test_rejected_broadcast_video_falls_back_once_without_disabling_logo(env, monkeypatch):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', 'https://example.test/logo.png')
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value='rejected-video'))
+    env.bot.send_rich_message.side_effect = TelegramBadRequest(method=None, message='MEDIA_EMPTY')
+
+    await sender.send_current_main_menu(env.bot, 100)
+
+    env.bot.send_rich_message.assert_awaited_once()
+    env.bot.send_message.assert_awaited_once()
+    rich_menu.remember_live_menu.assert_not_awaited()
+    assert rich_menu._resolve_rich_logo_url() == 'https://example.test/logo.png'
+    assert rich_menu.is_rich_menu_enabled() is True
 
 
 async def test_classic_delivery_failure_propagates(env, monkeypatch):

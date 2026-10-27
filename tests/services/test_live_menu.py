@@ -19,7 +19,7 @@ import app.handlers.menu as menu_mod
 from app.config import Settings, settings
 from app.external.remnawave_api import RemnaWaveAPI
 from app.localization.texts import get_texts
-from app.services import live_menu_service as live
+from app.services import live_menu_service as live, start_media_service
 from app.services.monitoring_service import MonitoringService
 from app.utils import rich_menu
 from app.utils.cache import CacheService
@@ -101,7 +101,7 @@ def env(monkeypatch):
     monkeypatch.setattr(rich_menu, 'cache', cache)
     monkeypatch.setattr(live, 'AsyncSessionLocal', session)
     monkeypatch.setattr(live, 'get_user_by_telegram_id', AsyncMock(return_value=user))
-    monkeypatch.setattr(live, 'build_main_menu_rich_html', AsyncMock(return_value='<p>menu</p>'))
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value=None))
     monkeypatch.setattr(live, '_pool_counters', lambda pool: None)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     monkeypatch.setattr(menu_mod, 'build_main_menu_keyboard', AsyncMock(return_value=keyboard))
@@ -114,7 +114,8 @@ def env(monkeypatch):
 async def _track(env, key=KEY):
     """Меню показано до изменений: снимок с текущими данными."""
     keyboard = await menu_mod.build_main_menu_keyboard(env.user, env.db)
-    fp = rich_menu.live_menu_fingerprint(env.user, get_texts('ru'), keyboard)
+    payload = await rich_menu.build_main_menu_rich_payload(env.user, get_texts('ru'), env.db)
+    fp = rich_menu.live_menu_fingerprint(env.user, get_texts('ru'), keyboard, payload=payload)
     await env.cache.set(key, {'m': 42, 'fp': fp}, expire=60)
 
 
@@ -253,6 +254,104 @@ async def test_visible_change_edits_the_same_message(env):
     assert env.cache.redis_client.ex[KEY] == 60, 'background edit keeps the original TTL'
 
 
+@pytest.mark.parametrize(
+    ('before', 'after'),
+    [(None, 'video-1'), ('video-1', 'video-2'), ('video-1', None)],
+)
+async def test_video_add_replace_remove_updates_live_menu_once(env, monkeypatch, before, after):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', 'https://example.test/logo.png')
+    video = AsyncMock(return_value=before)
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', video)
+    await _track(env)
+    previous_fp = (await env.cache.get(KEY))['fp']
+    video.return_value = after
+
+    assert await live._refresh_one(env.bot, KEY) == 'edited'
+
+    request = env.bot.await_args.args[0].rich_message
+    if after:
+        assert request.html.startswith('<video src="tg://video?id=start_video"></video>')
+        assert request.media[0].media.media == after
+        assert '<img ' not in request.html
+    else:
+        assert '<video' not in request.html
+        assert request.html.startswith('<img src="https://example.test/logo.png"/>')
+        assert request.media is None
+    assert (await env.cache.get(KEY))['fp'] != previous_fp
+    env.bot.reset_mock()
+    assert await live._refresh_one(env.bot, KEY) is None
+    env.bot.assert_not_awaited()
+
+
+async def test_cold_live_refresh_reads_saved_video_before_comparing_fingerprint(env, monkeypatch):
+    await _track(env)
+    start_media_service.reset_start_video_cache()
+    env.db.execute.return_value = SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(value='saved-video'))
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', start_media_service.get_start_video_file_id)
+
+    try:
+        assert await live._refresh_one(env.bot, KEY) == 'edited'
+        assert env.bot.await_args.args[0].rich_message.media[0].media.media == 'saved-video'
+        env.db.execute.assert_awaited_once()
+        env.bot.reset_mock()
+        assert await live._refresh_one(env.bot, KEY) is None
+        env.bot.assert_not_awaited()
+        env.db.execute.assert_awaited_once()
+    finally:
+        start_media_service.reset_start_video_cache()
+
+
+async def test_live_date_retry_keeps_video_and_inline_buttons(env, monkeypatch):
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value='video-1'))
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_INLINE_BUTTONS', True)
+    monkeypatch.setattr(menu_mod, 'build_main_menu_keyboard', AsyncMock(return_value=_make_keyboard()))
+    await _track(env)
+    env.user.full_name = 'Changed'
+    env.bot.side_effect = [TelegramBadRequest(method=None, message='RICH_MESSAGE_DATE_INVALID'), None]
+
+    assert await live._refresh_one(env.bot, KEY) == 'edited'
+    assert env.bot.await_count == 2
+    for call in env.bot.await_args_list:
+        message = call.args[0].rich_message
+        assert message.media[0].media.media == 'video-1'
+        assert 'tg://video?id=start_video' in message.html
+        assert 'data="y"' in message.html
+
+
+async def test_rejected_live_video_does_not_disable_logo_or_loop(env, monkeypatch):
+    monkeypatch.setattr(settings, 'MAIN_MENU_RICH_LOGO_URL', 'https://example.test/logo.png')
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', AsyncMock(return_value='video-1'))
+    await _track(env)
+    env.user.full_name = 'Changed'
+    env.bot.side_effect = TelegramBadRequest(method=None, message='MEDIA_EMPTY')
+
+    assert await live._refresh_one(env.bot, KEY) == 'dropped'
+    env.bot.assert_awaited_once()
+    assert await env.cache.get(KEY) is None
+    assert rich_menu._resolve_rich_logo_url() == 'https://example.test/logo.png'
+    assert rich_menu.is_rich_menu_enabled() is True
+
+
+async def test_video_change_during_live_edit_is_not_recorded_before_delivery(env, monkeypatch):
+    await _track(env)
+    video = AsyncMock(return_value='video-1')
+    monkeypatch.setattr(rich_menu, 'get_start_video_file_id', video)
+
+    async def replace_during_edit(request):
+        assert request.rich_message.media[0].media.media == 'video-1'
+        video.return_value = 'video-2'
+
+    env.bot.side_effect = replace_during_edit
+    assert await live._refresh_one(env.bot, KEY) == 'edited'
+    first_fp = (await env.cache.get(KEY))['fp']
+    env.bot.side_effect = None
+    assert await live._refresh_one(env.bot, KEY) == 'edited'
+    assert env.bot.await_args.args[0].rich_message.media[0].media.media == 'video-2'
+    assert (await env.cache.get(KEY))['fp'] != first_fp
+    assert await live._refresh_one(env.bot, KEY) is None
+    assert env.bot.await_count == 2
+
+
 async def test_multi_tariff_only_primary_display_is_tracked(env, monkeypatch):
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
     sibling = _make_subscription(datetime.now(UTC), status='disabled')
@@ -272,9 +371,9 @@ async def test_new_menu_during_build_is_not_overwritten(env, monkeypatch):
 
     async def build_while_user_opens_menu(user, texts, db):
         await env.cache.set(KEY, {'m': 99, 'fp': 'new'})
-        return '<p>menu</p>'
+        return rich_menu.RichMenuPayload('<p>menu</p>')
 
-    monkeypatch.setattr(live, 'build_main_menu_rich_html', build_while_user_opens_menu)
+    monkeypatch.setattr(live, 'build_main_menu_rich_payload', build_while_user_opens_menu)
 
     assert await live._refresh_one(env.bot, KEY) is None
     env.bot.assert_not_awaited()
@@ -633,7 +732,8 @@ async def test_send_and_edit_track_original_keyboard_when_buttons_are_inline(env
     keyboard = _make_keyboard()
     user = _make_user(None)
     texts = DummyTexts()
-    expected = rich_menu.live_menu_fingerprint(user, texts, keyboard)
+    payload = await rich_menu.build_main_menu_rich_payload(user, texts, env.db)
+    expected = rich_menu.live_menu_fingerprint(user, texts, keyboard, payload=payload)
     bot = AsyncMock()
     bot.send_rich_message.return_value = SimpleNamespace(message_id=55)
     assert await rich_menu.try_send_rich_main_menu(bot, 100, user, texts, env.db, keyboard)
