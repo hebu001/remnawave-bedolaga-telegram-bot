@@ -58,7 +58,9 @@ async def preview_tariff_switch(
 
     # Use actual_status for correct status check (handles time-based expiration)
     actual_status = subscription.actual_status
-    if actual_status == 'expired':
+    if actual_status == 'expired' or (
+        actual_status == 'limited' and remaining_days_for_switch(subscription.end_date) == 0
+    ):
         # For expired subscriptions, user should purchase a new tariff, not switch
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -81,7 +83,7 @@ async def preview_tariff_switch(
                 'use_purchase_flow': True,
             },
         )
-    if actual_status not in ('active', 'trial'):
+    if actual_status not in ('active', 'trial', 'limited'):
         # For disabled/pending subscriptions, block switching with generic error
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -236,7 +238,9 @@ async def switch_tariff(
 
     # Use actual_status for correct status check (handles time-based expiration)
     actual_status = subscription.actual_status
-    if actual_status == 'expired':
+    if actual_status == 'expired' or (
+        actual_status == 'limited' and remaining_days_for_switch(subscription.end_date) == 0
+    ):
         # For expired subscriptions, user should purchase a new tariff, not switch
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -259,7 +263,7 @@ async def switch_tariff(
                 'use_purchase_flow': True,
             },
         )
-    if actual_status not in ('active', 'trial'):
+    if actual_status not in ('active', 'trial', 'limited'):
         # For disabled/pending subscriptions, block switching with generic error
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -319,6 +323,17 @@ async def switch_tariff(
 
     await undo_grace_overlay_echo(db, subscription)
     remaining_days = remaining_days_for_switch(subscription.end_date)
+    if remaining_days == 0:
+        # Grace cleanup can restore an already expired billing end date. Never
+        # sell a zero-cost switch using days that were only temporary access.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                'code': 'subscription_expired',
+                'message': 'Subscription is expired. Please purchase a new tariff instead of switching.',
+                'use_purchase_flow': True,
+            },
+        )
 
     # Calculate cost (PricingEngine handles all cases: periodic<->periodic, daily->periodic, periodic->daily)
     switch_result = pricing_engine.calculate_tariff_switch_cost(
@@ -486,6 +501,15 @@ async def switch_tariff(
     reset_used_traffic = should_reset_used_traffic(upgrade_cost)
     if reset_used_traffic:
         subscription.traffic_used_gb = 0.0
+
+    if subscription.status in ('active', 'limited'):
+        # Exhausted traffic does not cancel the paid term. Re-enable only when
+        # the new quota (or a paid reset) actually provides traffic; a free
+        # switch must not bypass the exhausted quota.
+        if subscription.traffic_limit_gb == 0 or subscription.traffic_used_gb < subscription.traffic_limit_gb:
+            subscription.status = 'active'
+        else:
+            subscription.status = 'limited'
 
     if switching_to_daily:
         # Switching TO daily - reset end_date to 1 day, set last_daily_charge_at
