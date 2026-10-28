@@ -196,6 +196,7 @@ class CardlinkService:
         success_url: str | None = None,
         fail_url: str | None = None,
         language: str | None = None,
+        name: str | None = None,
     ) -> dict[str, Any]:
         if not self.is_available():
             raise CardlinkAPIError('Cardlink is not available for new payments')
@@ -203,6 +204,8 @@ class CardlinkService:
             raise CardlinkAPIError('Invalid Cardlink payment amount')
         if currency != 'RUB' or not _valid_text(order_id) or not isinstance(description, str):
             raise CardlinkAPIError('Invalid Cardlink payment parameters')
+        if name is not None and not _valid_text(name):
+            raise CardlinkAPIError('Invalid Cardlink payment name')
         payload = {
             'amount': f'{amount_kopeks // 100}.{amount_kopeks % 100:02d}',
             'description': description,
@@ -214,6 +217,8 @@ class CardlinkService:
             'payer_pays_commission': '1' if getattr(settings, 'CARDLINK_PAYER_PAYS_COMMISSION', False) else '0',
             'locale': 'ru' if language is None or language.lower().startswith('ru') else 'en',
         }
+        if name is not None:
+            payload['name'] = name
         ttl = getattr(settings, 'CARDLINK_LINK_TTL_SECONDS', 900)
         if type(ttl) is not int or ttl <= 0:
             raise CardlinkAPIError('Invalid Cardlink bill lifetime')

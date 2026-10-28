@@ -7,11 +7,12 @@ from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.crud import cardlink as cardlink_crud
-from app.database.models import CardlinkPayment, PaymentMethod, TransactionType
+from app.database.models import CardlinkPayment, PaymentMethod, TransactionType, User
 from app.services.cardlink_service import CardlinkAPIError, complete_bill_payments, money_to_kopeks
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
@@ -37,12 +38,20 @@ class CardlinkPaymentMixin:
             return None
         if not settings.CARDLINK_MIN_AMOUNT_KOPEKS <= amount_kopeks <= settings.CARDLINK_MAX_AMOUNT_KOPEKS:
             return None
+        # Cardlink searches the separate link name, not its description. The
+        # caller's user_id is a database ID; resolve the payer's Telegram ID.
+        name = 'Оплата заказа'
+        if user_id is not None:
+            telegram_id = await db.scalar(select(User.telegram_id).where(User.id == user_id))
+            if telegram_id is not None:
+                name = f'Оплата заказа user_id ({telegram_id})'
         order_id = f'cardlink_{uuid.uuid4().hex}'
         try:
             response = await service.create_payment_link(
                 amount_kopeks=amount_kopeks,
                 currency='RUB',
                 description=description,
+                name=name,
                 order_id=order_id,
                 # Cardlink POSTs to merchant-approved return URLs. Generic
                 # cabinet/subpage SPA URLs passed by callers are GET-only.

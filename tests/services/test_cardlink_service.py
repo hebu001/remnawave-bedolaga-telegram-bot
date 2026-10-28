@@ -214,12 +214,15 @@ async def test_create_explicit_optional_fields(config, http):
         language='en',
         success_url='https://merchant.example/success',
         fail_url='https://merchant.example/fail',
+        name='Оплата заказа user_id (6294691865)',
     )
     data = http.calls[0]['data']
     assert data['payment_method'] == 'SBP'
     assert data['payer_pays_commission'] == '1'
     assert data['success_url'] == 'https://merchant.example/success'
     assert data['fail_url'] == 'https://merchant.example/fail'
+    assert data['name'] == 'Оплата заказа user_id (6294691865)'
+    assert data['description'] == 'Top-up'
     assert data['locale'] == 'en'
 
 

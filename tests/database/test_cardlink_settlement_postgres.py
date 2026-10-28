@@ -676,6 +676,26 @@ async def test_creation_uses_merchant_return_urls_not_generic_spa_urls(postgres_
     called = service.cardlink_service.create_payment_link.await_args.kwargs
     assert called['success_url'] == 'https://merchant.example.test/cardlink/return'
     assert called['fail_url'] is None
+    assert called['name'] == 'Оплата заказа'
+
+
+@pytest.mark.parametrize('telegram_id', [6294691865, None])
+async def test_creation_names_link_by_telegram_identity_not_local_user_id(postgres_database, service, telegram_id):
+    async with postgres_sessions(postgres_database, TABLES) as (db, watcher):
+        user = User(telegram_id=telegram_id, email='cardlink-name@example.test', first_name='Fixture', language='ru')
+        db.add(user)
+        await db.commit()
+        assert user.id != telegram_id
+        result = await service.create_cardlink_payment(db, user.id, AMOUNT, 'Original order description')
+        assert result
+        called = service.cardlink_service.create_payment_link.await_args.kwargs
+        expected = f'Оплата заказа user_id ({telegram_id})' if telegram_id is not None else 'Оплата заказа'
+        assert called['name'] == expected
+        assert called['description'] == 'Original order description'
+        receipt = await watcher.get(CardlinkPayment, result['local_payment_id'])
+        assert receipt.user_id == user.id
+        assert receipt.description == 'Original order description'
+        assert receipt.amount_kopeks == AMOUNT and not receipt.is_paid
 
 
 async def test_unrecognized_subpage_metadata_does_not_acknowledge_payment(postgres_database, service, monkeypatch):
