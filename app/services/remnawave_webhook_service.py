@@ -43,7 +43,9 @@ from app.services.grace_access_runtime import get_open_grace_subscription_ids, g
 from app.services.grace_access_service import GraceReason
 from app.services.notification_delivery_service import NotificationType, notification_delivery_service
 from app.services.panel_sync import WEBHOOK, panel_date_behind_paid_renewal, project_onto_subscription, read_panel_user
+from app.services.renewal_reset_notice import consume_renewal_reset
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button, build_subscription_extend_button
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -56,6 +58,7 @@ _TEXT_KEY_TO_NOTIFICATION_TYPE: dict[str, NotificationType] = {
     'WEBHOOK_SUB_ENABLED': NotificationType.WEBHOOK_SUB_ENABLED,
     'WEBHOOK_SUB_LIMITED': NotificationType.WEBHOOK_SUB_LIMITED,
     'WEBHOOK_SUB_TRAFFIC_RESET': NotificationType.WEBHOOK_SUB_TRAFFIC_RESET,
+    'WEBHOOK_SUB_RENEWED_RESET': NotificationType.WEBHOOK_SUB_TRAFFIC_RESET,
     'WEBHOOK_SUB_DELETED': NotificationType.WEBHOOK_SUB_DELETED,
     'WEBHOOK_SUB_REVOKED': NotificationType.WEBHOOK_SUB_REVOKED,
     'WEBHOOK_SUB_EXPIRES_72H': NotificationType.WEBHOOK_SUB_EXPIRING,
@@ -77,6 +80,7 @@ _TEXT_KEY_TO_SETTING: dict[str, str] = {
     'WEBHOOK_SUB_ENABLED': 'WEBHOOK_NOTIFY_SUB_STATUS',
     'WEBHOOK_SUB_LIMITED': 'WEBHOOK_NOTIFY_SUB_LIMITED',
     'WEBHOOK_SUB_TRAFFIC_RESET': 'WEBHOOK_NOTIFY_TRAFFIC_RESET',
+    'WEBHOOK_SUB_RENEWED_RESET': 'WEBHOOK_NOTIFY_TRAFFIC_RESET',
     'WEBHOOK_SUB_DELETED': 'WEBHOOK_NOTIFY_SUB_DELETED',
     'WEBHOOK_SUB_REVOKED': 'WEBHOOK_NOTIFY_SUB_REVOKED',
     'WEBHOOK_SUB_EXPIRES_72H': 'WEBHOOK_NOTIFY_SUB_EXPIRING',
@@ -1063,7 +1067,23 @@ class RemnaWaveWebhookService:
                 return
 
         texts = get_texts(user.language)
-        message = texts.get(text_key)
+        if text_key == 'WEBHOOK_SUB_RENEWED_RESET':
+            default = (
+                (
+                    '✅ <b>Подписка продлена{tariff_label}</b>\n\n'
+                    'Трафик сброшен. Лимит снова доступен в полном объёме.\n\n'
+                    'Подписка действует до <b>{end_date}</b>.'
+                )
+                if user.language == 'ru'
+                else (
+                    '✅ <b>Subscription renewed{tariff_label}</b>\n\n'
+                    'Traffic has been reset. Your full allowance is available again.\n\n'
+                    'Valid until <b>{end_date}</b>.'
+                )
+            )
+            message = texts.t(text_key, default)
+        else:
+            message = texts.get(text_key)
         if not message:
             logger.warning('Missing locale key for language', text_key=text_key, language=user.language)
             return
@@ -1078,7 +1098,7 @@ class RemnaWaveWebhookService:
                 # MissingGreenlet from lazy loading in async context
                 loaded_tariff = sa_inspect(subscription).dict.get('tariff')
                 if loaded_tariff is not None:
-                    tariff_label = f' «{loaded_tariff.name}»'
+                    tariff_label = f' «{html.escape(loaded_tariff.name)}»'
             format_kwargs['tariff_label'] = tariff_label
 
         if format_kwargs:
@@ -1302,10 +1322,14 @@ class RemnaWaveWebhookService:
         ):
             return
 
+        renewed_until = await consume_renewal_reset(subscription, data)
         await self._notify_user(
             user,
-            'WEBHOOK_SUB_TRAFFIC_RESET',
+            'WEBHOOK_SUB_RENEWED_RESET' if renewed_until else 'WEBHOOK_SUB_TRAFFIC_RESET',
             reply_markup=self._get_subscription_keyboard(user),
+            format_kwargs={'end_date': format_local_datetime(renewed_until, '%d.%m.%Y %H:%M %Z')}
+            if renewed_until
+            else None,
             subscription=subscription,
         )
 

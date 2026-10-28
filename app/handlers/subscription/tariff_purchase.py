@@ -28,6 +28,7 @@ from app.database.models import Tariff, Transaction, TransactionType, User
 from app.localization.texts import Texts, get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.panel_sync import should_create_panel_account
+from app.services.renewal_reset_notice import is_tariff_renewal
 from app.services.subscription_service import SubscriptionService
 from app.services.tariff_switch_policy import remaining_days_for_switch, should_reset_used_traffic
 from app.services.telegram_checkout import cabinet_checkout_keyboard
@@ -1563,6 +1564,8 @@ async def handle_custom_confirm(
             pass
         return
 
+    _purchase_is_renewal = is_tariff_renewal(existing_subscription, tariff.id)
+
     # Получаем список серверов из тарифа
     squads = tariff.allowed_squads or []
 
@@ -1655,14 +1658,14 @@ async def handle_custom_confirm(
                     db,
                     subscription,
                     reset_traffic=True,
-                    reset_reason='покупка тарифа',
+                    reset_reason='продление тарифа' if _purchase_is_renewal else 'покупка тарифа',
                 )
             else:
                 await subscription_service.update_remnawave_user(
                     db,
                     subscription,
                     reset_traffic=True,
-                    reset_reason='покупка тарифа',
+                    reset_reason='продление тарифа' if _purchase_is_renewal else 'покупка тарифа',
                 )
         except Exception as e:
             logger.error('Ошибка обновления Remnawave', error=e)
@@ -2169,6 +2172,7 @@ async def confirm_tariff_purchase(
 
     # Reuse existing_sub fetched above for device pricing
     existing_subscription = existing_sub
+    _purchase_is_renewal = is_tariff_renewal(existing_subscription, tariff.id)
 
     try:
         if settings.is_multi_tariff_enabled():
@@ -2371,14 +2375,14 @@ async def confirm_tariff_purchase(
                 db,
                 subscription,
                 reset_traffic=True,
-                reset_reason='покупка тарифа',
+                reset_reason='продление тарифа' if _purchase_is_renewal else 'покупка тарифа',
             )
         else:
             await subscription_service.update_remnawave_user(
                 db,
                 subscription,
                 reset_traffic=True,
-                reset_reason='покупка тарифа',
+                reset_reason='продление тарифа' if _purchase_is_renewal else 'покупка тарифа',
             )
     except Exception as e:
         logger.error('Ошибка обновления Remnawave', error=e)

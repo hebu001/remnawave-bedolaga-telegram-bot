@@ -41,6 +41,7 @@ from app.services.notification_delivery_service import (
 )
 from app.services.panel_sync import should_create_panel_account
 from app.services.pricing_engine import PricingEngine, pricing_engine
+from app.services.renewal_reset_notice import is_tariff_renewal
 from app.services.subscription_purchase_service import (
     MiniAppSubscriptionPurchaseService,
     PurchaseBalanceError,
@@ -1024,6 +1025,7 @@ async def purchase_tariff(
         reset_used_traffic = True
         # До чистки триалов: защитная ветка ниже и extend_subscription снимают флаг.
         _purchase_converts_trial = bool(subscription and subscription.is_trial)
+        _purchase_is_renewal = is_tariff_renewal(subscription, tariff.id) and not is_daily_tariff
         try:
             # --- Trial cleanup: find and kill all trials BEFORE creating/extending ---
             from app.database.crud.subscription import deactivate_user_trial_subscriptions
@@ -1198,7 +1200,7 @@ async def purchase_tariff(
                         db,
                         subscription,
                         reset_traffic=reset_used_traffic,
-                        reset_reason='покупка тарифа (cabinet)',
+                        reset_reason='продление тарифа' if _purchase_is_renewal else 'покупка тарифа (cabinet)',
                         sync_squads=True,
                     )
                 else:
@@ -1206,7 +1208,7 @@ async def purchase_tariff(
                         db,
                         subscription,
                         reset_traffic=True,
-                        reset_reason='покупка тарифа (cabinet)',
+                        reset_reason='продление тарифа' if _purchase_is_renewal else 'покупка тарифа (cabinet)',
                     )
         except Exception as remnawave_error:
             logger.error('Failed to sync subscription with RemnaWave', remnawave_error=remnawave_error)

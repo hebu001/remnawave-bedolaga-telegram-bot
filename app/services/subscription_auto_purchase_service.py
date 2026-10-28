@@ -44,6 +44,7 @@ from app.services.gift_purchase_service import (
     quote_gift_purchase,
 )
 from app.services.pricing_engine import PricingEngine, pricing_engine
+from app.services.renewal_reset_notice import is_tariff_renewal
 from app.services.subscription_checkout_service import clear_subscription_checkout_draft
 from app.services.subscription_purchase_service import (
     MiniAppSubscriptionPurchaseService,
@@ -695,7 +696,9 @@ async def _auto_extend_subscription(
             db,
             updated_subscription,
             reset_traffic=should_reset_traffic,
-            reset_reason='смена тарифа' if is_tariff_change else 'продление подписки',
+            reset_reason=(
+                'конвертация триала' if was_trial else 'смена тарифа' if is_tariff_change else 'продление подписки'
+            ),
             sync_squads=True,
         )
     except Exception as error:  # pragma: no cover - defensive logging
@@ -973,6 +976,8 @@ async def _auto_purchase_tariff(
         )
         return False
 
+    _purchase_is_renewal = is_tariff_renewal(existing_subscription, tariff.id)
+
     # Получаем список серверов из тарифа
     squads = tariff.allowed_squads or []
     if not squads:
@@ -1078,7 +1083,7 @@ async def _auto_purchase_tariff(
             db,
             subscription,
             reset_traffic=True,
-            reset_reason='покупка тарифа',
+            reset_reason='продление тарифа' if _purchase_is_renewal else 'покупка тарифа',
         )
     except Exception as error:
         logger.warning(

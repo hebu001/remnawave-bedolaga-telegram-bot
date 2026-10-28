@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.database import AsyncSessionLocal
 from app.database.models import RenewalSyncTask
+from app.services.renewal_reset_notice import reset_traffic_with_notice
 from app.services.subscription_service import SubscriptionService
 
 
@@ -143,7 +144,9 @@ async def process_renewal_sync(subscription_id: int, *, session_factory=None, fo
                             # SubscriptionService's reset helper is best effort
                             # and swallows failures. Durable intents require an
                             # explicit acknowledgement for every requested step.
-                            if reset_traffic and not await api.reset_user_traffic(panel_user_id):
+                            if reset_traffic and not await reset_traffic_with_notice(
+                                api, panel_user_id, sub, renewal=True
+                            ):
                                 raise RenewalSyncUnavailable('traffic_reset_failed')
                             if reset_devices and not await api.reset_user_devices(panel_user_id, strict=True):
                                 raise RenewalSyncUnavailable('device_reset_failed')

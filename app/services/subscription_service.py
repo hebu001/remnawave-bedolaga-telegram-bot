@@ -33,6 +33,7 @@ from app.services.panel_sync import (
     resolve_panel_user_tag,
 )
 from app.services.panel_sync.traffic_identity import remember_previous_traffic_identity
+from app.services.renewal_reset_notice import RENEWAL_REASONS, reset_traffic_with_notice
 from app.utils.subscription_utils import (
     resolve_hwid_device_limit_for_payload,
 )
@@ -447,7 +448,7 @@ class SubscriptionService:
             payload=payload,
         )
         if reset_traffic:
-            await self._reset_user_traffic(api, result.panel_user.id, user, reset_reason)
+            await self._reset_user_traffic(api, result.panel_user.id, user, reset_reason, subscription=subscription)
         return result.panel_user
 
     async def _create_or_update_remnawave_user_multi(
@@ -710,6 +711,7 @@ class SubscriptionService:
                             reset_id,
                             user,
                             reset_reason,
+                            subscription=subscription,
                         )
 
                 subscription.subscription_url = updated_user.subscription_url
@@ -813,12 +815,14 @@ class SubscriptionService:
         panel_user_id: int,
         user,  # User object вместо telegram_id
         reset_reason: str | None = None,
+        *,
+        subscription: Subscription | None = None,
     ) -> None:
         if not panel_user_id:
             return
 
         try:
-            await api.reset_user_traffic(panel_user_id)
+            await reset_traffic_with_notice(api, panel_user_id, subscription, renewal=reset_reason in RENEWAL_REASONS)
             reason_text = f' ({reset_reason})' if reset_reason else ''
             logger.info(
                 '🔄 Сброшен трафик RemnaWave', _format_user_log=self._format_user_log(user), reason_text=reason_text
