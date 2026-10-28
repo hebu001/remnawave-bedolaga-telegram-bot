@@ -343,6 +343,67 @@ async def test_numeric_provider_bill_is_exact_and_json_serializable(config, http
     assert json.loads(json.dumps(result)) == result
 
 
+@pytest.mark.anyio
+async def test_bill_payments_uses_fixed_get_and_preserves_exact_principal(config, http):
+    http.raw = (
+        '{"success":true,"data":[{"id":"payment123","bill_id":"bill123",'
+        '"bill_order_id":"order123","status":"SUCCESS","currency_in":"RUB",'
+        '"amount":57.89000000,"bill_amount":55,"refunded_amount":0.00000000}],'
+        '"links":{"prev":null,"next":null},'
+        '"meta":{"prev_cursor":null,"next_cursor":null,"per_page":50}}'
+    )
+    result = await CardlinkService().get_bill_payments('bill123')
+    assert result['data'][0]['amount'] == '57.89000000'
+    assert result['data'][0]['bill_amount'] == 55
+    assert result['data'][0]['refunded_amount'] == '0.00000000'
+    assert len(http.calls) == 1
+    assert http.calls[0]['method'] == 'GET'
+    assert http.calls[0]['url'] == 'https://cardlink.link/api/v1/bill/payments'
+    assert http.calls[0]['params'] == {'id': 'bill123'}
+    assert http.calls[0]['allow_redirects'] is False
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'wrong-bill',
+        'missing-meta',
+        'missing-links',
+        'missing-cursor',
+        'next',
+        'prev',
+        'cursor',
+        'data-dict',
+        'unknown-status',
+    ],
+)
+@pytest.mark.anyio
+async def test_bill_payments_rejects_incomplete_or_ambiguous_responses(config, http, case):
+    from tests.services.test_cardlink_commission import payments_response
+
+    response = payments_response()
+    if case == 'wrong-bill':
+        response['data'][0]['bill_id'] = 'other'
+    elif case.startswith('missing-'):
+        key = case.removeprefix('missing-')
+        if key == 'cursor':
+            response['meta'].pop('next_cursor')
+        else:
+            response.pop(key)
+    elif case in ('next', 'prev'):
+        response['links'][case] = 'https://untrusted.example/never-follow'
+    elif case == 'cursor':
+        response['meta']['next_cursor'] = 'more'
+    elif case == 'data-dict':
+        response['data'] = {}
+    else:
+        response['data'][0]['status'] = 'UNKNOWN'
+    http.response = response
+    with pytest.raises(CardlinkAPIError):
+        await CardlinkService().get_bill_payments('bill123')
+    assert len(http.calls) == 1
+
+
 @pytest.mark.parametrize(
     ('field', 'value'),
     [

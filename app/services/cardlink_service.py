@@ -54,6 +54,37 @@ def _valid_text(value: Any) -> bool:
     )
 
 
+def complete_bill_payments(response: Any) -> list[dict[str, Any]]:
+    """Require one complete API page; never follow provider pagination URLs."""
+    if not isinstance(response, dict) or not (response.get('success') is True or response.get('success') == 'true'):
+        raise CardlinkAPIError('Cardlink API did not confirm payment-list success')
+    links, meta, data = response.get('links'), response.get('meta'), response.get('data')
+    if (
+        not isinstance(links, dict)
+        or not isinstance(meta, dict)
+        or any(key not in links or links[key] is not None for key in ('prev', 'next'))
+        or any(key not in meta or meta[key] is not None for key in ('prev_cursor', 'next_cursor'))
+        or not isinstance(data, list)
+        or len(data) > 1000
+    ):
+        raise CardlinkAPIError('Cardlink API payment list is incomplete')
+    seen_ids = set()
+    for item in data:
+        if (
+            not isinstance(item, dict)
+            or any(not _valid_text(item.get(key)) for key in ('id', 'bill_id', 'bill_order_id'))
+            or item['id'] != item['id'].strip()
+            or item['id'] in seen_ids
+            or not isinstance(item.get('status'), str)
+            or item['status'] not in _STATUSES
+            or not isinstance(item.get('currency_in'), str)
+            or item['currency_in'] not in _CURRENCIES
+        ):
+            raise CardlinkAPIError('Cardlink API returned invalid payment details')
+        seen_ids.add(item['id'])
+    return data
+
+
 def _https_url_host(value: Any) -> str | None:
     if not isinstance(value, str) or not value or value != value.strip():
         return None
@@ -225,6 +256,15 @@ class CardlinkService:
             money_to_kopeks(result.get('amount'))
         except ValueError:
             raise CardlinkAPIError('Cardlink API returned an invalid bill amount') from None
+        return result
+
+    async def get_bill_payments(self, bill_id: str) -> dict[str, Any]:
+        """Fetch principal evidence for a paid bill whose total includes fees."""
+        if not _valid_text(bill_id):
+            raise CardlinkAPIError('Invalid Cardlink bill identifier')
+        result = await self._request('GET', '/api/v1/bill/payments', params={'id': bill_id})
+        if any(item['bill_id'] != bill_id for item in complete_bill_payments(result)):
+            raise CardlinkAPIError('Cardlink API returned payments for another bill')
         return result
 
     def verify_callback(self, payload: Mapping[str, Any]) -> bool:

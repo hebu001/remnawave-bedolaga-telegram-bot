@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud import cardlink as cardlink_crud
 from app.database.models import CardlinkPayment, PaymentMethod, TransactionType
-from app.services.cardlink_service import CardlinkAPIError, money_to_kopeks
+from app.services.cardlink_service import CardlinkAPIError, complete_bill_payments, money_to_kopeks
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
 
@@ -79,7 +79,53 @@ class CardlinkPaymentMixin:
         }
 
     @staticmethod
-    def _validate_cardlink_bill(payment: CardlinkPayment, bill: dict[str, Any]) -> bool:
+    def _cardlink_fee_payment(
+        payment: CardlinkPayment, bill: dict[str, Any], verified_payments: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Return only safe evidence fields from one authenticated successful payment.
+
+        bill_amount excludes the commission charged to the payer. Neither a
+        callback commission nor gross-minus-commission determines our principal.
+        """
+        try:
+            payments = complete_bill_payments(verified_payments)
+            if any(
+                item['bill_id'] != payment.bill_id
+                or item['bill_order_id'] != payment.order_id
+                or item['currency_in'] != payment.currency
+                for item in payments
+            ):
+                return None
+            settled = [item for item in payments if item['status'] in ('SUCCESS', 'OVERPAID')]
+            if len(settled) != 1 or settled[0]['status'] != 'SUCCESS':
+                return None
+            evidence = settled[0]
+            if (
+                money_to_kopeks(evidence.get('bill_amount')) != payment.amount_kopeks
+                or money_to_kopeks(evidence.get('amount')) != money_to_kopeks(bill.get('amount'))
+                or money_to_kopeks(evidence.get('refunded_amount'), allow_zero=True) != 0
+            ):
+                return None
+            return {
+                key: evidence[key]
+                for key in (
+                    'id',
+                    'bill_id',
+                    'bill_order_id',
+                    'status',
+                    'amount',
+                    'bill_amount',
+                    'currency_in',
+                    'refunded_amount',
+                )
+            }
+        except ValueError, TypeError, CardlinkAPIError:
+            return None
+
+    @staticmethod
+    def _validate_cardlink_bill(
+        payment: CardlinkPayment, bill: dict[str, Any], *, verified_payments: dict[str, Any] | None = None
+    ) -> bool:
         """The callback authenticates neither status nor transaction/currency.
 
         Only a complete authenticated API bill that matches this immutable local
@@ -88,13 +134,24 @@ class CardlinkPaymentMixin:
         if not isinstance(bill, dict):
             return False
         try:
-            return (
+            identity_matches = (
                 bill.get('id') == payment.bill_id
                 and bill.get('order_id') == payment.order_id
                 and bill.get('currency_in') == payment.currency == 'RUB'
                 and bill.get('type') == 'NORMAL'
-                and money_to_kopeks(bill.get('amount')) == payment.amount_kopeks
                 and bill.get('status') in ('NEW', 'PROCESS', 'UNDERPAID', 'SUCCESS', 'OVERPAID', 'FAIL')
+            )
+            if not identity_matches:
+                return False
+            gross_kopeks = money_to_kopeks(bill.get('amount'))
+            if gross_kopeks == payment.amount_kopeks:
+                # A concurrent order change must not turn fetched fee evidence
+                # into the simpler no-fee path and bypass its principal check.
+                return verified_payments is None
+            return (
+                gross_kopeks > payment.amount_kopeks
+                and bill['status'] in ('SUCCESS', 'OVERPAID')
+                and CardlinkPaymentMixin._cardlink_fee_payment(payment, bill, verified_payments) is not None
             )
         except ValueError, TypeError, CardlinkAPIError:
             return False
@@ -137,17 +194,27 @@ class CardlinkPaymentMixin:
         except CardlinkAPIError:
             logger.warning('Cardlink bill verification unavailable', payment_id=payment.id)
             return None
-        if not isinstance(bill, dict) or not self._validate_cardlink_bill(payment, bill):
+        verified_payments = None
+        if isinstance(bill, dict) and bill.get('status') in ('SUCCESS', 'OVERPAID'):
+            try:
+                if money_to_kopeks(bill.get('amount')) > payment.amount_kopeks:
+                    verified_payments = await service.get_bill_payments(payment.bill_id)
+            except CardlinkAPIError, ValueError, TypeError:
+                logger.warning('Cardlink payment principal verification unavailable', payment_id=payment.id)
+                return None
+        if not self._validate_cardlink_bill(payment, bill, verified_payments=verified_payments):
             logger.error('Cardlink bill does not match local order', payment_id=payment.id)
             return None
         payment = await cardlink_crud.get_cardlink_payment_by_id_for_update(db, payment.id)
-        if payment is None or not self._validate_cardlink_bill(payment, bill):
+        if payment is None or not self._validate_cardlink_bill(payment, bill, verified_payments=verified_payments):
             await db.rollback()
             return None
         try:
             status = bill['status']
             metadata = dict(payment.metadata_json or {})
             metadata['verified_bill'] = bill
+            if verified_payments is not None:
+                metadata['verified_payment'] = self._cardlink_fee_payment(payment, bill, verified_payments)
             payment.metadata_json = metadata
             if callback is not None:
                 payment.callback_payload = callback
@@ -160,7 +227,10 @@ class CardlinkPaymentMixin:
             if payment.is_paid and metadata.get('purpose') not in {'guest_purchase', 'subpage_renewal'}:
                 await db.commit()
                 return payment, bill
-            await self._finalize_cardlink_payment(db, payment, bill)
+            if verified_payments is None:
+                await self._finalize_cardlink_payment(db, payment, bill)
+            else:
+                await self._finalize_cardlink_payment(db, payment, bill, verified_payments=verified_payments)
             return payment, bill
         except BaseException:
             await db.rollback()
@@ -171,12 +241,16 @@ class CardlinkPaymentMixin:
         db: AsyncSession,
         payment: CardlinkPayment,
         bill: dict[str, Any],
+        *,
+        verified_payments: dict[str, Any] | None = None,
     ) -> CardlinkPayment:
         """Caller holds the receipt row lock through ledger and balance commit."""
         # _sync already authenticates and validates the API bill. Repeat the
         # settlement invariant here so another internal caller cannot persist a
         # paid receipt or dispatch guest/subpage fulfillment with weaker proof.
-        if not self._validate_cardlink_bill(payment, bill) or bill['status'] not in ('SUCCESS', 'OVERPAID'):
+        if not self._validate_cardlink_bill(payment, bill, verified_payments=verified_payments) or bill[
+            'status'
+        ] not in ('SUCCESS', 'OVERPAID'):
             raise ValueError('cardlink_payment_evidence_mismatch')
         payment_module = import_module('app.services.payment_service')
         metadata = dict(payment.metadata_json or {})

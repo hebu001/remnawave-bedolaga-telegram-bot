@@ -40,6 +40,7 @@ def service(monkeypatch):
     svc.cardlink_service.is_available.return_value = True
     svc.cardlink_service.verify_callback.return_value = True
     svc.cardlink_service.get_bill = AsyncMock()
+    svc.cardlink_service.get_bill_payments = AsyncMock(return_value=None)
     svc.cardlink_service.create_payment_link = AsyncMock(
         return_value={'bill_id': 'bill-123', 'link_page_url': 'https://cardlink.link/bill/bill-123'}
     )
@@ -157,6 +158,121 @@ async def test_competing_callback_and_poll_credit_once(postgres_database, servic
         assert entries == 2 and saw_waiter
         await assert_credit(watcher, user_id, payment_id)
         event_emitter.emit.assert_awaited_once()
+
+
+async def seed_with_payer_fee(db, service):
+    from tests.services.test_cardlink_commission import payments_response
+
+    user_id, payment_id, callback = await seed(db, service)
+    payment = await db.get(CardlinkPayment, payment_id)
+    payment.amount_kopeks = 5500
+    await db.commit()
+    service.cardlink_service.get_bill.return_value['amount'] = '57.89'
+    proof = payments_response(bill_id='bill-123', bill_order_id='order-123')
+    service.cardlink_service.get_bill_payments.return_value = proof
+    callback.update(OutSum='57.89', Commission='2.89')
+    return user_id, payment_id, callback
+
+
+async def assert_payer_fee_credit(db, user_id, payment_id, *, credited=True):
+    db.expunge_all()
+    user = await db.get(User, user_id)
+    receipt = await db.get(CardlinkPayment, payment_id)
+    deposits = (await db.scalars(select(Transaction).where(Transaction.payment_method == 'cardlink'))).all()
+    assert user.balance_kopeks == INITIAL + (5500 if credited else 0)
+    assert receipt.amount_kopeks == 5500
+    assert receipt.is_paid is credited
+    assert len(deposits) == int(credited)
+    if credited:
+        assert deposits[0].id == receipt.transaction_id
+        assert deposits[0].amount_kopeks == 5500
+        assert receipt.metadata_json['verified_bill']['amount'] == '57.89'
+        evidence = receipt.metadata_json['verified_payment']
+        assert evidence['bill_amount'] == 55 and evidence['amount'] == '57.89'
+        assert 'payer_email' not in evidence
+    else:
+        assert receipt.status == 'NEW' and receipt.paid_at is None and receipt.transaction_id is None
+        assert receipt.callback_payload is None
+        assert 'verified_bill' not in (receipt.metadata_json or {})
+        assert 'verified_payment' not in (receipt.metadata_json or {})
+    await db.rollback()
+
+
+@pytest.mark.parametrize('status', ['SUCCESS', 'OVERPAID'])
+async def test_fee_receipt_replay_and_poll_credit_only_principal_once(postgres_database, service, status):
+    async with postgres_sessions(postgres_database, TABLES) as (db, watcher):
+        user_id, payment_id, callback = await seed_with_payer_fee(db, service)
+        service.cardlink_service.get_bill.return_value['status'] = status
+        for _ in range(2):
+            assert await deliver(service, db, callback)
+        assert await deliver(service, db, callback, poll=True, payment_id=payment_id)
+        await assert_payer_fee_credit(watcher, user_id, payment_id)
+        event_emitter.emit.assert_awaited_once()
+
+
+@pytest.mark.parametrize('second_is_poll', [False, True])
+async def test_competing_fee_callback_and_poll_credit_principal_once(
+    postgres_database, service, monkeypatch, second_is_poll
+):
+    async with postgres_sessions(postgres_database, TABLES, count=3) as (first, second, watcher):
+        user_id, payment_id, callback = await seed_with_payer_fee(first, service)
+        original = crud.get_cardlink_payment_by_id_for_update
+        locked = asyncio.Event()
+        entries = 0
+        saw_waiter = False
+
+        async def observe(db, local_id):
+            nonlocal entries, saw_waiter
+            entries += 1
+            if entries == 1:
+                result = await original(db, local_id)
+                locked.set()
+                saw_waiter = await lock_waiter_appeared(watcher)
+                return result
+            await locked.wait()
+            return await original(db, local_id)
+
+        monkeypatch.setattr(crud, 'get_cardlink_payment_by_id_for_update', observe)
+        async with asyncio.timeout(15):
+            outcomes = await asyncio.gather(
+                deliver(service, first, callback),
+                deliver(service, second, callback, poll=second_is_poll, payment_id=payment_id),
+            )
+        assert all(outcomes)
+        assert entries == 2 and saw_waiter
+        await assert_payer_fee_credit(watcher, user_id, payment_id)
+        event_emitter.emit.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    'field,bad',
+    [
+        ('bill_amount', '54.99'),
+        ('bill_amount', '55.01'),
+        ('bill_amount', '54.999'),
+        ('amount', '57.88'),
+        ('amount', '57.90'),
+        ('currency_in', 'USD'),
+        ('bill_id', 'other'),
+        ('bill_order_id', 'other'),
+        ('status', 'UNDERPAID'),
+        ('status', 'OVERPAID'),
+        ('refunded_amount', '0.01'),
+        ('refunded_amount', None),
+    ],
+)
+@pytest.mark.parametrize('poll', [False, True])
+async def test_fee_mismatch_stays_unpaid_even_if_caller_commits(postgres_database, service, field, bad, poll):
+    async with postgres_sessions(postgres_database, TABLES) as (db, watcher):
+        user_id, payment_id, callback = await seed_with_payer_fee(db, service)
+        service.cardlink_service.get_bill_payments.return_value['data'][0][field] = bad
+        if poll:
+            assert await service.get_cardlink_payment_status(db, payment_id) is None
+        else:
+            assert await service.process_cardlink_webhook(db, callback) is False
+        await db.commit()
+        await assert_payer_fee_credit(watcher, user_id, payment_id, credited=False)
+        event_emitter.emit.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
