@@ -62,6 +62,26 @@ def _has_customer_fee(payment: Any, payload: Any) -> bool:
     return amount is not None and amount > principal
 
 
+def _stored_creation_link(payment: Any) -> dict[str, Any] | None:
+    """Validate the server's authenticated POST /links receipt, not a callback.
+
+    WATA deletes expired links. A fixed OneTime creation receipt can still
+    prove principal after GET /links returns 404; fresh Paid transaction proof
+    remains mandatory. Arbitrary-amount/reusable links cannot use this fallback.
+    """
+    metadata = getattr(payment, 'metadata_json', None)
+    response = metadata.get('response') if isinstance(metadata, dict) else None
+    if (
+        not isinstance(response, dict)
+        or not _identifier(getattr(payment, 'terminal_public_id', None))
+        or response.get('type') != 'OneTime'
+        or response.get('isArbitraryAmountAllowed') is not False
+        or not _matches_payment(payment, response, link=True)
+    ):
+        return None
+    return response
+
+
 def _matches_payment(
     payment: Any,
     payload: Any,
@@ -102,7 +122,18 @@ def _matches_payment(
         if callback_link is not None and callback_link != payment.payment_link_id:
             return False
     elif payload.get('id' if link else 'paymentLinkId') != payment.payment_link_id:
-        return False
+        # Explicit null is documented when the temporary link disappears.
+        # Missing/empty/foreign IDs never qualify. Recheck the stored receipt
+        # against the locked payment as well as before acquiring its lock.
+        creation = _stored_creation_link(payment) if not link else None
+        if (
+            link
+            or 'paymentLinkId' not in payload
+            or payload['paymentLinkId'] is not None
+            or creation is None
+            or verified_link != creation
+        ):
+            return False
     terminal = getattr(payment, 'terminal_public_id', None)
     if terminal and payload.get('terminalPublicId') != terminal:
         return False
@@ -137,6 +168,17 @@ def _extract_transaction_id(payment: Any, remote_link: dict[str, Any] | None = N
 
 class WataPaymentMixin:
     """Encapsulates creation and status handling for WATA payment links."""
+
+    async def _wata_link_evidence(self, payment: Any) -> dict[str, Any] | None:
+        try:
+            return await self.wata_service.get_payment_link(payment.payment_link_id)
+        except WataAPIError as error:
+            if error.status_code == 404:
+                return _stored_creation_link(payment)
+            logger.warning('WATA link verification unavailable', error_type=type(error).__name__)
+        except Exception as error:
+            logger.warning('WATA link verification unavailable', error_type=type(error).__name__)
+        return None
 
     async def create_wata_payment(
         self,
@@ -302,11 +344,7 @@ class WataPaymentMixin:
         if is_paid_callback and _has_customer_fee(payment, payload):
             if not getattr(self, 'wata_service', None):
                 return False
-            try:
-                verified_link = await self.wata_service.get_payment_link(payment.payment_link_id)
-            except Exception as error:
-                logger.warning('WATA fee link verification unavailable', error_type=type(error).__name__)
-                return False
+            verified_link = await self._wata_link_evidence(payment)
         if not _matches_payment(
             payment, payload, webhook=True, require_paid=is_paid_callback, verified_link=verified_link
         ):
@@ -320,6 +358,13 @@ class WataPaymentMixin:
             except Exception as error:
                 logger.warning('WATA callback verification unavailable', error_type=type(error).__name__)
                 return False
+            if (
+                isinstance(verified_transaction, dict)
+                and 'paymentLinkId' in verified_transaction
+                and verified_transaction['paymentLinkId'] is None
+                and verified_link is None
+            ):
+                verified_link = await self._wata_link_evidence(payment)
             if (
                 not _matches_payment(payment, verified_transaction, verified_link=verified_link)
                 or verified_transaction['id'] != payload['transactionId']
@@ -414,11 +459,18 @@ class WataPaymentMixin:
             return None
 
         remote_link = None
+        verified_link = None
         transaction_payload = None
         service = getattr(self, 'wata_service', None)
         if service and not payment.is_paid:
             try:
                 remote_link = await service.get_payment_link(payment.payment_link_id)
+                verified_link = remote_link
+            except WataAPIError as error:
+                if error.status_code == 404:
+                    verified_link = _stored_creation_link(payment)
+                else:
+                    logger.warning('WATA link verification unavailable', error_type=type(error).__name__)
             except Exception as error:
                 logger.warning('WATA link verification unavailable', error_type=type(error).__name__)
 
@@ -432,7 +484,7 @@ class WataPaymentMixin:
                     try:
                         candidate = await service.get_transaction(transaction_id)
                         if (
-                            _matches_payment(payment, candidate, verified_link=remote_link)
+                            _matches_payment(payment, candidate, verified_link=verified_link)
                             and candidate['id'] == transaction_id
                         ):
                             transaction_payload = candidate
@@ -442,17 +494,30 @@ class WataPaymentMixin:
                     try:
                         response = await service.search_transactions(
                             order_id=payment.order_id,
-                            payment_link_id=payment.payment_link_id,
+                            payment_link_id=None if remote_link is None and verified_link else payment.payment_link_id,
                             status='Paid',
                             limit=5,
                         )
                         items = response.get('items') if isinstance(response, dict) else None
                         if isinstance(items, list):
                             # Search filters are hints, not proof of identity or amount.
-                            transaction_payload = next(
-                                (item for item in items if _matches_payment(payment, item, verified_link=remote_link)),
-                                None,
-                            )
+                            for item in items[:5]:
+                                if not _matches_payment(payment, item, verified_link=verified_link):
+                                    continue
+                                if item.get('paymentLinkId') is None:
+                                    # Null-link search results are only candidates;
+                                    # settle using a fresh lookup of that exact ID.
+                                    candidate = await service.get_transaction(item['id'])
+                                    if (
+                                        not _matches_payment(payment, candidate, verified_link=verified_link)
+                                        or candidate['id'] != item['id']
+                                        or _kopeck_amount(candidate.get('amount')) != _kopeck_amount(item.get('amount'))
+                                    ):
+                                        continue
+                                    transaction_payload = candidate
+                                else:
+                                    transaction_payload = item
+                                break
                     except Exception as error:
                         logger.warning('WATA search verification unavailable', error_type=type(error).__name__)
 
@@ -462,11 +527,14 @@ class WataPaymentMixin:
                     if locked:
                         payment = locked
                         if not payment.is_paid and _matches_payment(
-                            payment, transaction_payload, verified_link=remote_link
+                            payment, transaction_payload, verified_link=verified_link
                         ):
-                            if _has_customer_fee(payment, transaction_payload):
+                            if (
+                                _has_customer_fee(payment, transaction_payload)
+                                or transaction_payload.get('paymentLinkId') is None
+                            ):
                                 payment = await self._finalize_wata_payment(
-                                    db, payment, transaction_payload, verified_link=remote_link
+                                    db, payment, transaction_payload, verified_link=verified_link
                                 )
                             else:
                                 payment = await self._finalize_wata_payment(db, payment, transaction_payload)

@@ -24,6 +24,7 @@ from app.database.crud.transaction import get_income_total, income_payments_quer
 from app.database.models import PaymentMethod, Transaction, TransactionType, User, WataPayment
 from app.services.event_emitter import event_emitter
 from app.services.payment_service import PaymentService
+from app.services.wata_service import WataAPIError
 from tests.fixtures.postgres_db import lock_waiter_appeared, postgres_sessions
 
 
@@ -34,7 +35,7 @@ INITIAL_BALANCE_KOPEKS = 700
 TABLES = [WataPayment.__table__, Transaction.__table__, User.__table__]
 
 
-async def _create_payment(db: Any, order_id: str) -> tuple[int, int, dict[str, Any]]:
+async def _create_payment(db: Any, order_id: str, *, expired_link: bool = False) -> tuple[int, int, dict[str, Any]]:
     user = User(
         telegram_id=3090001,
         first_name='WATA replay test',
@@ -68,6 +69,23 @@ async def _create_payment(db: Any, order_id: str) -> tuple[int, int, dict[str, A
         'currency': 'RUB',
         'paymentTime': datetime.now(UTC).isoformat(),
     }
+    if expired_link:
+        payment.terminal_public_id = 'immutable-test-terminal'
+        payment.metadata_json = {
+            'response': {
+                'id': payment.payment_link_id,
+                'orderId': order_id,
+                'terminalPublicId': payment.terminal_public_id,
+                'amount': '1250.00',
+                'currency': 'RUB',
+                'status': 'Opened',
+                'type': 'OneTime',
+                'isArbitraryAmountAllowed': False,
+            }
+        }
+        await db.commit()
+        payload['terminalPublicId'] = payment.terminal_public_id
+        payload['paymentLinkId'] = None
     return user.id, payment.id, payload
 
 
@@ -134,15 +152,16 @@ async def _assert_one_credit_and_receipt(db: Any, user_id: int, payment_id: int,
 
 
 @pytest.mark.parametrize('customer_fee', [False, True])
+@pytest.mark.parametrize('expired_link', [False, True])
 async def test_repeated_paid_wata_callback_credits_and_counts_income_once(
-    postgres_database, monkeypatch, customer_fee
+    postgres_database, monkeypatch, customer_fee, expired_link
 ) -> None:
     notification = AsyncMock()
     monkeypatch.setattr(event_emitter, 'emit', notification)
     service = PaymentService(bot=None)
 
     async with postgres_sessions(postgres_database, TABLES, count=2) as (db, watcher):
-        user_id, payment_id, payload = await _create_payment(db, 'wata-replay')
+        user_id, payment_id, payload = await _create_payment(db, 'wata-replay', expired_link=expired_link)
         remote_link = {
             'id': payload['paymentLinkId'],
             'orderId': payload['orderId'],
@@ -155,7 +174,10 @@ async def test_repeated_paid_wata_callback_credits_and_counts_income_once(
             payload['commission'] = '65.7895'
         service.wata_service = SimpleNamespace(
             get_transaction=AsyncMock(return_value=_api_transaction(payload)),
-            get_payment_link=AsyncMock(return_value=remote_link),
+            get_payment_link=AsyncMock(
+                return_value=remote_link,
+                side_effect=WataAPIError('link not found', status_code=404) if expired_link else None,
+            ),
         )
         for _ in range(4):
             assert await _deliver(service, db, payload) is True
@@ -165,15 +187,16 @@ async def test_repeated_paid_wata_callback_credits_and_counts_income_once(
 
 
 @pytest.mark.parametrize('customer_fee', [False, True])
+@pytest.mark.parametrize('expired_link', [False, True])
 async def test_competing_paid_wata_callbacks_credit_and_count_income_once(
-    postgres_database, monkeypatch, customer_fee
+    postgres_database, monkeypatch, customer_fee, expired_link
 ) -> None:
     notification = AsyncMock()
     monkeypatch.setattr(event_emitter, 'emit', notification)
     service = PaymentService(bot=None)
 
     async with postgres_sessions(postgres_database, TABLES, count=3) as (first, second, watcher):
-        user_id, payment_id, payload = await _create_payment(first, 'wata-concurrent')
+        user_id, payment_id, payload = await _create_payment(first, 'wata-concurrent', expired_link=expired_link)
         remote_link = {
             'id': payload['paymentLinkId'],
             'orderId': payload['orderId'],
@@ -186,7 +209,10 @@ async def test_competing_paid_wata_callbacks_credit_and_count_income_once(
             payload['commission'] = '65.7895'
         service.wata_service = SimpleNamespace(
             get_transaction=AsyncMock(return_value=_api_transaction(payload)),
-            get_payment_link=AsyncMock(return_value=remote_link),
+            get_payment_link=AsyncMock(
+                return_value=remote_link,
+                side_effect=WataAPIError('link not found', status_code=404) if expired_link else None,
+            ),
         )
         original_lock = wata_crud.get_wata_payment_by_id_for_update
         holder_has_the_row = asyncio.Event()

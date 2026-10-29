@@ -25,6 +25,10 @@ _MIN_EXPIRATION_MINUTES = 15
 class WataAPIError(RuntimeError):
     """Raised when the WATA API returns an error response."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class WataService:
     """Thin wrapper around the WATA REST API used for balance top-ups."""
@@ -122,12 +126,14 @@ class WataService:
                             await asyncio.sleep(sleep_for)
                             continue
                         logger.warning('WATA API rate limited (429) — retries exhausted', method=method, path=path)
-                        last_error = WataAPIError(f'WATA API rate limited on {method} {path}')
+                        last_error = WataAPIError(f'WATA API rate limited on {method} {path}', status_code=429)
                         break
 
                     if response.status >= 400:
                         logger.error('WATA API error', response_status=response.status, response_text=response_text)
-                        raise WataAPIError(f'WATA API returned status {response.status}: {response_text}')
+                        raise WataAPIError(
+                            f'WATA API returned status {response.status}: {response_text}', status_code=response.status
+                        )
 
                     if not response_text:
                         return {}
@@ -241,7 +247,6 @@ class WataService:
         limit: int = 5,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
-            'skipCount': 0,
             'maxResultCount': max(1, min(limit, 1000)),
         }
         if order_id:
@@ -249,12 +254,12 @@ class WataService:
         if status:
             params['statuses'] = status
         if payment_link_id:
-            params['paymentLinkId'] = payment_link_id
+            params['PaymentLinkIds'] = [payment_link_id]
 
         logger.debug(
             'Ищем WATA транзакции: order_id payment_link_id', order_id=order_id, payment_link_id=payment_link_id
         )
-        return await self._request('GET', '/transactions', params=params)
+        return await self._request('GET', '/v2/transactions', params=params)
 
     async def get_transaction(self, transaction_id: str) -> dict[str, Any]:
         logger.debug('Получаем WATA транзакцию', transaction_id=transaction_id)
