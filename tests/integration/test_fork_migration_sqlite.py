@@ -58,12 +58,12 @@ engine = create_engine('sqlite:///' + sys.argv[1])
 try:
     with engine.connect() as connection:
         cfg = config()
-        assert ScriptDirectory.from_config(cfg).get_heads() == ['evo_0110']
+        assert ScriptDirectory.from_config(cfg).get_heads() == ['evo_0112']
         _upgrade_on_connection(connection, cfg)
         tables = set(inspect(connection).get_table_names())
         assert set(Base.metadata.tables) <= tables
         assert {'cashera_payments', 'cashera_subscriptions', 'dpichecker_actions', 'user_reminders'} <= tables
-        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == 'evo_0110'
+        assert connection.scalar(text('SELECT version_num FROM alembic_version')) == 'evo_0112'
         assert connection.execute(text('SELECT builtin_key,is_active FROM user_reminders')).all() == [('link_auth_method', 0)]
         assert connection.scalar(text("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_guard_open_grace_subscription_delete'")) == 1
 finally:
@@ -100,7 +100,7 @@ def test_sqlite_managed_head_repeated_startup_preserves_rows(tmp_path):
                 assert connection.scalar(text('SELECT id FROM subscriptions')) == 37
                 assert connection.execute(text('SELECT * FROM subscriptions WHERE id=37')).all() == before
                 assert connection.scalar(text('SELECT balance_kopeks FROM users WHERE id=1')) == 12345
-                assert connection.scalar(text('SELECT version_num FROM alembic_version')) == 'evo_0110'
+                assert connection.scalar(text('SELECT version_num FROM alembic_version')) == 'evo_0112'
                 assert connection.execute(text('SELECT builtin_key,is_active FROM user_reminders')).all() == [
                     ('link_auth_method', 0)
                 ]

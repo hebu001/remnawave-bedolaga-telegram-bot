@@ -3,6 +3,7 @@ import secrets
 import string
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import structlog
 from sqlalchemy import and_, case, exists, false, func, nullslast, or_, select, text
@@ -1559,6 +1560,7 @@ async def get_inactive_users(db: AsyncSession, months: int = 3) -> list[User]:
 
 
 async def delete_user(db: AsyncSession, user: User) -> bool:
+    user.cabinet_personal_link_id = uuid4()
     user.status = UserStatus.DELETED.value
     user.updated_at = datetime.now(UTC)
 

@@ -17,6 +17,8 @@ logger = structlog.get_logger(__name__)
 # ---- Constants ---------------------------------------------------------------
 
 MENU_LAYOUT_KEY = 'CABINET_MENU_LAYOUT'
+PERSONAL_LINK_ACTION = 'cabinet_personal_link'
+PERSONAL_LINK_MANAGED_KEY = 'personal_link_managed'
 
 BUILTIN_SECTIONS: tuple[str, ...] = (
     'home',
@@ -48,6 +50,7 @@ CALLBACK_ACTIONS: tuple[str, ...] = (
     'menu_language',
     'menu_balance',
     'menu_subscription',
+    PERSONAL_LINK_ACTION,
 )
 VALID_CALLBACK_ACTIONS = frozenset(CALLBACK_ACTIONS)
 
@@ -66,6 +69,22 @@ DEFAULT_MENU_LAYOUT: dict[str, object] = {
 # ---- Module-level cache ------------------------------------------------------
 
 _cached_layout: dict[str, object] | None = None
+
+
+def personal_link_is_managed(config: dict) -> bool:
+    """Both menu editors keep explicit placement/removal separate from old defaults."""
+    if config.get(PERSONAL_LINK_MANAGED_KEY) is True:
+        return True
+    for key, action_key in (('custom_buttons', 'callback_data'), ('buttons', 'action')):
+        buttons = config.get(key, {})
+        if isinstance(buttons, dict) and any(
+            isinstance(button, dict)
+            and button.get('type') in ('callback', 'builtin')
+            and button.get(action_key) == PERSONAL_LINK_ACTION
+            for button in buttons.values()
+        ):
+            return True
+    return False
 
 
 def _deep_copy_layout(source: dict[str, object]) -> dict[str, object]:
@@ -176,7 +195,9 @@ def _validate_layout(data: dict) -> dict[str, object]:
     result: dict[str, object] = {}
 
     for key, value in data.items():
-        if key == 'custom_buttons':
+        if key == PERSONAL_LINK_MANAGED_KEY and value is True:
+            result[key] = True
+        elif key == 'custom_buttons':
             if isinstance(value, dict):
                 clean_customs: dict[str, dict] = {}
                 for btn_id, btn_data in value.items():
@@ -217,7 +238,9 @@ async def load_menu_layout_cache() -> dict[str, object]:
                 db_data: dict = json.loads(setting.value)
                 if isinstance(db_data, dict):
                     validated = _validate_layout(db_data)
-                    if validated and any(k.startswith('row_') for k in validated):
+                    if validated and (
+                        any(k.startswith('row_') for k in validated) or personal_link_is_managed(validated)
+                    ):
                         # Replace rows and custom_buttons from DB only if at least one row exists
                         merged = validated
                         # Ensure custom_buttons always present

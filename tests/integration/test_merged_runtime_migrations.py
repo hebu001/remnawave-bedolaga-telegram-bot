@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 from alembic.script import ScriptDirectory
@@ -30,7 +31,7 @@ pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(not os.getenv('TEST_POSTGRES_URL'), reason='needs dedicated local PostgreSQL'),
 ]
-HEAD = 'evo_0111'
+HEAD = 'evo_0112'
 
 
 async def upgrade_runtime(connection, schema):
@@ -148,6 +149,9 @@ async def test_backup_restore_preserves_pending_durable_and_identity_data(monkey
         assert {m.__tablename__ for m in models} | set(service.association_tables) == set(Base.metadata.tables)
         monkeypatch.setattr(module, 'AsyncSessionLocal', async_sessionmaker(source, expire_on_commit=False))
         payload, associations, count, _ = await service._export_database_via_orm(models)
+        for row in payload['users']:
+            assert str(UUID(row['cabinet_personal_link_id'])) == row['cabinet_personal_link_id']
+        json.dumps(payload)  # UUID values must survive the actual JSON backup format.
         assert payload['subpage_invoices'] and payload['renewal_sync_tasks']
         assert payload['cabinet_ws_tickets'] and payload['traffic_notification_states']
         assert payload['cashera_payments'] and payload['cashera_subscriptions'] and payload['dpichecker_actions']
@@ -175,6 +179,16 @@ async def test_backup_restore_preserves_pending_durable_and_identity_data(monkey
                 (Path(os.environ['BRIDGE_EVIDENCE_DIR']) / f'backup-roundtrip-{clear_existing}.json').write_text(
                     json.dumps({'before': before, 'restored': restored}, indent=2) + '\n'
                 )
+            original_selectors = {row['id']: row['cabinet_personal_link_id'] for row in before['users']}
+            restored_selectors = [row['cabinet_personal_link_id'] for row in restored['users']]
+            assert len(restored_selectors) == len(set(restored_selectors))
+            for row in restored['users']:
+                assert row['cabinet_personal_link_id'] != original_selectors[row['id']]
+            # Explicit security exception: a restore issues fresh personal links.
+            # Every pre-existing field and all other tables must still match.
+            for snapshot in (before, restored):
+                for row in snapshot['users']:
+                    row.pop('cabinet_personal_link_id')
             assert restored == before
 
 

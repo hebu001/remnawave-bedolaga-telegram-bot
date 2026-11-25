@@ -73,7 +73,7 @@ def _oidc_patches(s: ExitStack, **kwargs) -> None:
     async def get_setting(_db, key):
         return settings_values.get(key)
 
-    claims = {'id': 123, 'name': 'A', 'exp': datetime.now(UTC).timestamp() + 600}
+    claims = {'id': 123, 'name': 'A', 'iat': 1700000000, 'exp': datetime.now(UTC).timestamp() + 600}
     s.enter_context(patch('app.cabinet.routes.auth.get_setting_value', AsyncMock(side_effect=get_setting)))
     s.enter_context(patch('app.cabinet.routes.auth.validate_telegram_oidc_token', AsyncMock(return_value=claims)))
 

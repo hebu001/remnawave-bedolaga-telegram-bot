@@ -14,13 +14,14 @@ from datetime import UTC, date as dt_date, datetime, time as dt_time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import aiofiles
 import pyzipper
 import structlog
 from aiogram.types import FSInputFile
-from sqlalchemy import inspect, null, select, text
+from sqlalchemy import Uuid, inspect, null, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -943,6 +944,8 @@ class BackupService:
                                 record_dict[column.name] = value.isoformat()
                             elif isinstance(value, Decimal):
                                 record_dict[column.name] = float(value)
+                            elif isinstance(value, UUID):
+                                record_dict[column.name] = str(value)
                             elif isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
                                 record_dict[column.name] = 0.0
                             elif isinstance(value, (list, dict)):
@@ -1420,6 +1423,11 @@ class BackupService:
             try:
                 processed_data = self._process_record_data(user_data, User, 'users')
                 processed_data['referred_by_id'] = None
+                # Restoring an older backup must never resurrect a revoked bookmark.
+                # The shared signing key stays server-side; issue a fresh selector
+                # even when this archive predates personal links.
+                processed_data['cabinet_personal_link_id'] = uuid4()
+                processed_data['cabinet_personal_link_key_version'] = 1
 
                 if 'id' in processed_data:
                     existing_user = await db.execute(select(User).where(User.id == processed_data['id']))
@@ -1540,7 +1548,9 @@ class BackupService:
 
             column_type_str = str(column.type).upper()
 
-            if ('DATETIME' in column_type_str or 'TIMESTAMP' in column_type_str) and isinstance(value, str):
+            if isinstance(column.type, Uuid) and isinstance(value, str):
+                processed_data[key] = UUID(value)
+            elif ('DATETIME' in column_type_str or 'TIMESTAMP' in column_type_str) and isinstance(value, str):
                 try:
                     if 'T' in value:
                         processed_data[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))

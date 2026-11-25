@@ -1,8 +1,10 @@
 import asyncio
 import html
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import structlog
 from aiogram import Bot, Dispatcher, F, types
@@ -901,6 +903,8 @@ async def _merge_phantom_into_active_user(
 
     # Soft-delete phantom: clear unique identifiers to prevent future matches
     # and constraint violations. Preserve record for audit trail.
+    phantom.cabinet_personal_link_id = uuid4()
+    active_user.cabinet_personal_link_id = uuid4()
     phantom.status = UserStatus.DELETED.value
     phantom.username = None
     phantom.remnawave_id = None
@@ -3444,6 +3448,91 @@ async def required_sub_channel_check(
             pass
 
 
+def _personal_link_channel_alert(texts: Any, detail: dict) -> str:
+    """Describe the existing access denial without another membership check."""
+    fallback = texts.t(
+        'CABINET_PERSONAL_LINK_CHANNEL_REQUIRED',
+        'Чтобы получить ссылку на кабинет, подпишитесь на обязательные каналы и попробуйте снова.',
+    )
+    titles = detail.get('channel_titles')
+    if not isinstance(titles, list):
+        return fallback
+    for raw_title in titles:
+        if not isinstance(raw_title, str):
+            continue
+        title = ' '.join(''.join(char if char.isprintable() else ' ' for char in raw_title).split())
+        # Titles are plain display text. Do not echo URLs, handles or markup
+        # accidentally configured as a title; never inspect other error fields.
+        if not title or any(char in title for char in '<>@/') or re.search(r'(?:[\w-]+\.)+[\w-]{2,}', title):
+            continue
+        title = title[:40] + ('…' if len(title) > 40 else '')
+        if len(titles) == 1:
+            template = texts.t(
+                'CABINET_PERSONAL_LINK_CHANNEL_REQUIRED_NAMED',
+                'Чтобы получить ссылку на кабинет, подпишитесь на канал «{channel}» и попробуйте снова.',
+            )
+        else:
+            template = texts.t(
+                'CABINET_PERSONAL_LINK_CHANNELS_REQUIRED_NAMED',
+                'Чтобы получить ссылку на кабинет, подпишитесь на обязательные каналы, '
+                'включая «{channel}», и попробуйте снова.',
+            )
+        alert = template.format(channel=title)
+        # answerCallbackQuery allows 200 characters; count emoji conservatively.
+        return alert if len(alert.encode('utf-16-le')) // 2 <= 200 else fallback
+    return fallback
+
+
+async def process_cabinet_personal_link(callback: types.CallbackQuery, db: AsyncSession) -> None:
+    """Deliver the secret only to the authenticated sender's private chat."""
+    from fastapi import HTTPException
+
+    from app.cabinet.auth.personal_link import get_personal_link
+
+    message = callback.message
+    if (
+        not isinstance(message, types.Message)
+        or message.chat.type != 'private'
+        or message.chat.id != callback.from_user.id
+    ):
+        await callback.answer()
+        return
+    user = await get_user_by_telegram_id(db, callback.from_user.id)
+    texts = get_texts(user.language) if user else get_texts()
+    denied = texts.t('CABINET_PERSONAL_LINK_UNAVAILABLE', 'Не удалось получить ссылку на кабинет.')
+    if not user:
+        await callback.answer(denied, show_alert=True)
+        return
+    try:
+        url = await get_personal_link(db, user.id, verified_telegram_id=callback.from_user.id)
+    except HTTPException as exc:
+        if (
+            exc.status_code == 403
+            and isinstance(exc.detail, dict)
+            and exc.detail.get('code') == 'required_channel_subscription_missing'
+        ):
+            denied = _personal_link_channel_alert(texts, exc.detail)
+        await callback.answer(denied, show_alert=True)
+        return
+    await callback.answer()
+    try:
+        warning = texts.t(
+            'CABINET_PERSONAL_LINK_PRIVATE',
+            'Личная ссылка для входа. Любой, у кого она есть, сможет открыть ваш кабинет VPN. Не пересылайте её.',
+        )
+        await message.answer(
+            f'{warning}\n\n{url}',
+            reply_markup=get_back_keyboard(user.language),
+            parse_mode=None,
+            link_preview_options=types.LinkPreviewOptions(is_disabled=True),
+            protect_content=False,
+        )
+    except Exception as exc:
+        # aiogram exceptions may retain the Telegram request, including the URL.
+        logger.warning('Private cabinet link delivery failed', error_type=type(exc).__name__)
+        await message.answer(denied)
+
+
 async def process_webauth_confirm(
     callback: types.CallbackQuery,
     db: AsyncSession,
@@ -3484,6 +3573,7 @@ async def process_webauth_confirm(
 def register_handlers(dp: Dispatcher):
     logger.debug('=== НАЧАЛО регистрации обработчиков start.py ===')
 
+    dp.callback_query.register(process_cabinet_personal_link, F.data == 'cabinet_personal_link')
     dp.message.register(cmd_start, Command('start'))
     logger.debug('Зарегистрирован cmd_start')
 

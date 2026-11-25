@@ -1,6 +1,7 @@
 """FastAPI dependencies for cabinet module."""
 
 from datetime import UTC, datetime
+from typing import NoReturn
 
 import structlog
 from fastapi import Depends, HTTPException, Request, status
@@ -24,7 +25,11 @@ from app.services.user_action_log_service import mark_user_seen, schedule_cabine
 from app.services.user_revival_service import NotDeletedError, revive_deleted_user
 
 from .auth.jwt_handler import get_token_payload
-from .auth.session_security import session_version_matches
+from .auth.session_security import (
+    require_personal_link_copy_provenance,
+    require_personal_link_rotation_proof,
+    session_is_current,
+)
 from .auth.telegram_auth import validate_telegram_init_data
 from .ip_utils import get_client_ip
 
@@ -101,8 +106,11 @@ async def get_current_cabinet_user(
             detail='User not found',
         )
 
-    if not session_version_matches(payload, user):
+    if not await session_is_current(db, payload, user):
         raise HTTPException(status_code=401, detail='Session revoked; sign in again')
+
+    request.state.cabinet_auth_method = payload.get('auth_method')
+    request.state.cabinet_auth_payload = payload
 
     # Validate Telegram initData first — we need its outcome both for the
     # cross-account guard (existing) and for the DELETED auto-revival
@@ -140,6 +148,8 @@ async def get_current_cabinet_user(
                     detail='Session belongs to a different Telegram account. Please restart the app.',
                     headers={'WWW-Authenticate': 'Bearer'},
                 )
+
+    request.state.cabinet_verified_telegram_id = init_data_telegram_id if init_data_matches_user else None
 
     # Blacklist check happens BEFORE the status branching: a blacklisted
     # account must show as blacklisted regardless of whether it's also
@@ -257,11 +267,18 @@ async def get_current_cabinet_user(
     if settings.CHANNEL_IS_REQUIRED_SUB:
         # Skip for email-only users (no telegram_id)
         if user.telegram_id is not None:
-            # Skip admin check
-            is_admin = settings.is_admin(
+            channel_exempt = settings.is_admin(
                 telegram_id=user.telegram_id, email=user.email if user.email_verified else None
             )
-            if not is_admin:
+            personal_link_request = payload.get('auth_method') == 'personal_link' or request.url.path.rstrip('/') in (
+                '/cabinet/auth/personal-link',
+                '/cabinet/auth/personal-link/rotate',
+            )
+            if not channel_exempt and personal_link_request:
+                from .auth.personal_link import personal_link_channel_exempt
+
+                channel_exempt = personal_link_channel_exempt(user)
+            if not channel_exempt:
                 from app.services.channel_subscription_service import channel_subscription_service
 
                 channels_with_status = await channel_subscription_service.get_channels_with_status(user.telegram_id)
@@ -300,6 +317,43 @@ async def get_current_cabinet_user(
     return user
 
 
+def _deny_personal_link_credentials() -> NoReturn:
+    raise HTTPException(
+        status_code=403,
+        detail={'code': 'primary_login_required', 'message': 'Войдите обычным способом, чтобы изменить способы входа.'},
+    )
+
+
+async def get_primary_cabinet_user(request: Request, user: User = Depends(get_current_cabinet_user)) -> User:
+    """Revealing or rotating a long-lived login secret requires explicit primary provenance."""
+    if getattr(request.state, 'cabinet_auth_method', None) != 'primary':
+        _deny_personal_link_credentials()
+    return user
+
+
+async def get_personal_link_copy_user(request: Request, user: User = Depends(get_current_cabinet_user)) -> User:
+    """Copy an existing credential without upgrading a guest purchase handoff."""
+    require_personal_link_copy_provenance(
+        getattr(request.state, 'cabinet_auth_payload', {}),
+        user,
+        getattr(request.state, 'cabinet_verified_telegram_id', None),
+    )
+    return user
+
+
+async def get_personal_link_rotation_user(request: Request, user: User = Depends(get_current_cabinet_user)) -> User:
+    """Replacing the credential requires a recent verified email or Telegram login."""
+    require_personal_link_rotation_proof(getattr(request.state, 'cabinet_auth_payload', {}), user)
+    return user
+
+
+async def get_credential_management_user(request: Request, user: User = Depends(get_current_cabinet_user)) -> User:
+    """Preserve existing sessions' privileges, without letting a link install a new sign-in method."""
+    if getattr(request.state, 'cabinet_auth_method', None) == 'personal_link':
+        _deny_personal_link_credentials()
+    return user
+
+
 async def get_optional_cabinet_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
@@ -326,7 +380,7 @@ async def get_optional_cabinet_user(
 
     user = await get_user_by_id(db, user_id)
 
-    if not user or user.status != 'active' or not session_version_matches(payload, user):
+    if not user or user.status != 'active' or not await session_is_current(db, payload, user):
         return None
 
     # Cross-validate Telegram identity (same as get_current_cabinet_user)
@@ -367,6 +421,8 @@ async def get_current_admin_user(
     Raises:
         HTTPException: If user is not an admin by either mechanism
     """
+    if getattr(request.state, 'cabinet_auth_method', None) == 'personal_link':
+        raise HTTPException(status_code=403, detail='Admin access required')
     # Legacy check: config-based admin list. Routed through is_user_admin_by_env so the
     # ADMIN_EMAILS match honours the trusted email_verification_source guard — an email
     # verified by an untrusted source (VK/Yandex OAuth, or a no-proof flow) must not grant
@@ -410,6 +466,8 @@ def require_permission(*permissions: str):
         user: User = Depends(get_current_cabinet_user),
         db: AsyncSession = Depends(get_cabinet_db),
     ) -> User:
+        if getattr(request.state, 'cabinet_auth_method', None) == 'personal_link':
+            raise HTTPException(status_code=403, detail='Admin access required')
         from app.services.permission_service import PermissionService
 
         try:

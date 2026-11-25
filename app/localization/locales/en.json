@@ -1,4 +1,11 @@
 {
+  "CABINET_PERSONAL_LINK_SAVE": "Save access to the bot",
+  "CABINET_PERSONAL_LINK_OPEN": "Open cabinet in browser",
+  "CABINET_PERSONAL_LINK_UNAVAILABLE": "Could not get your cabinet link.",
+  "CABINET_PERSONAL_LINK_CHANNEL_REQUIRED": "To get your cabinet link, subscribe to the required channels and try again.",
+  "CABINET_PERSONAL_LINK_CHANNEL_REQUIRED_NAMED": "To get your cabinet link, subscribe to the channel “{channel}” and try again.",
+  "CABINET_PERSONAL_LINK_CHANNELS_REQUIRED_NAMED": "To get your cabinet link, subscribe to the required channels, including “{channel}”, and try again.",
+  "CABINET_PERSONAL_LINK_PRIVATE": "This is your personal sign-in link. Anyone who has it can open your VPN account. Do not forward it.",
   "ACCESS_DENIED": "❌ Access denied",
   "ADDON_INSUFFICIENT_FUNDS_MESSAGE": "⚠️ <b>Insufficient funds</b>\n\nService price: {required}\nBalance: {balance}\nMissing: {missing}\n\nChoose a top-up method. The amount will be filled in automatically.",
   "ADD_COUNTRIES_BUTTON": "🌐 Add countries",

@@ -1,4 +1,11 @@
 {
+  "CABINET_PERSONAL_LINK_SAVE": "Сохранить доступ к боту",
+  "CABINET_PERSONAL_LINK_OPEN": "Открыть кабинет в браузере",
+  "CABINET_PERSONAL_LINK_UNAVAILABLE": "Не удалось получить ссылку на кабинет.",
+  "CABINET_PERSONAL_LINK_CHANNEL_REQUIRED": "Чтобы получить ссылку на кабинет, подпишитесь на обязательные каналы и попробуйте снова.",
+  "CABINET_PERSONAL_LINK_CHANNEL_REQUIRED_NAMED": "Чтобы получить ссылку на кабинет, подпишитесь на канал «{channel}» и попробуйте снова.",
+  "CABINET_PERSONAL_LINK_CHANNELS_REQUIRED_NAMED": "Чтобы получить ссылку на кабинет, подпишитесь на обязательные каналы, включая «{channel}», и попробуйте снова.",
+  "CABINET_PERSONAL_LINK_PRIVATE": "Личная ссылка для входа. Любой, у кого она есть, сможет открыть ваш кабинет VPN. Не пересылайте её.",
   "ACCESS_DENIED": "❌ Доступ запрещен",
   "ADDON_INSUFFICIENT_FUNDS_MESSAGE": "⚠️ <b>Недостаточно средств</b>\n\nСтоимость услуги: {required}\nНа балансе: {balance}\nНе хватает: {missing}\n\nВыберите способ пополнения. Сумма подставится автоматически.",
   "ADD_COUNTRIES_BUTTON": "🌐 Добавить страны",

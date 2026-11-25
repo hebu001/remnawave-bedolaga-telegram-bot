@@ -15,7 +15,7 @@ import structlog
 from fastapi import WebSocket
 from sqlalchemy import select
 
-from app.cabinet.auth.session_security import session_version_matches
+from app.cabinet.auth.session_security import session_is_current
 from app.database.database import AsyncSessionLocal
 from app.database.models import User
 from app.services.permission_service import PermissionService
@@ -56,8 +56,11 @@ class CabinetConnectionManager:
         factory = self._session_factory or AsyncSessionLocal
         async with factory() as db:
             user = await db.scalar(select(User).where(User.id == session.user_id))
-            if not user or user.status != 'active' or not session_version_matches(session.payload, user):
+            if not user or user.status != 'active' or not await session_is_current(db, session.payload, user):
                 return False
+            if session.payload.get('auth_method') == 'personal_link':
+                session.is_admin = False
+                return session.seconds_left > 0
             # Evaluate current RBAC/ABAC and trusted legacy-admin configuration;
             # roles embedded in the original JWT never authorize a broadcast.
             was_admin = session.is_admin

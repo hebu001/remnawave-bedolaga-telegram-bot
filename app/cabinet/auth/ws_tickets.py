@@ -4,12 +4,13 @@ import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cabinet.auth.session_security import lock_auth_user, session_version_matches
+from app.cabinet.auth.session_security import lock_auth_user, session_is_current
 from app.config import settings
 from app.database.models import CabinetWsTicket
 
@@ -53,7 +54,7 @@ async def issue_ws_ticket(db: AsyncSession, payload: dict, origin: str) -> str:
     if type(expires) not in (int, float) or expires <= now.timestamp():
         raise HTTPException(status_code=401, detail='Access token expired')
     user = await lock_auth_user(db, int(payload['sub']))
-    if not user or user.status != 'active' or not session_version_matches(payload, user):
+    if not user or user.status != 'active' or not await session_is_current(db, payload, user):
         raise HTTPException(status_code=401, detail='Session revoked')
     await db.execute(delete(CabinetWsTicket).where(CabinetWsTicket.expires_at <= now))
     pending = await db.scalar(
@@ -68,6 +69,9 @@ async def issue_ws_ticket(db: AsyncSession, payload: dict, origin: str) -> str:
             token_hash=hashlib.sha256(ticket.encode()).hexdigest(),
             user_id=user.id,
             auth_version=payload.get('auth_version', 0),
+            personal_link_id=UUID(payload['personal_link_id'])
+            if payload.get('auth_method') == 'personal_link'
+            else None,
             origin=origin,
             expires_at=min(now + timedelta(seconds=TICKET_TTL_SECONDS), access_expires_at),
             access_expires_at=access_expires_at,
@@ -88,10 +92,18 @@ async def consume_ws_ticket(db: AsyncSession, ticket: str, origin: str) -> dict 
             CabinetWsTicket.origin == origin,
             CabinetWsTicket.expires_at > datetime.now(UTC),
         )
-        .returning(CabinetWsTicket.user_id, CabinetWsTicket.auth_version, CabinetWsTicket.access_expires_at)
+        .returning(
+            CabinetWsTicket.user_id,
+            CabinetWsTicket.auth_version,
+            CabinetWsTicket.access_expires_at,
+            CabinetWsTicket.personal_link_id,
+        )
     )
     row = result.first()
     await db.commit()
     if row is None:
         return None
-    return {'sub': str(row.user_id), 'auth_version': row.auth_version, 'exp': row.access_expires_at.timestamp()}
+    payload = {'sub': str(row.user_id), 'auth_version': row.auth_version, 'exp': row.access_expires_at.timestamp()}
+    if row.personal_link_id is not None:
+        payload.update(auth_method='personal_link', personal_link_id=str(row.personal_link_id))
+    return payload

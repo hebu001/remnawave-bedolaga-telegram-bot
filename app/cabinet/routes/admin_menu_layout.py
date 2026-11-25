@@ -29,10 +29,12 @@ from app.utils.menu_layout_cache import (
     CALLBACK_ACTIONS,
     DEFAULT_MENU_LAYOUT,
     MENU_LAYOUT_KEY,
+    PERSONAL_LINK_MANAGED_KEY,
     VALID_CALLBACK_ACTIONS,
     VALID_CUSTOM_BUTTON_STYLES,
     get_cached_menu_layout,
     load_menu_layout_cache,
+    personal_link_is_managed,
 )
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -356,6 +358,17 @@ async def update_menu_layout(
     _validate_update_payload(payload.rows)
 
     layout_data, button_styles_updates = _split_update(payload.rows)
+
+    # This internal marker survives removing the last explicit link button.
+    # Old menus keep their automatic button until an admin configures it; reset
+    # writes the unmarked defaults and restores that automatic behavior.
+    previous_raw = await _get_setting_value(db, MENU_LAYOUT_KEY)
+    try:
+        previous = json.loads(previous_raw) if previous_raw else {}
+    except json.JSONDecodeError, TypeError:
+        previous = {}
+    if personal_link_is_managed(layout_data) or (isinstance(previous, dict) and personal_link_is_managed(previous)):
+        layout_data[PERSONAL_LINK_MANAGED_KEY] = True
 
     # Save layout to CABINET_MENU_LAYOUT (without committing)
     await _upsert_setting(db, MENU_LAYOUT_KEY, json.dumps(layout_data))

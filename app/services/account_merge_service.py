@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, Literal
+from uuid import uuid4
 
 import structlog
 from sqlalchemy import and_, delete, func, or_, select, update
@@ -1235,6 +1236,8 @@ async def execute_merge(
     # 14. Помечаем secondary как удалённый и очищаем ВСЕ unique constraint и FK поля
     # NOTE: In multi-tariff mode, all secondary subscriptions were already transferred to primary
     # in _handle_subscription_merge. Do NOT clear their remnawave_id — they are now primary's subs.
+    primary.cabinet_personal_link_id = uuid4()
+    secondary.cabinet_personal_link_id = uuid4()
     secondary.status = UserStatus.DELETED.value
     secondary.referral_code = None
     secondary.remnawave_id = None

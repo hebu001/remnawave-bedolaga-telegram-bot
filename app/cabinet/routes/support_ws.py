@@ -25,7 +25,7 @@ from starlette.websockets import WebSocketState
 from app.bot_factory import create_bot
 from app.cabinet.auth.jwt_handler import get_token_payload
 from app.cabinet.auth.registration_access import evaluate_public_registration
-from app.cabinet.auth.session_security import session_version_matches
+from app.cabinet.auth.session_security import session_is_current
 from app.cabinet.auth.telegram_auth import validate_telegram_init_data
 from app.cabinet.routes.media import (
     _BLOCKED_UPLOAD_CONTENT_TYPES,
@@ -371,6 +371,10 @@ support_ws_manager = SupportWsManager()
 
 
 async def _role_context(db: AsyncSession, user: User, payload: dict[str, Any]) -> WsUserContext:
+    if payload.get('auth_method') == 'personal_link':
+        return WsUserContext(
+            user=user, token_payload=payload, role='owner', permissions=[], role_names=[], role_level=0
+        )
     permissions, role_names, role_level = await UserRoleCRUD.get_user_permissions(db, user.id)
     lower_roles = {role.lower() for role in role_names}
     is_legacy_admin = is_user_admin_by_env(user).is_admin
@@ -402,6 +406,7 @@ async def _apply_cabinet_account_guards(
     user: User,
     *,
     init_data_matches_user: bool,
+    auth_method: str | None = None,
 ) -> dict[str, Any] | None:
     if user.telegram_id is not None:
         is_blacklisted, _blacklist_reason = await blacklist_service.is_user_blacklisted(user.telegram_id, user.username)
@@ -458,7 +463,12 @@ async def _apply_cabinet_account_guards(
     if maintenance_service.is_maintenance_active() and not is_user_admin_by_env(user).is_admin:
         return _shared_error('FORBIDDEN', 'Service is under maintenance', resource_type='auth')
 
-    if settings.CHANNEL_IS_REQUIRED_SUB and user.telegram_id is not None and not is_user_admin_by_env(user).is_admin:
+    channel_exempt = is_user_admin_by_env(user).is_admin
+    if not channel_exempt and auth_method == 'personal_link':
+        from ..auth.personal_link import personal_link_channel_exempt
+
+        channel_exempt = personal_link_channel_exempt(user)
+    if settings.CHANNEL_IS_REQUIRED_SUB and user.telegram_id is not None and not channel_exempt:
         from app.services.channel_subscription_service import channel_subscription_service
 
         channels_with_status = await channel_subscription_service.get_channels_with_status(user.telegram_id)
@@ -501,7 +511,7 @@ async def _authenticate_ws(
         return None, _shared_error('AUTH_REQUIRED', 'Access token payload is invalid', resource_type='auth')
 
     user = await get_user_by_id(db, user_id)
-    if not user or not session_version_matches(payload, user):
+    if not user or not await session_is_current(db, payload, user):
         return None, _shared_error('AUTH_REQUIRED', 'Session revoked or user missing', resource_type='auth')
 
     init_data_raw = websocket.headers.get('x-telegram-init-data')
@@ -516,7 +526,9 @@ async def _authenticate_ws(
             )
         init_data_matches_user = True
 
-    account_error = await _apply_cabinet_account_guards(db, user, init_data_matches_user=init_data_matches_user)
+    account_error = await _apply_cabinet_account_guards(
+        db, user, init_data_matches_user=init_data_matches_user, auth_method=payload.get('auth_method')
+    )
     if account_error is not None:
         return None, account_error
 
@@ -532,13 +544,15 @@ async def _refresh_session_context(db: AsyncSession, session: SupportWsSession) 
     user = await db.scalar(
         select(User).where(User.id == session.context.user_id).execution_options(populate_existing=True)
     )
-    if not user or user.status != 'active' or not session_version_matches(payload, user):
+    if not user or user.status != 'active' or not await session_is_current(db, payload, user):
         return False
     session.context = await _role_context(db, user, payload)
     return True
 
 
 async def _has_permission(db: AsyncSession, context: WsUserContext, permission: str) -> bool:
+    if context.token_payload.get('auth_method') == 'personal_link':
+        return False
     allowed, _reason = await PermissionService.check_permission(db, context.user, permission)
     return allowed
 
@@ -598,12 +612,15 @@ async def _require_ws_permission(
     ticket_id: int | None = None,
     details: dict[str, Any] | None = None,
 ) -> None:
-    allowed, reason = await PermissionService.check_permission(
-        db,
-        session.context.user,
-        permission,
-        ip_address=_ws_client_ip(session.websocket),
-    )
+    if session.context.token_payload.get('auth_method') == 'personal_link':
+        allowed, reason = False, 'Primary login required'
+    else:
+        allowed, reason = await PermissionService.check_permission(
+            db,
+            session.context.user,
+            permission,
+            ip_address=_ws_client_ip(session.websocket),
+        )
     if not allowed:
         await _log_ws_permission_audit(
             db,

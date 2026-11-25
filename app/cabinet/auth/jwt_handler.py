@@ -35,6 +35,11 @@ def create_access_token(
     telegram_id: int | None = None,
     *,
     auth_version: int = 0,
+    auth_method: str | None = None,
+    personal_link_id: str | None = None,
+    auth_proof: str | None = None,
+    auth_time: int | None = None,
+    auth_identity: str | None = None,
     permissions: list[str] | None = None,
     roles: list[str] | None = None,
     role_level: int = 0,
@@ -63,6 +68,9 @@ def create_access_token(
         'iat': datetime.now(UTC),
     }
 
+    payload.update(_session_claims(auth_method, personal_link_id))
+    payload.update(_proof_claims(auth_method, auth_proof, auth_time, auth_identity))
+
     # Добавляем telegram_id только если он есть
     if telegram_id is not None:
         payload['telegram_id'] = telegram_id
@@ -79,7 +87,42 @@ def create_access_token(
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
-def create_refresh_token(user_id: int, *, auth_version: int = 0) -> str:
+def _session_claims(auth_method: str | None, personal_link_id: str | None) -> dict[str, str]:
+    if auth_method == 'personal_link' and personal_link_id:
+        return {'auth_method': auth_method, 'personal_link_id': personal_link_id}
+    if auth_method == 'personal_link' or personal_link_id is not None:
+        raise ValueError('Invalid personal link session provenance')
+    return {'auth_method': auth_method} if auth_method else {}
+
+
+def _proof_claims(
+    auth_method: str | None, proof: str | None, authenticated_at: int | None, identity: str | None
+) -> dict[str, str | int]:
+    if proof is None and authenticated_at is None and identity is None:
+        return {}
+    if (
+        auth_method != 'primary'
+        or proof not in ('email', 'telegram')
+        or type(authenticated_at) is not int
+        or authenticated_at <= 0
+        or not isinstance(identity, str)
+        or len(identity) != 64
+        or any(char not in '0123456789abcdef' for char in identity)
+    ):
+        raise ValueError('Invalid authentication proof')
+    return {'auth_proof': proof, 'auth_time': authenticated_at, 'auth_identity': identity}
+
+
+def create_refresh_token(
+    user_id: int,
+    *,
+    auth_version: int = 0,
+    auth_method: str | None = None,
+    personal_link_id: str | None = None,
+    auth_proof: str | None = None,
+    auth_time: int | None = None,
+    auth_identity: str | None = None,
+) -> str:
     """
     Create a long-lived refresh token.
 
@@ -102,6 +145,8 @@ def create_refresh_token(user_id: int, *, auth_version: int = 0) -> str:
         # user are issued within the same second (JWT datetimes are encoded
         # with second precision).
         'jti': secrets.token_urlsafe(16),
+        **_session_claims(auth_method, personal_link_id),
+        **_proof_claims(auth_method, auth_proof, auth_time, auth_identity),
     }
 
     secret = settings.get_cabinet_jwt_secret()

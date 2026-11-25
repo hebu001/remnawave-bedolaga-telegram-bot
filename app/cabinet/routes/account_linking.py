@@ -55,7 +55,7 @@ from ..auth.telegram_auth import (
     validate_telegram_login_widget,
     validate_telegram_oidc_token,
 )
-from ..dependencies import get_cabinet_db, get_current_cabinet_user
+from ..dependencies import get_cabinet_db, get_credential_management_user, get_current_cabinet_user
 from ..ip_utils import get_client_ip
 from ..schemas.auth import UserResponse
 from .auth import _create_auth_response, _store_refresh_token, _user_to_response
@@ -411,7 +411,7 @@ async def get_linked_providers(
 async def link_provider_init(
     provider: OAuthProviderName,
     http_request: Request,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
 ) -> LinkInitResponse:
     """Start OAuth flow for linking a new provider to the current account."""
 
@@ -456,7 +456,7 @@ async def link_provider_init(
 async def link_provider_callback(
     provider: OAuthProviderName,
     request: LinkCallbackRequest,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> LinkCallbackResponse:
     """Handle OAuth callback for linking a provider to the current account."""
@@ -505,7 +505,7 @@ async def link_provider_callback(
 @router.post('/unlink/{provider}', response_model=UnlinkResponse)
 async def unlink_provider(
     provider: OAuthProviderName,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> UnlinkResponse:
     """Unlink an OAuth provider from the current account."""
@@ -532,7 +532,7 @@ async def unlink_provider(
 async def link_telegram(
     request: LinkTelegramRequest,
     raw_request: Request,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> LinkCallbackResponse:
     """Link Telegram account via WebApp initData, OIDC id_token, or Login Widget."""
@@ -846,7 +846,7 @@ merge_router = APIRouter(prefix='/auth/merge', tags=['Cabinet Account Merge'])
 async def get_merge_preview_endpoint(
     raw_request: Request,
     merge_token: str = Path(..., min_length=32, max_length=64),
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> MergePreviewResponse:
     """Preview the result of merging two accounts before confirming."""
@@ -904,7 +904,7 @@ async def execute_merge_endpoint(
     request: MergeRequest,
     raw_request: Request,
     merge_token: str = Path(..., min_length=32, max_length=64),
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> MergeResponse:
     """Execute account merge. Consumes the merge token (one-time use)."""

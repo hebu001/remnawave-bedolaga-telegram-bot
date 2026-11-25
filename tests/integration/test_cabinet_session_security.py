@@ -156,6 +156,11 @@ async def test_reset_revokes_all_old_credentials_and_allows_new_login(sessions, 
         )
         assert jwt_handler.get_token_payload(pair.access_token)['auth_version'] == 1
         assert jwt_handler.get_token_payload(pair.refresh_token, 'refresh')['auth_version'] == 1
+        for token, token_type in ((pair.access_token, 'access'), (pair.refresh_token, 'refresh')):
+            payload = jwt_handler.get_token_payload(token, token_type)
+            assert payload['auth_proof'] == 'email'
+            assert payload['auth_identity'] == session_security.auth_proof_identity(user, 'email')
+            assert 0 <= int(datetime.now(UTC).timestamp()) - payload['auth_time'] <= 2
     assert (await refresh(sessions, pair.refresh_token)).access_token
 
 
@@ -404,10 +409,10 @@ async def test_login_with_old_password_racing_reset_cannot_issue_current_credent
     entered, release = asyncio.Event(), asyncio.Event()
     original = auth._create_auth_response
 
-    async def paused(user, db):
+    async def paused(user, db, **provenance):
         entered.set()
         await release.wait()
-        return await original(user, db)
+        return await original(user, db, **provenance)
 
     monkeypatch.setattr(auth, '_create_auth_response', paused)
 
@@ -418,11 +423,17 @@ async def test_login_with_old_password_racing_reset_cannot_issue_current_credent
             )
 
     login_task = asyncio.create_task(login())
-    await asyncio.wait_for(entered.wait(), 2)
-    await reset(sessions)
-    release.set()
-    with pytest.raises(HTTPException, match='Session revoked'):
-        await login_task
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await reset(sessions)
+        release.set()
+        with pytest.raises(HTTPException, match='Session revoked'):
+            await login_task
+    finally:
+        release.set()
+        if not login_task.done():
+            login_task.cancel()
+        await asyncio.gather(login_task, return_exceptions=True)
 
 
 @pytest.mark.parametrize('change', ['reset', 'password_hash', 'auth_version', 'blocked'])
@@ -659,3 +670,136 @@ async def test_connection_limits_are_atomic(sessions, account, monkeypatch):
     attempts = [ws_routes.CabinetWsSession(SimpleNamespace(), payload) for _ in range(4)]
     results = await asyncio.gather(*(manager.connect(session) for session in attempts))
     assert results.count(True) == 1 and len(manager._sessions) == 1
+
+
+@pytest.mark.parametrize('event', ['rotate', 'password_reset', 'feature_off', 'server_key', 'cabinet_origin'])
+async def test_personal_link_access_refresh_and_both_socket_sessions_follow_revocation(
+    sessions, account, monkeypatch, event
+):
+    from app.cabinet.auth import personal_link
+
+    monkeypatch.setattr(settings, 'CABINET_PERSONAL_LINK_ENABLED', True)
+    monkeypatch.setattr(settings, 'CABINET_PERSONAL_LINK_SECRET', '41' * 32)
+    async with sessions() as db:
+        url = await personal_link.get_personal_link(
+            db, account.user_id, auth_payload=jwt_handler.get_token_payload(account.pair.access_token)
+        )
+        secret = url.rsplit('/', 1)[1]
+        user = await personal_link.resolve_personal_link(db, secret)
+        pair = await auth._create_auth_response(
+            user, db, auth_method='personal_link', personal_link_id=str(personal_link.personal_link_session_id(user))
+        )
+        await auth._store_refresh_token(db, user.id, pair.refresh_token, device_info='personal_link')
+
+    # A new pair for this browser must remain bound to the same revocable link after rotation.
+    rotated = await refresh(sessions, pair.refresh_token)
+    access = jwt_handler.get_token_payload(rotated.access_token)
+    refresh_payload = jwt_handler.get_token_payload(rotated.refresh_token, expected_type='refresh')
+    for payload in (access, refresh_payload):
+        assert payload['auth_method'] == 'personal_link' and payload['personal_link_id'] == access['personal_link_id']
+    assert access['permissions'] == [] and access['roles'] == []
+    credentials = HTTPAuthorizationCredentials(scheme='Bearer', credentials=rotated.access_token)
+    async with sessions() as db:
+        req = request()
+        user = await dependencies.get_current_cabinet_user(req, credentials, db)
+        assert user.id == account.user_id
+        with pytest.raises(HTTPException, match='primary_login_required'):
+            await dependencies.get_primary_cabinet_user(req, user)
+        with pytest.raises(HTTPException, match='primary_login_required'):
+            await dependencies.get_credential_management_user(req, user)
+        assert await auth.check_is_admin(req, user, db) == {'is_admin': False}
+
+    ticket_payload = await consume(sessions, await issue(sessions, account, payload=access))
+    assert ticket_payload['personal_link_id'] == access['personal_link_id']
+    socket = ws_routes.CabinetWsSession(SimpleNamespace(close=AsyncMock()), ticket_payload)
+    manager = ws_routes.CabinetConnectionManager(session_factory=sessions)
+    assert await manager.validate(socket) and not socket.is_admin
+    async with sessions() as db:
+        mobile, error = await support_ws._authenticate_ws(
+            db, SimpleNamespace(headers={}), access_token=rotated.access_token
+        )
+        assert not error and mobile.role == 'owner'
+        support_session = support_ws.SupportWsSession(SimpleNamespace(close=AsyncMock()), mobile)
+
+    if event == 'rotate':
+        async with sessions() as db:
+            owner = await db.get(User, account.user_id)
+            step_up = await auth._create_auth_response(owner, db, auth_proof='email')
+            assert (
+                await personal_link.get_personal_link(
+                    db, account.user_id, rotate=True, auth_payload=jwt_handler.get_token_payload(step_up.access_token)
+                )
+                != url
+            )
+    elif event == 'password_reset':
+        await reset(sessions)
+    elif event == 'feature_off':
+        monkeypatch.setattr(settings, 'CABINET_PERSONAL_LINK_ENABLED', False)
+    elif event == 'server_key':
+        monkeypatch.setattr(settings, 'CABINET_PERSONAL_LINK_SECRET', '42' * 32)
+    elif event == 'cabinet_origin':
+        monkeypatch.setattr(settings, 'CABINET_URL', 'https://different.example.com')
+
+    with pytest.raises(HTTPException):
+        await refresh(sessions, rotated.refresh_token)
+    async with sessions() as db:
+        with pytest.raises(HTTPException):
+            await dependencies.get_current_cabinet_user(request(), credentials, db)
+        assert not await support_ws._refresh_session_context(db, support_session)
+        with pytest.raises(HTTPException):
+            await personal_link.resolve_personal_link(db, secret)
+    assert not await manager.validate(socket)
+    if event != 'password_reset':
+        assert (await refresh(sessions, account.pair.refresh_token)).access_token
+
+
+@pytest.mark.parametrize('assignment_timing', ['before_login', 'after_login'])
+async def test_personal_link_staff_sessions_remain_customer_only(sessions, account, monkeypatch, assignment_timing):
+    from app.cabinet.auth import personal_link
+
+    monkeypatch.setattr(settings, 'CABINET_PERSONAL_LINK_ENABLED', True)
+    monkeypatch.setattr(settings, 'CABINET_PERSONAL_LINK_SECRET', '41' * 32)
+
+    def assign():
+        monkeypatch.setattr(
+            auth.UserRoleCRUD, 'get_user_permissions', AsyncMock(return_value=(['*:*'], ['superadmin'], 999))
+        )
+
+    if assignment_timing == 'before_login':
+        assign()
+    async with sessions() as db:
+        user = await db.get(User, account.user_id)
+        pair = await auth._create_auth_response(
+            user, db, auth_method='personal_link', personal_link_id=str(personal_link.personal_link_session_id(user))
+        )
+        await auth._store_refresh_token(db, user.id, pair.refresh_token)
+    if assignment_timing == 'after_login':
+        assign()
+    rotated = await refresh(sessions, pair.refresh_token)
+    payload = jwt_handler.get_token_payload(rotated.access_token)
+    assert payload['permissions'] == [] and payload['roles'] == [] and not payload.get('role_level')
+    credentials = HTTPAuthorizationCredentials(scheme='Bearer', credentials=rotated.access_token)
+    async with sessions() as db:
+        req = request()
+        user = await dependencies.get_current_cabinet_user(req, credentials, db)
+        assert await auth.get_my_permissions(req, user, db) == {'permissions': [], 'roles': [], 'role_level': 0}
+        assert await auth.check_is_admin(req, user, db) == {'is_admin': False}
+        with pytest.raises(HTTPException) as admin_denied:
+            await dependencies.get_current_admin_user(req, user, db)
+        assert admin_denied.value.status_code == 403
+        with pytest.raises(HTTPException) as permission_denied:
+            await dependencies.require_permission('users:read')(req, user, db)
+        assert permission_denied.value.status_code == 403
+        primary = await auth._create_auth_response(user, db)
+        assert jwt_handler.get_token_payload(primary.access_token)['permissions'] == ['*:*']
+        mobile, error = await support_ws._authenticate_ws(
+            db, SimpleNamespace(headers={}), access_token=rotated.access_token
+        )
+        assert not error and mobile.role == 'owner' and not mobile.permissions
+        assert not await support_ws._has_permission(db, mobile, 'tickets:read')
+
+    manager = ws_routes.CabinetConnectionManager(session_factory=sessions)
+    socket = ws_routes.CabinetWsSession(SimpleNamespace(close=AsyncMock(), send_text=AsyncMock()), payload)
+    assert await manager.validate(socket) and not socket.is_admin
+    assert not await manager.send(socket, {'type': 'private'}, admin_only=True)
+    socket.websocket.send_text.assert_not_awaited()

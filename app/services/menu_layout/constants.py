@@ -395,6 +395,13 @@ BUILTIN_BUTTONS_INFO: list[dict[str, Any]] = [
 AVAILABLE_CALLBACKS: list[dict[str, Any]] = [
     # Меню
     {
+        'callback_data': 'cabinet_personal_link',
+        'name': 'Сохранить доступ к боту',
+        'category': 'menu',
+        'icon': '🔑',
+        'text': {'ru': 'Сохранить доступ к боту', 'en': 'Save access to the bot'},
+    },
+    {
         'callback_data': 'back_to_menu',
         'name': 'Назад в меню',
         'category': 'menu',

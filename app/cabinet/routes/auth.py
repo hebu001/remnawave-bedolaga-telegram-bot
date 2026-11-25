@@ -5,6 +5,7 @@ import hashlib
 import hmac
 from collections.abc import Awaitable
 from datetime import UTC, datetime
+from urllib.parse import parse_qsl
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -23,9 +24,11 @@ from app.cabinet.auth.registration_throttle import (
     enforce_verification_resend_throttle,
 )
 from app.cabinet.auth.session_security import (
+    auth_proof_identity,
     auth_version,
     lock_auth_user,
     revoke_password_sessions,
+    session_is_current,
     session_version_matches,
 )
 from app.config import settings
@@ -102,7 +105,7 @@ from ..auth.merge_service import (
     get_email_merge_otp,
     store_email_merge_otp,
 )
-from ..dependencies import get_cabinet_db, get_current_cabinet_user
+from ..dependencies import get_cabinet_db, get_credential_management_user, get_current_cabinet_user
 from ..ip_utils import get_client_ip
 from ..schemas.auth import (
     AuthResponse,
@@ -302,30 +305,57 @@ def _user_to_response(user: User) -> UserResponse:
     )
 
 
-async def _create_auth_response(user: User, db: AsyncSession) -> AuthResponse:
+async def _create_auth_response(
+    user: User,
+    db: AsyncSession,
+    *,
+    auth_method: str = 'primary',
+    personal_link_id: str | None = None,
+    auth_proof: str | None = None,
+    auth_time: int | None = None,
+) -> AuthResponse:
     """Create full auth response with tokens and RBAC permissions."""
     credential_version = auth_version(user)
-    # Idempotent Superadmin re-assignment for users in ADMIN_IDS / ADMIN_EMAILS.
-    # Покрывает кейс: юзер был удалён через кабинет → пересоздан через /start
-    # → у нового user.id нет роли, потому что RBAC bootstrap отрабатывает только
-    # на старте бота. Без этой проверки админ из ADMIN_IDS получает access_token
-    # с пустыми permissions до следующего рестарта и видит 401 на /me/is-admin.
-    try:
-        await ensure_superadmin_role_on_login(db, user)
-    except Exception as bootstrap_error:
-        # IntegrityError изолирован savepoint'ом внутри ensure_superadmin_role_on_login,
-        # сюда долетают только программистские/инфраструктурные сбои (DB down, attribute
-        # errors). Login сам не валится — get_user_permissions ниже выдаст актуальное
-        # состояние ролей, какое бы оно ни было.
-        logger.error(
-            'Failed to ensure Superadmin role on login',
-            user_id=user.id,
-            telegram_id=user.telegram_id,
-            error=str(bootstrap_error),
-            exc_info=True,
-        )
+    proof_claims = {}
+    if auth_proof is not None:
+        identity = auth_proof_identity(user, auth_proof)
+        if auth_method != 'primary' or identity is None:
+            raise ValueError('Authentication proof does not match the account')
+        proof_claims = {
+            'auth_proof': auth_proof,
+            'auth_time': int(datetime.now(UTC).timestamp()) if auth_time is None else auth_time,
+            'auth_identity': identity,
+        }
+    if auth_method == 'personal_link':
+        if not await session_is_current(
+            db,
+            {'auth_version': credential_version, 'auth_method': auth_method, 'personal_link_id': personal_link_id},
+            user,
+        ):
+            raise HTTPException(status_code=401, detail='Personal link is unavailable')
+        user_permissions, user_role_names, user_role_level = [], [], 0
+    else:
+        # Idempotent Superadmin re-assignment for users in ADMIN_IDS / ADMIN_EMAILS.
+        # Покрывает кейс: юзер был удалён через кабинет → пересоздан через /start
+        # → у нового user.id нет роли, потому что RBAC bootstrap отрабатывает только
+        # на старте бота. Без этой проверки админ из ADMIN_IDS получает access_token
+        # с пустыми permissions до следующего рестарта и видит 401 на /me/is-admin.
+        try:
+            await ensure_superadmin_role_on_login(db, user)
+        except Exception as bootstrap_error:
+            # IntegrityError изолирован savepoint'ом внутри ensure_superadmin_role_on_login,
+            # сюда долетают только программистские/инфраструктурные сбои (DB down, attribute
+            # errors). Login сам не валится — get_user_permissions ниже выдаст актуальное
+            # состояние ролей, какое бы оно ни было.
+            logger.error(
+                'Failed to ensure Superadmin role on login',
+                user_id=user.id,
+                telegram_id=user.telegram_id,
+                error=str(bootstrap_error),
+                exc_info=True,
+            )
 
-    user_permissions, user_role_names, user_role_level = await UserRoleCRUD.get_user_permissions(db, user.id)
+        user_permissions, user_role_names, user_role_level = await UserRoleCRUD.get_user_permissions(db, user.id)
 
     access_token = create_access_token(
         user.id,
@@ -334,8 +364,17 @@ async def _create_auth_response(user: User, db: AsyncSession) -> AuthResponse:
         roles=user_role_names,
         role_level=user_role_level,
         auth_version=credential_version,
+        auth_method=auth_method,
+        personal_link_id=personal_link_id,
+        **proof_claims,
     )
-    refresh_token = create_refresh_token(user.id, auth_version=credential_version)
+    refresh_token = create_refresh_token(
+        user.id,
+        auth_version=credential_version,
+        auth_method=auth_method,
+        personal_link_id=personal_link_id,
+        **proof_claims,
+    )
     expires_in = settings.get_cabinet_access_token_expire_minutes() * 60
 
     return AuthResponse(
@@ -358,7 +397,7 @@ async def _store_refresh_token(
 
     payload = get_token_payload(refresh_token, expected_type='refresh')
     user = await lock_auth_user(db, user_id)
-    if not user or user.status != 'active' or not payload or not session_version_matches(payload, user):
+    if not user or user.status != 'active' or not payload or not await session_is_current(db, payload, user):
         await db.rollback()
         raise HTTPException(status_code=401, detail='Session revoked; sign in again')
     if payload.get('sub') != str(user_id):
@@ -384,6 +423,11 @@ async def _rotate_refresh_token(
     user_id: int,
     *,
     credential_version: int = 0,
+    auth_method: str | None = None,
+    personal_link_id: str | None = None,
+    auth_proof: str | None = None,
+    auth_time: int | None = None,
+    auth_identity: str | None = None,
 ) -> str:
     """Replace a used refresh token and extend the authenticated session.
 
@@ -391,7 +435,15 @@ async def _rotate_refresh_token(
     token and inserting its replacement in one commit prevents token replay
     while making the refresh-token lifetime sliding for active sessions.
     """
-    new_refresh_token = create_refresh_token(user_id, auth_version=credential_version)
+    new_refresh_token = create_refresh_token(
+        user_id,
+        auth_version=credential_version,
+        auth_method=auth_method,
+        personal_link_id=personal_link_id,
+        auth_proof=auth_proof,
+        auth_time=auth_time,
+        auth_identity=auth_identity,
+    )
     new_token_hash = hashlib.sha256(new_refresh_token.encode()).hexdigest()
     rotated_at = datetime.now(UTC)
 
@@ -916,7 +968,9 @@ async def auth_telegram(
     user.cabinet_last_login = datetime.now(UTC)
     await db.commit()
 
-    response = await _create_auth_response(user, db)
+    response = await _create_auth_response(
+        user, db, auth_proof='telegram', auth_time=int(dict(parse_qsl(request.init_data))['auth_date'])
+    )
 
     # Store refresh token
     await _store_refresh_token(db, user.id, response.refresh_token)
@@ -1091,7 +1145,7 @@ async def auth_telegram_widget(
     user.cabinet_last_login = datetime.now(UTC)
     await db.commit()
 
-    response = await _create_auth_response(user, db)
+    response = await _create_auth_response(user, db, auth_proof='telegram', auth_time=request.auth_date)
     await _store_refresh_token(db, user.id, response.refresh_token)
 
     # Process referral code (only for new users — existing users cannot be assigned a referrer)
@@ -1280,7 +1334,9 @@ async def auth_telegram_oidc(
     user.cabinet_last_login = datetime.now(UTC)
     await db.commit()
 
-    response = await _create_auth_response(user, db)
+    response = await _create_auth_response(
+        user, db, auth_proof='telegram', auth_time=int(claims.get('auth_time', claims['iat']))
+    )
     await _store_refresh_token(db, user.id, response.refresh_token)
 
     # Process referral code (only for new users — existing users cannot be assigned a referrer)
@@ -1322,7 +1378,7 @@ async def auth_telegram_oidc(
 async def register_email(
     request: EmailRegisterRequest,
     raw_request: Request,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """
@@ -1509,7 +1565,7 @@ async def register_email(
 async def verify_email_merge(
     request: EmailMergeVerifyRequest,
     raw_request: Request,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """
@@ -1802,7 +1858,7 @@ async def verify_email(
     await _sync_subscription_from_panel_by_email(db, user)
 
     # Return auth tokens so user is logged in after verification
-    response = await _create_auth_response(user, db)
+    response = await _create_auth_response(user, db, auth_proof='email')
     await _store_refresh_token(db, user.id, response.refresh_token)
 
     # Process campaign bonus (prefer request param, fallback to saved slug from registration)
@@ -2008,7 +2064,7 @@ async def login_email(
     user.cabinet_last_login = datetime.now(UTC)
     await db.commit()
 
-    response = await _create_auth_response(user, db)
+    response = await _create_auth_response(user, db, auth_proof='email' if user.email_verified else None)
     await _store_refresh_token(db, user.id, response.refresh_token)
 
     # Process campaign bonus
@@ -2043,7 +2099,7 @@ async def refresh_token(
         ) from e
 
     user = await lock_auth_user(db, user_id)
-    if not user or user.status != 'active' or not session_version_matches(payload, user):
+    if not user or user.status != 'active' or not await session_is_current(db, payload, user):
         raise HTTPException(status_code=401, detail='Session revoked or user inactive')
 
     # Verify token exists in database and is not revoked
@@ -2076,7 +2132,13 @@ async def refresh_token(
             detail='Invalid token owner',
         )
 
-    user_permissions, user_role_names, user_role_level = await UserRoleCRUD.get_user_permissions(db, user.id)
+    auth_method = payload.get('auth_method')
+    personal_link_id = payload.get('personal_link_id')
+    proof_claims = {key: payload[key] for key in ('auth_proof', 'auth_time', 'auth_identity') if key in payload}
+    if auth_method == 'personal_link':
+        user_permissions, user_role_names, user_role_level = [], [], 0
+    else:
+        user_permissions, user_role_names, user_role_level = await UserRoleCRUD.get_user_permissions(db, user.id)
     access_token = create_access_token(
         user.id,
         user.telegram_id,
@@ -2084,6 +2146,9 @@ async def refresh_token(
         roles=user_role_names,
         role_level=user_role_level,
         auth_version=auth_version(user),
+        auth_method=auth_method,
+        personal_link_id=personal_link_id,
+        **proof_claims,
     )
     expires_in = settings.get_cabinet_access_token_expire_minutes() * 60
     # Rotation is capability-negotiated so older already-open cabinet bundles,
@@ -2091,7 +2156,15 @@ async def refresh_token(
     # during a rolling deployment. Current clients always send this header.
     rotation_supported = raw_request.headers.get('X-Refresh-Token-Rotation') == '1'
     new_refresh_token = (
-        await _rotate_refresh_token(db, token_record, user.id, credential_version=auth_version(user))
+        await _rotate_refresh_token(
+            db,
+            token_record,
+            user.id,
+            credential_version=auth_version(user),
+            auth_method=auth_method,
+            personal_link_id=personal_link_id,
+            **proof_claims,
+        )
         if rotation_supported
         else request.refresh_token
     )
@@ -2187,7 +2260,7 @@ async def auto_login(
             detail='Administrator accounts cannot use auto-login. Please sign in via Telegram.',
         )
 
-    response = await _create_auth_response(user, db)
+    response = await _create_auth_response(user, db, auth_method='guest')
     await _store_refresh_token(db, user.id, response.refresh_token)
     user.cabinet_last_login = datetime.now(UTC)
     await db.commit()
@@ -2356,21 +2429,27 @@ async def get_my_avatar(
 
 @router.get('/me/permissions')
 async def get_my_permissions(
+    request: Request,
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get current user's RBAC permissions, roles, and level."""
     from app.services.permission_service import PermissionService
 
+    if getattr(request.state, 'cabinet_auth_method', None) == 'personal_link':
+        return {'permissions': [], 'roles': [], 'role_level': 0}
     return await PermissionService.get_user_permissions(db, user.id, user=user)
 
 
 @router.get('/me/is-admin')
 async def check_is_admin(
+    request: Request,
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Check if current user is an admin (legacy config or RBAC)."""
+    if getattr(request.state, 'cabinet_auth_method', None) == 'personal_link':
+        return {'is_admin': False}
     # Legacy check: config-based admin list
     is_admin = settings.is_admin(telegram_id=user.telegram_id, email=user.email if user.email_verified else None)
 
@@ -2387,7 +2466,7 @@ async def check_is_admin(
 async def request_email_change(
     request: EmailChangeRequest,
     raw_request: Request,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """
@@ -2575,7 +2654,7 @@ async def request_email_change(
 async def verify_email_change(
     request: EmailChangeVerifyRequest,
     raw_request: Request,
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """
@@ -2620,7 +2699,7 @@ async def verify_email_change(
 
 @router.post('/email/change/cancel')
 async def cancel_email_change(
-    user: User = Depends(get_current_cabinet_user),
+    user: User = Depends(get_credential_management_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """
@@ -2772,7 +2851,18 @@ async def poll_deep_link_token(
     user.cabinet_last_login = datetime.now(UTC)
     await db.commit()
 
-    response = await _create_auth_response(user, db)
+    # The Redis handoff records the authenticated Telegram identity and its original confirmation time.
+    proof_time = None
+    if consumed.get('telegram_id') == user.telegram_id and user.telegram_id is not None:
+        try:
+            linked_at = datetime.fromisoformat(consumed['linked_at'])
+            if linked_at.tzinfo is not None:
+                proof_time = int(linked_at.timestamp())
+        except KeyError, TypeError, ValueError:
+            pass  # Older handoffs remain usable but cannot authorize a credential replacement.
+    response = await _create_auth_response(
+        user, db, auth_proof='telegram' if proof_time is not None else None, auth_time=proof_time
+    )
     await _store_refresh_token(db, user.id, response.refresh_token, device_info='deep_link')
 
     # Deep link auth is always for existing users — referral code not applicable

@@ -28,6 +28,7 @@ routed through here — it has its own (more invasive) log line.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,6 +96,7 @@ async def revive_deleted_user(
     _ = db
     now = datetime.now(UTC)
     previous_updated_at = user.updated_at
+    user.cabinet_personal_link_id = uuid4()
     user.status = UserStatus.ACTIVE.value
     user.last_activity = now
     user.updated_at = now

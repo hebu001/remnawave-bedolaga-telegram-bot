@@ -29,14 +29,34 @@ from sqlalchemy import (
     Time,
     TypeDecorator,
     UniqueConstraint,
+    Uuid,
     inspect,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 from sqlalchemy.orm.attributes import NO_VALUE
 from sqlalchemy.sql import func
+from sqlalchemy.sql.functions import FunctionElement
+
+
+class NewCabinetLinkId(FunctionElement):
+    """Generate opaque link selectors in the database, including for non-ORM inserts."""
+
+    type = Uuid()
+    inherit_cache = True
+
+
+@compiles(NewCabinetLinkId)
+def _compile_link_uuid(element, compiler, **kw):
+    return 'gen_random_uuid()'
+
+
+@compiles(NewCabinetLinkId, 'sqlite')
+def _compile_sqlite_link_uuid(element, compiler, **kw):
+    return '(lower(hex(randomblob(16))))'
 
 
 class AwareDateTime(TypeDecorator):
@@ -2468,6 +2488,8 @@ class User(Base):
     email_verification_source = Column(String(32), nullable=True)
     password_hash = Column(String(255), nullable=True)
     cabinet_auth_version = Column(Integer, nullable=False, default=0, server_default='0')
+    cabinet_personal_link_id = Column(Uuid, nullable=False, unique=True, index=True, server_default=NewCabinetLinkId())
+    cabinet_personal_link_key_version = Column(Integer, nullable=False, server_default='1')
     email_verification_token = Column(String(255), nullable=True)
     email_verification_expires = Column(AwareDateTime(), nullable=True)
     password_reset_token = Column(String(255), nullable=True)
@@ -4618,6 +4640,7 @@ class CabinetWsTicket(Base):
     token_hash = Column(String(64), primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     auth_version = Column(Integer, nullable=False)
+    personal_link_id = Column(Uuid, nullable=True)
     origin = Column(String(512), nullable=False)
     expires_at = Column(AwareDateTime(), nullable=False)
     access_expires_at = Column(AwareDateTime(), nullable=False)

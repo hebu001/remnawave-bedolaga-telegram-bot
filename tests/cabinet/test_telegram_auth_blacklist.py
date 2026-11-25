@@ -54,7 +54,11 @@ def auth_flow(monkeypatch):
 
     async def validate_oidc(*_args, **_kwargs):
         events.append('validated')
-        return {'id': str(TELEGRAM_ID), 'preferred_username': USERNAME, 'name': 'Synthetic'} if state.valid else None
+        return (
+            {'id': str(TELEGRAM_ID), 'preferred_username': USERNAME, 'name': 'Synthetic', 'iat': 1700000000}
+            if state.valid
+            else None
+        )
 
     async def check_blacklist(*_args):
         events.append('blacklist')
@@ -111,7 +115,7 @@ def auth_flow(monkeypatch):
 async def _login(flow, state):
     if flow == 'init_data':
         handler = auth.auth_telegram
-        request = TelegramAuthRequest(init_data='synthetic-init-data')
+        request = TelegramAuthRequest(init_data='auth_date=1700000000&user=synthetic')
     elif flow == 'widget':
         handler = auth.auth_telegram_widget
         request = TelegramWidgetAuthRequest(
@@ -218,7 +222,9 @@ async def test_allowed_telegram_identity_keeps_existing_and_new_user_login(auth_
         state._consume_oidc_token.assert_awaited_once()
     assert state.user.cabinet_last_login is not None
     state.db.commit.assert_awaited_once()
-    state._create_auth_response.assert_awaited_once_with(state.user, state.db)
+    state._create_auth_response.assert_awaited_once_with(
+        state.user, state.db, auth_proof='telegram', auth_time=1700000000
+    )
     state._store_refresh_token.assert_awaited_once_with(state.db, state.user.id, state.response.refresh_token)
 
 
@@ -281,7 +287,24 @@ async def test_allowed_deeplink_keeps_existing_user_login(auth_flow):
     state.blacklist.assert_awaited_once_with(TELEGRAM_ID, USERNAME)
     assert state.user.cabinet_last_login is not None
     state.db.commit.assert_awaited_once()
-    state._create_auth_response.assert_awaited_once_with(state.user, state.db)
+    state._create_auth_response.assert_awaited_once_with(state.user, state.db, auth_proof=None, auth_time=None)
     state._store_refresh_token.assert_awaited_once_with(
         state.db, state.user.id, state.response.refresh_token, device_info='deep_link'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('confirmed_id', [TELEGRAM_ID, TELEGRAM_ID + 1])
+async def test_deeplink_rotation_proof_binds_original_confirmation_identity_and_time(auth_flow, confirmed_id):
+    state = auth_flow
+    state.consume.return_value = {
+        'user_id': state.user.id,
+        'telegram_id': confirmed_id,
+        'linked_at': '2023-11-14T22:13:20+00:00',
+    }
+    await _poll(state)
+    assert state._create_auth_response.await_args.kwargs == (
+        {'auth_proof': 'telegram', 'auth_time': 1700000000}
+        if confirmed_id == TELEGRAM_ID
+        else {'auth_proof': None, 'auth_time': None}
     )

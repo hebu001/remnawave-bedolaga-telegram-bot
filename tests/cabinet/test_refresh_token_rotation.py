@@ -95,7 +95,7 @@ async def test_refresh_endpoint_returns_rotated_refresh_token() -> None:
     assert response.access_token == 'new-access-token'
     assert response.refresh_token == 'rotated-refresh-token'
     assert response.expires_in == 900
-    rotate.assert_awaited_once_with(db, old_record, 42, credential_version=0)
+    rotate.assert_awaited_once_with(db, old_record, 42, credential_version=0, auth_method=None, personal_link_id=None)
 
 
 @pytest.mark.asyncio

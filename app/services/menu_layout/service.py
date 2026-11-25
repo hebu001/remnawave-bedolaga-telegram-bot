@@ -18,6 +18,7 @@ from app.config import settings
 from app.database.crud.system_setting import upsert_system_setting
 from app.database.models import SystemSetting
 from app.localization.texts import get_texts
+from app.utils.menu_layout_cache import PERSONAL_LINK_MANAGED_KEY, personal_link_is_managed
 
 from .constants import (
     AVAILABLE_CALLBACKS,
@@ -66,6 +67,11 @@ class MenuLayoutService:
         """Получить список всех доступных callback_data."""
         config = await cls.get_config(db)
         buttons_in_menu = set(config.get('buttons', {}).keys())
+        buttons_in_menu.update(
+            button.get('action')
+            for button in config.get('buttons', {}).values()
+            if button.get('type') in ('callback', 'builtin')
+        )
 
         # Добавляем встроенные callback_data
         builtin_callbacks = {btn['callback_data'] for btn in BUILTIN_BUTTONS_INFO}
@@ -111,6 +117,7 @@ class MenuLayoutService:
     ) -> dict[str, Any]:
         """Импортировать конфигурацию меню."""
         warnings = []
+        current_config = await cls.get_config(db)
 
         if merge_mode == 'replace':
             # Полная замена
@@ -139,6 +146,8 @@ class MenuLayoutService:
                 else:
                     warnings.append(f"Row '{row['id']}' already exists, skipped")
 
+        if personal_link_is_managed(current_config):
+            new_config[PERSONAL_LINK_MANAGED_KEY] = True
         await cls.save_config(db, new_config)
 
         return {
@@ -213,15 +222,21 @@ class MenuLayoutService:
 
     # --- Работа с конфигурацией ---
 
+    @staticmethod
+    def _remember_personal_link_management(config: dict[str, Any]) -> dict[str, Any]:
+        if personal_link_is_managed(config):
+            config[PERSONAL_LINK_MANAGED_KEY] = True
+        return config
+
     @classmethod
     async def get_config(cls, db: AsyncSession) -> dict[str, Any]:
         """Получить конфигурацию меню."""
         if cls._cache is not None:
-            return cls._cache
+            return cls._remember_personal_link_management(cls._cache)
 
         async with cls._lock:
             if cls._cache is not None:
-                return cls._cache
+                return cls._remember_personal_link_management(cls._cache)
 
             result = await db.execute(select(SystemSetting).where(SystemSetting.key == MENU_LAYOUT_CONFIG_KEY))
             setting = result.scalar_one_or_none()
@@ -238,7 +253,7 @@ class MenuLayoutService:
                 cls._cache = cls.get_default_config()
                 cls._cache_updated_at = None
 
-            return cls._cache
+            return cls._remember_personal_link_management(cls._cache)
 
     @classmethod
     async def get_config_updated_at(cls, db: AsyncSession) -> datetime | None:
@@ -249,6 +264,7 @@ class MenuLayoutService:
     @classmethod
     async def save_config(cls, db: AsyncSession, config: dict[str, Any]) -> None:
         """Сохранить конфигурацию меню."""
+        cls._remember_personal_link_management(config)
         config_json = json.dumps(config, ensure_ascii=False, indent=2)
         await upsert_system_setting(
             db,
@@ -1008,6 +1024,12 @@ class MenuLayoutService:
         effective_button_id = button_id or button_config.get('builtin_id', '')
         text_config = button_config.get('text', {})
         action = button_config.get('action', '')
+        is_personal_link = button_type in ('callback', 'builtin') and action == 'cabinet_personal_link'
+        if is_personal_link:
+            from app.cabinet.auth.personal_link import personal_link_enabled
+
+            if not personal_link_enabled():
+                return None
         open_mode = button_config.get('open_mode', 'callback')
         webapp_url = button_config.get('webapp_url')
         icon = button_config.get('icon', '')
@@ -1033,6 +1055,8 @@ class MenuLayoutService:
 
         # Получаем текст
         text = cls._get_localized_text(text_config, context.language)
+        if not text and is_personal_link:
+            text = texts.t('CABINET_PERSONAL_LINK_SAVE', 'Сохранить доступ к боту')
         if not text:
             return None
 
@@ -1047,6 +1071,8 @@ class MenuLayoutService:
             text = cls._format_dynamic_text(text, context, texts)
 
         # Строим кнопку в зависимости от типа
+        if is_personal_link:
+            return InlineKeyboardButton(text=text, callback_data=action, icon_custom_emoji_id=custom_emoji_id)
         if button_type == 'url':
             return InlineKeyboardButton(text=text, url=action, icon_custom_emoji_id=custom_emoji_id)
         if button_type == 'mini_app':
@@ -1155,7 +1181,14 @@ class MenuLayoutService:
                 for i in range(0, len(row_buttons), max_per_row):
                     keyboard_rows.append(row_buttons[i : i + max_per_row])
 
-        return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+        from app.keyboards.inline import _with_personal_link_button
+
+        return _with_personal_link_button(
+            InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+            context.language,
+            is_staff=context.is_admin or context.is_moderator,
+            append_default=not personal_link_is_managed(config),
+        )
 
     @classmethod
     async def preview_keyboard(
@@ -1166,6 +1199,10 @@ class MenuLayoutService:
         """Предпросмотр меню (возвращает структуру для API)."""
         config = await cls.get_config(db)
         texts = get_texts(context.language)
+        from app.cabinet.auth.personal_link import personal_link_enabled
+
+        links_enabled = personal_link_enabled()
+        seen_personal_link = False
 
         preview_rows: list[dict[str, Any]] = []
         rows_config = config.get('rows', [])
@@ -1196,8 +1233,18 @@ class MenuLayoutService:
                 if not cls._evaluate_conditions(button_conditions, context):
                     continue
 
+                is_personal_link = (
+                    button_cfg.get('type') in ('callback', 'builtin')
+                    and button_cfg.get('action') == 'cabinet_personal_link'
+                )
+                if is_personal_link:
+                    if not links_enabled or seen_personal_link:
+                        continue
+                    seen_personal_link = True
                 text_config = button_cfg.get('text', {})
                 text = cls._get_localized_text(text_config, context.language)
+                if not text and is_personal_link:
+                    text = texts.t('CABINET_PERSONAL_LINK_SAVE', 'Сохранить доступ к боту')
 
                 if button_cfg.get('dynamic_text'):
                     text = cls._format_dynamic_text(text, context, texts)
@@ -1213,6 +1260,19 @@ class MenuLayoutService:
             if row_buttons:
                 for i in range(0, len(row_buttons), max_per_row):
                     preview_rows.append({'buttons': row_buttons[i : i + max_per_row]})
+
+        if links_enabled and not seen_personal_link and not personal_link_is_managed(config):
+            preview_rows.append(
+                {
+                    'buttons': [
+                        {
+                            'text': texts.t('CABINET_PERSONAL_LINK_SAVE', 'Сохранить доступ к боту'),
+                            'action': 'cabinet_personal_link',
+                            'type': 'callback',
+                        }
+                    ]
+                }
+            )
 
         return preview_rows
 

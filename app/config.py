@@ -1556,6 +1556,8 @@ class Settings(BaseSettings):
     # Cabinet (Personal Account) settings
     CABINET_ENABLED: bool = False
     CABINET_JWT_SECRET: str | None = None
+    CABINET_PERSONAL_LINK_ENABLED: bool = False
+    CABINET_PERSONAL_LINK_SECRET: str | None = Field(default=None, repr=False)
     CABINET_ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     CABINET_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     CABINET_ALLOWED_ORIGINS: str = ''

@@ -26,6 +26,38 @@ from app.utils.subscription_utils import (
 logger = structlog.get_logger(__name__)
 
 
+def _with_personal_link_button(
+    keyboard: InlineKeyboardMarkup, language: str, *, is_staff: bool, append_default: bool = True
+) -> InlineKeyboardMarkup:
+    from app.cabinet.auth.personal_link import personal_link_enabled
+
+    enabled = personal_link_enabled()
+    found = False
+    rows = []
+    for row in keyboard.inline_keyboard:
+        kept = []
+        for button in row:
+            if button.callback_data == 'cabinet_personal_link':
+                if not enabled or found:
+                    continue
+                found = True
+            kept.append(button)
+        if kept:
+            rows.append(kept)
+    # Preserve the configured position, label and styling. Append only for
+    # legacy menus which have never explicitly managed this action.
+    if enabled and not found and append_default:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=get_texts(language).t('CABINET_PERSONAL_LINK_SAVE', 'Сохранить доступ к боту'),
+                    callback_data='cabinet_personal_link',
+                )
+            ]
+        )
+    return keyboard if rows == keyboard.inline_keyboard else InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def get_main_menu_keyboard_async(
     db: AsyncSession,
     language: str = DEFAULT_LANGUAGE,
@@ -376,6 +408,10 @@ def _is_cabinet_callback_action_enabled(callback_data: str) -> bool:
         return settings.ACTIVATE_BUTTON_VISIBLE
     if callback_data == 'menu_language':
         return settings.is_language_selection_enabled()
+    if callback_data == 'cabinet_personal_link':
+        from app.cabinet.auth.personal_link import personal_link_enabled
+
+        return personal_link_enabled()
     return True
 
 
@@ -410,6 +446,8 @@ def _get_cabinet_callback_action_text(
         return texts.MENU_LANGUAGE
     if callback_data == 'menu_balance':
         return _get_balance_text(cached_styles, language, texts, balance_kopeks)
+    if callback_data == 'cabinet_personal_link':
+        return texts.t('CABINET_PERSONAL_LINK_SAVE', 'Сохранить доступ к боту')
     if callback_data == 'menu_subscription':
         return (
             texts.t('MY_SUBSCRIPTIONS_BUTTON', '📱 Мои подписки')
@@ -434,7 +472,7 @@ def _build_cabinet_main_menu_keyboard(
     and how many fit per keyboard row (``max_per_row``).
     """
     from app.utils.button_styles_cache import CALLBACK_TO_SECTION, get_cached_button_styles
-    from app.utils.menu_layout_cache import VALID_CALLBACK_ACTIONS, get_cached_menu_layout
+    from app.utils.menu_layout_cache import VALID_CALLBACK_ACTIONS, get_cached_menu_layout, personal_link_is_managed
     from app.utils.miniapp_buttons import (
         CALLBACK_TO_CABINET_STYLE,
         _resolve_style,
@@ -647,7 +685,12 @@ def _build_cabinet_main_menu_keyboard(
     if is_moderator and not is_admin:
         keyboard_rows.append([InlineKeyboardButton(text='🧑‍⚖️ Модерация', callback_data='moderator_panel')])
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    return _with_personal_link_button(
+        InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        language,
+        is_staff=is_admin or is_moderator,
+        append_default=not personal_link_is_managed(layout),
+    )
 
 
 def get_main_menu_keyboard(
@@ -888,7 +931,9 @@ def get_main_menu_keyboard(
     if (not is_admin) and is_moderator:
         keyboard.append([InlineKeyboardButton(text='🧑‍⚖️ Модерация', callback_data='moderator_panel')])
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return _with_personal_link_button(
+        InlineKeyboardMarkup(inline_keyboard=keyboard), language, is_staff=is_admin or is_moderator
+    )
 
 
 def get_info_menu_keyboard(
